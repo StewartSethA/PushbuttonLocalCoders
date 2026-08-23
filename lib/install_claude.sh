@@ -109,7 +109,7 @@ configure_claude_api_key() {
         read -r -s ANTHROPIC_API_KEY < /dev/tty
         printf "\n" > /dev/tty
         if [[ -n "$ANTHROPIC_API_KEY" ]]; then
-            echo "ANTHROPIC_API_KEY=\"$ANTHROPIC_API_KEY\"" > "$config_file"
+            printf 'ANTHROPIC_API_KEY=%q\n' "$ANTHROPIC_API_KEY" > "$config_file"
             chmod 600 "$config_file"
             export ANTHROPIC_API_KEY
             tui_success "API key saved to $config_file"
@@ -156,10 +156,12 @@ ensure_litellm_proxy() {
     tui_step "Installing LiteLLM proxy…"
     local install_log="$PUSHBUTTON_CONFIG_DIR/litellm-install.log"
     mkdir -p "$PUSHBUTTON_CONFIG_DIR"
-    pip3 install --user "$LITELLM_PYPI_SPEC" >>"$install_log" 2>&1 || pip3 install "$LITELLM_PYPI_SPEC" 2>&1 | tee -a "$install_log" || {
-        tui_warn "LiteLLM install failed; falling back to direct Ollama chat."
-        return 1
-    }
+    if ! pip3 install --user "$LITELLM_PYPI_SPEC" >>"$install_log" 2>&1; then
+        if ! pip3 install "$LITELLM_PYPI_SPEC" 2>&1 | tee -a "$install_log"; then
+            tui_warn "LiteLLM install failed; falling back to direct Ollama chat."
+            return 1
+        fi
+    fi
 
     prepend_python_user_bin_to_path
 
@@ -251,7 +253,7 @@ launch_interactive_claude_session() {
     if ! command -v claude &>/dev/null; then
         tui_warn "Claude Code is unavailable; falling back to an interactive Ollama session."
         if [[ -r /dev/tty ]]; then
-            (cd "$session_dir" && ollama run "$model_tag" < /dev/tty)
+            (cd "$session_dir" && ollama run "$model_tag" < /dev/tty > /dev/tty 2> /dev/tty)
             return $?
         fi
         return 1
@@ -264,7 +266,7 @@ launch_interactive_claude_session() {
 
     if ! start_local_claude_gateway "$model_tag"; then
         tui_warn "Falling back to a direct interactive Ollama session."
-        (cd "$session_dir" && ollama run "$model_tag" < /dev/tty)
+        (cd "$session_dir" && ollama run "$model_tag" < /dev/tty > /dev/tty 2> /dev/tty)
         return $?
     fi
 
@@ -277,7 +279,7 @@ launch_interactive_claude_session() {
         export ANTHROPIC_BASE_URL="$base_url"
         export ANTHROPIC_API_KEY="$local_api_key"
         unset ANTHROPIC_AUTH_TOKEN
-        claude --model "$CLAUDE_GATEWAY_MODEL" < /dev/tty
+        claude --model "$CLAUDE_GATEWAY_MODEL" < /dev/tty > /dev/tty 2> /dev/tty
     )
     return $?
 }
