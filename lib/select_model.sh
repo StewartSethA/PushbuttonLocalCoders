@@ -36,6 +36,8 @@ declare -a CPU_MODEL_CATALOGUE=(
     "qwen3.8:27b-q4_K_M|Qwen 3.8 27B (CPU fallback)|27|82|32768|cpu"
     "nemotron-3.5-lightning:30b-a3b-q4_K_M|Nemotron 3.5 Lightning (CPU fallback)|30|80|32768|cpu"
 )
+# Cloud entries intentionally use: tag|display_name|source|tier
+# and are only consumed by cloud-specific prompt/catalog code.
 declare -a CLOUD_MODEL_CATALOGUE=(
     "claude-sonnet-5|Claude Sonnet 5|cloud|high"
     "claude-opus-5|Claude Opus 5|cloud|max"

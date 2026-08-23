@@ -174,7 +174,10 @@ bootstrap_private_cuda_rattler() {
         "$uv_bin" venv "$CUDA_BOOTSTRAP_ENV" --python "$(command -v python3)" --no-managed-python >/dev/null
     fi
 
-    "$uv_bin" pip install --python "$py" "py-rattler==$PY_RATTLER_VERSION" >/dev/null
+    if ! "$uv_bin" pip install --python "$py" "py-rattler==$PY_RATTLER_VERSION"; then
+        tui_error "Failed to install py-rattler==$PY_RATTLER_VERSION"
+        return 1
+    fi
 
     "$py" - "$CUDA_PRIVATE_PREFIX" "$CUDA_RATTLER_CHANNEL" "$CUDA12_VERSION" "$CUDA12_CUBLAS_VERSION" <<'PYCUDA'
 import asyncio
