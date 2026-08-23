@@ -158,10 +158,6 @@ mode_quick() {
     # 3. Install Claude Code + local bridge
     setup_claude
 
-    if launch_interactive_claude_session "$SELECTED_MODEL" "$PWD"; then
-        return 0
-    fi
-
     tui_header "Setup Complete"
     echo ""
     echo "  Claude Code :  ANTHROPIC_BASE_URL=http://${PUSHBUTTON_CLAUDE_GATEWAY_HOST:-127.0.0.1}:${PUSHBUTTON_CLAUDE_GATEWAY_PORT:-4000} claude --model ${PUSHBUTTON_CLAUDE_GATEWAY_MODEL:-pushbutton-local}"
@@ -170,6 +166,8 @@ mode_quick() {
     echo "  Agent mode  :  bash $0 --agent --project /your/project --task 'Improve this code'"
     echo "  Explore     :  bash $0 --explore"
     echo ""
+
+    launch_interactive_claude_session "$SELECTED_MODEL" "$PWD" || true
 }
 
 mode_explore() {

@@ -183,7 +183,15 @@ start_local_claude_gateway() {
         existing_pid="$(<"$pid_file")"
         if [[ -n "$existing_pid" ]] && kill -0 "$existing_pid" 2>/dev/null; then
             kill "$existing_pid" 2>/dev/null || true
-            wait "$existing_pid" 2>/dev/null || true
+            local shutdown_attempts=0
+            while kill -0 "$existing_pid" 2>/dev/null; do
+                sleep 1
+                (( shutdown_attempts++ ))
+                if (( shutdown_attempts > 5 )); then
+                    tui_warn "Timed out waiting for the previous LiteLLM bridge to stop."
+                    break
+                fi
+            done
         fi
         rm -f "$pid_file"
     fi
