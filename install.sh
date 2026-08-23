@@ -33,6 +33,7 @@ bootstrap_repo() {
     if [[ -d "$SCRIPT_DIR/lib" ]]; then
         LIB_DIR="$SCRIPT_DIR/lib"
         AGENTS_DIR="$SCRIPT_DIR/agents"
+        ENTRY_SCRIPT="$SCRIPT_DIR/install.sh"
         return 0
     fi
 
@@ -47,6 +48,7 @@ bootstrap_repo() {
     fi
     LIB_DIR="$INSTALL_DIR/lib"
     AGENTS_DIR="$INSTALL_DIR/agents"
+    ENTRY_SCRIPT="$INSTALL_DIR/install.sh"
 }
 
 bootstrap_repo
@@ -58,6 +60,7 @@ source "$LIB_DIR/select_model.sh"
 source "$LIB_DIR/install_ollama.sh"
 source "$LIB_DIR/install_claude.sh"
 source "$LIB_DIR/install_llamacpp.sh"
+source "$LIB_DIR/benchmark.sh"
 source "$LIB_DIR/docker_agent.sh"
 source "$LIB_DIR/ablation.sh"
 source "$LIB_DIR/network_nodes.sh"
@@ -73,6 +76,10 @@ NUM_DEVS=1
 MONITOR_INTERVAL=2
 NODES_SUBCMD="live"
 NODES_ARG=""
+RUN_BENCHMARK="ask"
+BENCHMARK_CONTEXT_SWEEP="ask"
+BENCHMARK_FRAMEWORK="ollama"
+MODE_EXPLICIT=false
 
 print_help() {
     cat <<HELP
@@ -87,6 +94,7 @@ Modes:
   --team               Launch multi-agent team via Docker Compose
   --monitor            Live GPU/CPU/node monitor
   --build-llamacpp     Build llama.cpp with GPU/CPU optimisations
+  --benchmark          Run an Ollama speed benchmark and save the runtime profile
   --nodes              Network node monitor (add/list/live)
   --orchestrator       Start local orchestrator + developer agents
   --help               Show this help
@@ -97,6 +105,9 @@ Options:
   --devs     <n>       Number of developer agents (default: 1)
   --interval <s>       Monitor refresh interval in seconds (default: 2)
   --model    <tag>     Override model tag (Ollama format)
+  --framework <name>   Benchmark framework: ollama or ollama-cpu
+  --skip-benchmark     Skip the post-setup benchmark prompt
+  --context-sweep      Run the longer context sweep after the quick benchmark
 
 Environment:
   ANTHROPIC_API_KEY    Anthropic API key for Claude cloud features
@@ -109,13 +120,21 @@ HELP
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --quick)           MODE="quick"         ; shift ;;
-        --explore)         MODE="explore"        ; shift ;;
-        --agent)           MODE="agent"          ; shift ;;
-        --team)            MODE="team"           ; shift ;;
-        --monitor)         MODE="monitor"        ; shift ;;
-        --build-llamacpp)  MODE="llamacpp"       ; shift ;;
+        --quick)           MODE="quick"          ; MODE_EXPLICIT=true ; shift ;;
+        --explore)         MODE="explore"        ; MODE_EXPLICIT=true ; shift ;;
+        --agent)           MODE="agent"          ; MODE_EXPLICIT=true ; shift ;;
+        --team)            MODE="team"           ; MODE_EXPLICIT=true ; shift ;;
+        --monitor)         MODE="monitor"        ; MODE_EXPLICIT=true ; shift ;;
+        --build-llamacpp)  MODE="llamacpp"       ; MODE_EXPLICIT=true ; shift ;;
+        --benchmark)       if [[ "$MODE_EXPLICIT" == false ]]; then
+                               MODE="benchmark"
+                               MODE_EXPLICIT=true
+                           else
+                               RUN_BENCHMARK="yes"
+                           fi
+                           shift ;;
         --nodes)           MODE="nodes"          ; shift
+                           MODE_EXPLICIT=true
                            # Capture optional subcommand (add/rm/list/live)
                            if [[ $# -gt 0 ]] && [[ "$1" != --* ]]; then
                                NODES_SUBCMD="$1"; shift
@@ -125,13 +144,16 @@ while [[ $# -gt 0 ]]; do
                                fi
                            fi
                            ;;
-        --orchestrator)    MODE="orchestrator"   ; shift ;;
+        --orchestrator)    MODE="orchestrator"   ; MODE_EXPLICIT=true ; shift ;;
         --help|-h)         print_help ; exit 0   ;;
         --project)         PROJECT_DIR="$2"      ; shift 2 ;;
         --task)            TASK="$2"             ; shift 2 ;;
         --devs)            NUM_DEVS="$2"         ; shift 2 ;;
         --interval)        MONITOR_INTERVAL="$2" ; shift 2 ;;
         --model)           SELECTED_MODEL="$2"   ; shift 2 ;;
+        --framework)       BENCHMARK_FRAMEWORK="$2" ; shift 2 ;;
+        --skip-benchmark)  RUN_BENCHMARK="no"       ; shift ;;
+        --context-sweep)   BENCHMARK_CONTEXT_SWEEP="yes" ; shift ;;
         *)                 tui_warn "Unknown option: $1" ; shift ;;
     esac
 done
@@ -157,12 +179,16 @@ mode_quick() {
     # 3. Install Claude CLI
     setup_claude
 
+    # 4. Offer a quick speed benchmark and persist the runtime profile
+    maybe_run_post_setup_benchmark "$SELECTED_MODEL" "$BENCHMARK_FRAMEWORK" "$RUN_BENCHMARK" "$BENCHMARK_CONTEXT_SWEEP"
+
     tui_header "Setup Complete"
     echo ""
     echo "  Run a query :  ollama run $SELECTED_MODEL \"Write a hello world in Python\""
-    echo "  Monitor     :  bash $0 --monitor"
-    echo "  Agent mode  :  bash $0 --agent --project /your/project --task 'Improve this code'"
-    echo "  Explore     :  bash $0 --explore"
+    echo "  Monitor     :  bash $ENTRY_SCRIPT --monitor"
+    echo "  Agent mode  :  bash $ENTRY_SCRIPT --agent --project /your/project --task 'Improve this code'"
+    echo "  Explore     :  bash $ENTRY_SCRIPT --explore"
+    echo "  Runtime env :  source $RUNTIME_ENV_FILE"
     echo ""
 }
 
@@ -209,6 +235,7 @@ mode_nodes() {
         add)  add_node "${NODES_ARG:?IP required}"    ;;
         rm)   remove_node "${NODES_ARG:?IP required}" ;;
         list) read_nodes                               ;;
+        scan) scan_nodes_models                        ;;
         *)    monitor_nodes_live "$MONITOR_INTERVAL"   ;;
     esac
 }
@@ -219,6 +246,15 @@ mode_orchestrator() {
     run_orchestrator "$TASK" "$NUM_DEVS"
 }
 
+mode_benchmark() {
+    tui_header "PushbuttonLocalCoders — Benchmark"
+    if [[ -z "${SELECTED_MODEL:-}" ]]; then
+        auto_select_model
+    fi
+    setup_ollama "$SELECTED_MODEL"
+    maybe_run_post_setup_benchmark "$SELECTED_MODEL" "$BENCHMARK_FRAMEWORK" "yes" "$BENCHMARK_CONTEXT_SWEEP"
+}
+
 # ── Dispatch ───────────────────────────────────────────────────────────────────
 case "$MODE" in
     quick)        mode_quick       ;;
@@ -227,6 +263,7 @@ case "$MODE" in
     team)         mode_team        ;;
     monitor)      mode_monitor     ;;
     llamacpp)     mode_llamacpp    ;;
+    benchmark)    mode_benchmark   ;;
     nodes)        mode_nodes        ;;
     orchestrator) mode_orchestrator ;;
     *)

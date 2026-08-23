@@ -3,7 +3,7 @@
 > **Pushbutton bootstrap for a powerful local AI coding assistant.**
 > One `curl` command installs Ollama, Claude CLI, and the best local coder model
 > your hardware can run — with GPU-optimised llama.cpp builds, a multi-agent
-> Docker sandbox, hardware ablation, and a live TUI monitor.
+> Docker sandbox, hardware ablation, a quick speed benchmark, and a live TUI monitor.
 
 ---
 
@@ -32,6 +32,7 @@ bash install.sh          # "just get me running" mode
 | `--agent` | Wrap a project directory in a sandboxed Docker agent (dangerously-skip-permissions enabled) |
 | `--team` | Launch a full orchestrator + developer agent team via Docker Compose |
 | `--monitor` | Live TUI showing GPU, CPU, VRAM and RAM utilisation |
+| `--benchmark` | Run a short Ollama benchmark, compare actual vs guessed tok/s, and save the runtime profile |
 | `--nodes` | Monitor networked boxes (GPU/CPU/VRAM/RAM over SSH) |
 | `--build-llamacpp` | Build llama.cpp with GPU acceleration (CUDA / Metal / ROCm) and CPU fallback |
 | `--orchestrator` | Start a local multi-agent orchestrator + developer processes |
@@ -51,8 +52,17 @@ bash install.sh --team --project ~/my-project --devs 2 --task "Refactor and opti
 # Live hardware monitor
 bash install.sh --monitor
 
+# Benchmark the current Ollama runtime (GPU by default)
+bash install.sh --benchmark
+
+# Benchmark Ollama in CPU-only mode
+bash install.sh --benchmark --framework ollama-cpu
+
 # Monitor networked GPU boxes
 bash install.sh --nodes
+
+# Scan configured nodes for reachable Ollama instances and their models
+bash install.sh --nodes scan
 
 # Build llama.cpp with GPU support
 bash install.sh --build-llamacpp
@@ -67,6 +77,7 @@ bash install.sh --build-llamacpp
 | `DEVELOPER_MODEL` | *auto-selected* | Override developer model (Ollama tag) |
 | `ORCHESTRATOR_MODEL` | *auto-selected* | Override orchestrator model |
 | `PUSHBUTTON_DIR` | `~/.local/share/pushbutton` | Install directory when run via curl |
+| `RUNTIME_ENV_FILE` | `~/.config/pushbutton/runtime.env` | Saved local runtime profile from the latest benchmark |
 
 ---
 
@@ -81,8 +92,9 @@ lib/
   install_claude.sh         ← Claude CLI install + API key config
   install_llamacpp.sh       ← llama.cpp build (CUDA / Metal / ROCm / CPU)
   ablation.sh               ← Rapid model/quant benchmarking with progress bar
+  benchmark.sh              ← Quick Ollama speed benchmark + runtime persistence
   tui.sh                    ← TUI helpers: progress bars, spinners, monitor
-  network_nodes.sh          ← SSH-based remote GPU/CPU/RAM monitor
+  network_nodes.sh          ← SSH-based remote GPU/CPU/RAM monitor + Ollama scan
   orchestrator.sh           ← Local multi-agent orchestrator
   docker_agent.sh           ← Docker sandbox wrapper
 agents/
@@ -116,6 +128,25 @@ Override at any time with `--model <tag>` or the `DEVELOPER_MODEL` env var.
 
 ---
 
+## Quick Benchmark
+
+After `--quick` setup, PushbuttonLocalCoders can immediately prompt to run a short
+benchmark on the selected Ollama runtime. The first pass uses a short 128-token
+prompt and automatically sizes the generation budget from the guessed total speed
+so the run stays under roughly 10 seconds on starter settings.
+
+The benchmark:
+- shows an estimated PP/TG progress bar while it runs
+- compares actual vs guessed prompt-processing and token-generation speeds
+- saves the chosen local runtime profile to `~/.config/pushbutton/runtime.env`
+- can optionally run a longer context sweep capped to a projected runtime below 30 minutes
+
+That saved runtime file is meant to be sourced later by local tooling such as
+Claude Code wrappers or other scripts that need the currently selected local
+model/framework combination.
+
+---
+
 ## Multi-Agent Docker Sandbox
 
 ```bash
@@ -139,10 +170,11 @@ All containers share the project directory as `/workspace` and
 ## Network Node Monitor
 
 Add remote GPU/CPU boxes to `~/.config/pushbutton/nodes.txt` (one IP per line),
-then watch their utilisation in real time:
+then watch their utilisation in real time or scan them for reachable Ollama models:
 
 ```bash
 bash lib/network_nodes.sh add 192.168.1.10
+bash lib/network_nodes.sh scan
 bash lib/network_nodes.sh live
 ```
 
