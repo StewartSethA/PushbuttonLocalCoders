@@ -606,6 +606,7 @@ configure_model_plan() {
     local described_models=("primary:$PRIMARY_CODER_MODEL" "orchestrator:$ORCHESTRATOR_MODEL")
     if [[ -n "$ADDITIONAL_CODER_MODELS" ]]; then
         local extra_tag
+        local -a __extra_models=()
         IFS=',' read -r -a __extra_models <<< "$ADDITIONAL_CODER_MODELS"
         for extra_tag in "${__extra_models[@]}"; do
             described_models+=("additional:$extra_tag")

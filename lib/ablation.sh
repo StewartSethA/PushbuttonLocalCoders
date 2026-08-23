@@ -47,7 +47,7 @@ collect_generate_metrics() {
     local prompt payload response
     prompt=$(bench_prompt)
     payload=$(cat <<EOF
-{"model":"$model_tag","prompt":"$(json_escape "$prompt")","stream":false,"options":{"temperature":0,"num_predict":96,"num_ctx":$target_context}}
+{"model":"$(json_escape "$model_tag")","prompt":"$(json_escape "$prompt")","stream":false,"options":{"temperature":0,"num_predict":96,"num_ctx":$target_context}}
 EOF
 )
     curl -fsS "${OLLAMA_HOST:-http://localhost:11434}/api/generate" \
