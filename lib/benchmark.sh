@@ -11,6 +11,7 @@ PUSHBUTTON_CONFIG_DIR="${PUSHBUTTON_CONFIG_DIR:-$HOME/.config/pushbutton}"
 RUNTIME_ENV_FILE="${RUNTIME_ENV_FILE:-$PUSHBUTTON_CONFIG_DIR/runtime.env}"
 RUNTIME_HISTORY_FILE="${RUNTIME_HISTORY_FILE:-$PUSHBUTTON_CONFIG_DIR/runtime_history.tsv}"
 CONTEXT_SWEEP_MAX_S="${CONTEXT_SWEEP_MAX_S:-1800}"
+QUICK_BENCH_TARGET_S="${QUICK_BENCH_TARGET_S:-8}"
 
 ensure_runtime_store() {
     mkdir -p "$PUSHBUTTON_CONFIG_DIR"
@@ -44,6 +45,14 @@ print(" ".join(f"pbtok{i:03d}" for i in range(n)))
 PY
 }
 
+detect_cpu_threads_value() {
+    detect_cpu | awk -F= '/^CPU_THREADS=/{gsub(/"/, "", $2); print $2; exit}'
+}
+
+detect_gpu_model_value() {
+    detect_gpu | awk -F= '/^GPU_MODEL=/{sub(/^"/, "", $2); sub(/"$/, "", $2); print $2; exit}'
+}
+
 estimate_ollama_speeds() {
     local model="${1:?model required}"
     local framework="${2:-ollama}"
@@ -58,14 +67,12 @@ estimate_ollama_speeds() {
         ollama-cpu)
             base_pp=260
             base_tg=14
-            eval "$(detect_cpu)"
-            hw_factor=$(awk -v t="${CPU_THREADS:-16}" 'BEGIN { v=t/32.0; if (v<0.55) v=0.55; if (v>2.0) v=2.0; printf "%.3f", v }')
+            hw_factor=$(awk -v t="$(detect_cpu_threads_value)" 'BEGIN { if (t == "") t = 16; v=t/32.0; if (v<0.55) v=0.55; if (v>2.0) v=2.0; printf "%.3f", v }')
             ;;
         *)
             base_pp=2400
             base_tg=120
-            eval "$(detect_gpu)"
-            case "${GPU_MODEL:-}" in
+            case "$(detect_gpu_model_value)" in
                 *H100*|*A100*) hw_factor="1.45" ;;
                 *V100*|*A40*|*RTX\ 6000*|*L40*) hw_factor="1.20" ;;
                 *4090*|*3090*) hw_factor="1.10" ;;
@@ -80,7 +87,7 @@ estimate_ollama_speeds() {
         q6*) quant_factor="0.74" ;;
         q5*) quant_factor="0.88" ;;
         q4*) quant_factor="1.00" ;;
-        *)   quant_factor="0.92" ;;
+        *)   quant_factor="0.92" ;; # unknown / full-precision formats default a bit slower than q4
     esac
 
     case "$family" in
@@ -103,9 +110,9 @@ estimate_ollama_speeds() {
 calc_quick_gen_tokens() {
     local prompt_tokens="${1:-128}"
     local guessed_total="${2:-32}"
-    awk -v prompt="$prompt_tokens" -v total="$guessed_total" '
+    awk -v prompt="$prompt_tokens" -v total="$guessed_total" -v target_s="$QUICK_BENCH_TARGET_S" '
         BEGIN {
-            budget = int(total * 8.0)
+            budget = int(total * target_s)
             gen = budget - prompt
             if (gen < 32) gen = 32
             if (gen > 128) gen = 128
@@ -279,10 +286,20 @@ PY
             sleep 0.1
         done
         wait "$curl_pid"
+        local curl_status=$?
+        if (( curl_status != 0 )); then
+            tui_error "Benchmark request failed against $host."
+            return "$curl_status"
+        fi
         tui_progress_bar 1 1 "Done"
         printf "\r\033[K"
     else
         wait "$curl_pid"
+        local curl_status=$?
+        if (( curl_status != 0 )); then
+            tui_error "Benchmark request failed against $host."
+            return "$curl_status"
+        fi
     fi
 
     IFS=$'\t' read -r ACTUAL_PP ACTUAL_TG ACTUAL_TOTAL PROMPT_EVAL_COUNT EVAL_COUNT < <(python3 - "$result_file" <<'PY'
