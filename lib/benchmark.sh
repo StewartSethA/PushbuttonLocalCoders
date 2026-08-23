@@ -321,8 +321,6 @@ PY
         tui_success "Runtime profile saved to $RUNTIME_ENV_FILE"
     fi
 
-    rm -f "$payload_file" "$result_file"
-    trap - RETURN
 }
 
 run_ollama_context_sweep() {
@@ -349,7 +347,7 @@ run_ollama_context_sweep() {
     done
 
     if (( ${#contexts[@]} == 0 )); then
-        tui_warn "Skipping context sweep — projected runtime exceeds 30 minutes."
+        tui_warn "Skipping context sweep — projected runtime exceeds $(( CONTEXT_SWEEP_MAX_S / 60 )) minutes."
         return 0
     fi
 
@@ -396,10 +394,10 @@ maybe_run_post_setup_benchmark() {
     local mode="${3:-ask}"
     local sweep_mode="${4:-ask}"
     local prompt_tokens=128
-    local gen_tokens guessed_total
+    local gen_tokens guessed_total guessed_pp guessed_tg
 
-    IFS=$'\t' read -r GUESSED_PP GUESSED_TG < <(estimate_ollama_speeds "$model" "$framework")
-    guessed_total=$(awk -v pp="$GUESSED_PP" -v tg="$GUESSED_TG" 'BEGIN { printf "%.1f", (pp + tg) / 2.0 }')
+    IFS=$'\t' read -r guessed_pp guessed_tg < <(estimate_ollama_speeds "$model" "$framework")
+    guessed_total=$(awk -v pp="$guessed_pp" -v tg="$guessed_tg" 'BEGIN { printf "%.1f", (pp + tg) / 2.0 }')
     gen_tokens=$(calc_quick_gen_tokens "$prompt_tokens" "$guessed_total")
 
     case "$mode" in
