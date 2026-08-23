@@ -135,7 +135,7 @@ ensure_litellm_proxy() {
     fi
 
     tui_step "Installing LiteLLM proxy…"
-    pip3 install --user "$LITELLM_PYPI_SPEC" 2>/dev/null || pip3 install "$LITELLM_PYPI_SPEC" 2>/dev/null || {
+    pip3 install --user "$LITELLM_PYPI_SPEC" 2>/dev/null || pip3 install "$LITELLM_PYPI_SPEC" || {
         tui_warn "LiteLLM install failed; falling back to direct Ollama chat."
         return 1
     }
@@ -174,14 +174,15 @@ start_local_claude_gateway() {
     local log_file="$PUSHBUTTON_CONFIG_DIR/litellm.log"
     local base_url="http://$CLAUDE_GATEWAY_HOST:$CLAUDE_GATEWAY_PORT"
     local gateway_config
-    gateway_config="$(write_local_claude_gateway_config "$model_tag")"
-
-    ensure_litellm_proxy || return 1
 
     if ! [[ "$CLAUDE_GATEWAY_PORT" =~ ^[0-9]+$ ]] || (( CLAUDE_GATEWAY_PORT < 1 || CLAUDE_GATEWAY_PORT > 65535 )); then
         tui_warn "Invalid PUSHBUTTON_CLAUDE_GATEWAY_PORT: $CLAUDE_GATEWAY_PORT"
         return 1
     fi
+
+    gateway_config="$(write_local_claude_gateway_config "$model_tag")"
+
+    ensure_litellm_proxy || return 1
 
     if [[ -f "$pid_file" ]]; then
         local existing_pid
@@ -227,7 +228,7 @@ launch_interactive_claude_session() {
     if ! command -v claude &>/dev/null; then
         tui_warn "Claude Code is unavailable; falling back to an interactive Ollama session."
         if [[ -r /dev/tty ]]; then
-            (cd "$session_dir" && ollama run "$model_tag" < /dev/tty > /dev/tty 2> /dev/tty)
+            (cd "$session_dir" && ollama run "$model_tag" < /dev/tty)
             return $?
         fi
         return 1
@@ -240,7 +241,7 @@ launch_interactive_claude_session() {
 
     if ! start_local_claude_gateway "$model_tag"; then
         tui_warn "Falling back to a direct interactive Ollama session."
-        (cd "$session_dir" && ollama run "$model_tag" < /dev/tty > /dev/tty 2> /dev/tty)
+        (cd "$session_dir" && ollama run "$model_tag" < /dev/tty)
         return $?
     fi
 
@@ -253,7 +254,7 @@ launch_interactive_claude_session() {
         export ANTHROPIC_BASE_URL="$base_url"
         export ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-pushbutton-local}"
         unset ANTHROPIC_AUTH_TOKEN
-        claude --model "$CLAUDE_GATEWAY_MODEL" < /dev/tty > /dev/tty 2> /dev/tty
+        claude --model "$CLAUDE_GATEWAY_MODEL" < /dev/tty
     )
     return $?
 }
