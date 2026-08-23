@@ -247,7 +247,7 @@ launch_interactive_claude_session() {
         cd "$session_dir"
         export ANTHROPIC_BASE_URL="$base_url"
         export ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-pushbutton-local}"
-        export ANTHROPIC_AUTH_TOKEN=""
+        unset ANTHROPIC_AUTH_TOKEN
         exec claude --model "$CLAUDE_GATEWAY_MODEL" < /dev/tty > /dev/tty 2> /dev/tty
     )
 }
