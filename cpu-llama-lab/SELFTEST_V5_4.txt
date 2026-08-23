@@ -1,0 +1,15 @@
+PASS test_plan
+PASS test_hardening
+PASS test_models
+PASS prefix-smoke fake--Q4: cache_n=512 prompt_n=1536
+PASS test_sweep
+PASS test_agent_quality
+PASS test_platforms
+KNL patch compatibility: PASS (all semantic anchors resolved; source unchanged)
+PASS: patch dry-run/apply/check/idempotence/revert/transactionality
+compiler=gcc-14 (Debian 14.2.0-19) 14.2.0
+baseline=15509.0566 knl_unrolled=15509.0625 abs_err=0.00585938 tol=15.5091 PASS
+native_probe baseline_ms=0.0108 unrolled_ms=0.0100 speedup=1.081x sink=1.24072e+07
+cc1: warning: '-march=knl' support will be removed in GCC 15 [-Wdeprecated]
+PASS: native correctness + KNL cross-compile + macro ISA audit + objdump hot-loop audit
+PASS: suite self-tests (component-equivalent release validation)

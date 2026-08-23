@@ -15,6 +15,11 @@ LLAMA_INSTALL_PREFIX="${LLAMA_INSTALL_PREFIX:-$HOME/.local}"
 
 # Private CUDA prefix installed by this script (never touches /usr/local).
 CUDA_PRIVATE_PREFIX="${CUDA_PRIVATE_PREFIX:-$HOME/.local/share/cuda-toolkit}"
+CUDA_RATTLER_CHANNEL="${CUDA_RATTLER_CHANNEL:-https://conda.anaconda.org/nvidia/label/cuda-12.9.1}"
+CUDA_BOOTSTRAP_ENV="${CUDA_BOOTSTRAP_ENV:-$HOME/.local/share/pushbutton/cuda-bootstrap-py}"
+CUDA_UV_TOOLS_DIR="${CUDA_UV_TOOLS_DIR:-$HOME/.local/share/pushbutton/tools}"
+CUDA_UV_CACHE_DIR="${CUDA_UV_CACHE_DIR:-$HOME/.local/share/pushbutton/uv-cache}"
+PY_RATTLER_VERSION="${PY_RATTLER_VERSION:-0.25.0}"
 
 # CUDA 12.9.1 is the pinned version for legacy architectures (Volta sm_70,
 # Pascal sm_61) because CUDA 13 removed their offline-compilation support.
@@ -124,6 +129,180 @@ install_cuda_toolkit() {
     export CPATH="$CUDA_PRIVATE_PREFIX/include:${CPATH:-}"
 
     tui_success "CUDA toolkit ready at $CUDA_PRIVATE_PREFIX ✓"
+}
+
+ensure_local_uv() {
+    local uv_bin=""
+    if command -v uv &>/dev/null; then
+        uv_bin="$(command -v uv)"
+    elif [[ -x "$CUDA_UV_TOOLS_DIR/bin/uv" ]]; then
+        uv_bin="$CUDA_UV_TOOLS_DIR/bin/uv"
+    else
+        tui_step "Installing private uv bootstrap…"
+        mkdir -p "$CUDA_UV_TOOLS_DIR/bin" "$CUDA_UV_CACHE_DIR"
+        local installer="$CUDA_UV_TOOLS_DIR/uv-install.sh"
+        curl -LsSf https://astral.sh/uv/install.sh -o "$installer"
+        env UV_UNMANAGED_INSTALL="$CUDA_UV_TOOLS_DIR/bin" UV_NO_MODIFY_PATH=1 sh "$installer" >/dev/null
+        uv_bin="$CUDA_UV_TOOLS_DIR/bin/uv"
+    fi
+
+    [[ -x "$uv_bin" ]] || {
+        tui_error "uv bootstrap returned no executable"
+        return 1
+    }
+
+    export UV_CACHE_DIR="$CUDA_UV_CACHE_DIR"
+    export UV_PYTHON_INSTALL_DIR="$HOME/.local/share/pushbutton/uv-python"
+    export UV_NO_MANAGED_PYTHON=1
+    printf '%s\n' "$uv_bin"
+}
+
+bootstrap_private_cuda_rattler() {
+    if [[ -x "$CUDA_PRIVATE_PREFIX/bin/nvcc" ]]; then
+        printf '%s\n' "$CUDA_PRIVATE_PREFIX/bin/nvcc"
+        return 0
+    fi
+
+    local uv_bin py
+    uv_bin="$(ensure_local_uv)"
+    py="$CUDA_BOOTSTRAP_ENV/bin/python"
+
+    tui_step "Provisioning private CUDA $CUDA12_VERSION via uv + py-rattler…"
+    mkdir -p "$CUDA_PRIVATE_PREFIX" "$CUDA_UV_CACHE_DIR"
+
+    if [[ ! -x "$py" ]]; then
+        "$uv_bin" venv "$CUDA_BOOTSTRAP_ENV" --python "$(command -v python3)" --no-managed-python >/dev/null
+    fi
+
+    "$uv_bin" pip install --python "$py" "py-rattler==$PY_RATTLER_VERSION" >/dev/null
+
+    "$py" - "$CUDA_PRIVATE_PREFIX" "$CUDA_RATTLER_CHANNEL" "$CUDA12_VERSION" "$CUDA12_CUBLAS_VERSION" <<'PYCUDA'
+import asyncio
+import os
+import sys
+from pathlib import Path
+from rattler import VirtualPackage, install, solve
+
+root = Path(sys.argv[1]).resolve()
+channel = sys.argv[2]
+cuda_version = sys.argv[3]
+cublas_version = sys.argv[4]
+
+async def main():
+    records = await solve(
+        channels=[channel],
+        specs=[f"cuda-minimal-build {cuda_version}", f"libcublas-dev {cublas_version}"],
+        virtual_packages=VirtualPackage.detect(),
+    )
+    root.mkdir(parents=True, exist_ok=True)
+    await install(records=records, target_prefix=str(root))
+
+asyncio.run(main())
+
+import platform as _platform
+_arch = _platform.machine() + "-linux"
+candidates = [root / "bin" / "nvcc", root / "targets" / _arch / "bin" / "nvcc"]
+candidates += list(root.glob("targets/*/bin/nvcc"))
+nvcc = next((p for p in candidates if p.is_file() and os.access(p, os.X_OK)), None)
+if nvcc is None:
+    raise SystemExit("nvcc not found after rattler installation")
+stable = root / "bin" / "nvcc"
+if stable != nvcc:
+    stable.parent.mkdir(parents=True, exist_ok=True)
+    if stable.exists() or stable.is_symlink():
+        stable.unlink()
+    stable.symlink_to(nvcc)
+print(stable)
+PYCUDA
+
+    [[ -x "$CUDA_PRIVATE_PREFIX/bin/nvcc" ]] || {
+        tui_error "private CUDA bootstrap completed but nvcc is unavailable"
+        return 1
+    }
+    printf '%s\n' "$CUDA_PRIVATE_PREFIX/bin/nvcc"
+}
+
+configure_cuda_env_from_nvcc() {
+    local nvcc_path="${1:?nvcc path required}"
+    local cuda_root
+    cuda_root="$(cd "$(dirname "$nvcc_path")/.." && pwd -P)"
+    local arch_linux; arch_linux="$(uname -m)-linux"
+    local target="$cuda_root/targets/$arch_linux"
+    # Fall back to any present target subdirectory if the arch-specific one doesn't exist.
+    if [[ ! -d "$target" ]]; then
+        local t; t="$(find "$cuda_root/targets" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | head -1)"
+        [[ -n "$t" ]] && target="$t"
+    fi
+
+    export CUDA_ROOT="$cuda_root"
+    export CUDA_HOME="$cuda_root"
+    export CUDA_PATH="$cuda_root"
+    export CUDACXX="$nvcc_path"
+    export PATH="$(dirname "$nvcc_path"):$PATH"
+
+    local lib_path="$cuda_root/lib64:$cuda_root/lib"
+    local inc_path="$cuda_root/include"
+    if [[ -d "$target" ]]; then
+        lib_path="$lib_path:$target/lib:$target/lib/stubs"
+        inc_path="$inc_path:$target/include"
+    fi
+    export LD_LIBRARY_PATH="$lib_path${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    export LIBRARY_PATH="$lib_path${LIBRARY_PATH:+:$LIBRARY_PATH}"
+    export CPATH="$inc_path${CPATH:+:$CPATH}"
+}
+
+ensure_nvcc() {
+    [[ -n "${GPU_MODEL:-}" ]] || eval "$(detect_gpu)"
+    local want_cuda12="false"
+    gpu_needs_cuda12 && want_cuda12="true"
+
+    local -a candidates=()
+    [[ -n "${CUDA_HOME:-}" ]] && candidates+=("$CUDA_HOME/bin/nvcc")
+    [[ -n "${CUDA_PATH:-}" ]] && candidates+=("$CUDA_PATH/bin/nvcc")
+    [[ -n "${CUDA_ROOT:-}" ]] && candidates+=("$CUDA_ROOT/bin/nvcc")
+    [[ -n "${CUDACXX:-}" ]] && candidates+=("$CUDACXX")
+    candidates+=(
+        "$CUDA_PRIVATE_PREFIX/bin/nvcc"
+        /usr/local/cuda-12.9/bin/nvcc
+        /usr/local/cuda-12.8/bin/nvcc
+        /usr/local/cuda-12.6/bin/nvcc
+        /usr/local/cuda-12.5/bin/nvcc
+        /usr/local/cuda-12.4/bin/nvcc
+        /usr/local/cuda-12.3/bin/nvcc
+        /usr/local/cuda-12.2/bin/nvcc
+        /usr/local/cuda-12.1/bin/nvcc
+        /usr/local/cuda-12.0/bin/nvcc
+        /usr/local/cuda/bin/nvcc
+    )
+    command -v nvcc &>/dev/null && candidates+=("$(command -v nvcc)")
+
+    local candidate release major
+    for candidate in "${candidates[@]}"; do
+        [[ -x "$candidate" ]] || continue
+        release="$("$candidate" --version 2>/dev/null | sed -n 's/.*release \([0-9][0-9]*\)\..*/\1/p' | tail -n1)"
+        major="${release:-0}"
+        if [[ "$want_cuda12" == "true" && "$major" -ge 13 ]]; then
+            continue
+        fi
+        configure_cuda_env_from_nvcc "$candidate"
+        printf '%s\n' "$candidate"
+        return 0
+    done
+
+    local bootstrapped=""
+    if bootstrapped="$(bootstrap_private_cuda_rattler 2>/dev/null)"; then
+        configure_cuda_env_from_nvcc "$bootstrapped"
+        printf '%s\n' "$bootstrapped"
+        return 0
+    fi
+
+    install_cuda_toolkit "$want_cuda12"
+    [[ -x "$CUDA_PRIVATE_PREFIX/bin/nvcc" ]] || {
+        tui_error "Failed to provision a usable nvcc"
+        return 1
+    }
+    configure_cuda_env_from_nvcc "$CUDA_PRIVATE_PREFIX/bin/nvcc"
+    printf '%s\n' "$CUDA_PRIVATE_PREFIX/bin/nvcc"
 }
 
 ensure_build_deps() {
@@ -270,23 +449,15 @@ build_llamacpp() {
     local build_success=false
 
     if [[ "$GPU_VENDOR" == "nvidia" ]]; then
-        # Determine whether this GPU needs a pinned CUDA 12.x toolkit.
-        local use_cuda12="false"
-        gpu_needs_cuda12 && use_cuda12="true"
-
-        # Install the CUDA toolkit automatically if nvcc is not already present.
-        if ! command -v nvcc &>/dev/null && [[ ! -x "${CUDA_ROOT:-}/bin/nvcc" ]]; then
-            tui_warn "NVIDIA GPU found but nvcc not in PATH — auto-installing CUDA toolkit."
-            install_cuda_toolkit "$use_cuda12" || {
-                tui_warn "CUDA toolkit installation failed — will attempt CPU-only build."
-            }
-        fi
-
-        if command -v nvcc &>/dev/null || [[ -x "${CUDA_ROOT:-}/bin/nvcc" ]]; then
+        local nvcc_path=""
+        nvcc_path="$(ensure_nvcc 2>/dev/null || true)"
+        if [[ -n "$nvcc_path" && -x "$nvcc_path" ]]; then
             local cuda_arch
             cuda_arch=$(cuda_arch_for_gpu)
-            local cuda_root="${CUDA_ROOT:-}"
+            local cuda_root="${CUDA_ROOT:-$(cd "$(dirname "$nvcc_path")/.." && pwd -P)}"
             build_with_cuda "$cuda_arch" "$cuda_root" && build_success=true || true
+        else
+            tui_warn "No usable nvcc found — will attempt CPU-only build."
         fi
     fi
 

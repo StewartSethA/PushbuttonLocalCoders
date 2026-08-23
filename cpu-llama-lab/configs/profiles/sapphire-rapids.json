@@ -1,0 +1,1 @@
+{"profile":"sapphire-rapids","note":"Reference profile label. Actual build choices are generated from detected CPU flags by lib/plan.py; this file is documentation/config namespace, not a source of truth."}

@@ -76,6 +76,9 @@ source "$LIB_DIR/docker_agent.sh"
 source "$LIB_DIR/ablation.sh"
 source "$LIB_DIR/network_nodes.sh"
 source "$LIB_DIR/orchestrator.sh"
+source "$LIB_DIR/install_gguf.sh"
+source "$LIB_DIR/install_glm.sh"
+source "$LIB_DIR/apple_ablate.sh"
 
 mkdir -p "$CONFIG_DIR"
 
@@ -136,6 +139,11 @@ Modes:
   --benchmark          Run an Ollama speed benchmark and save the runtime profile
   --nodes              Network node monitor (add/list/scan/live)
   --orchestrator       Start local orchestrator + developer agents
+  --qwen38            Deploy Qwen3.8 GGUF on llama.cpp using system nvcc
+  --qwen38-cuda       Deploy Qwen3.8 GGUF on llama.cpp and bootstrap private CUDA if needed
+  --glm52             Deploy GLM-5.2 AWQ INT4 on 8×A100 via Docker/vLLM
+  --apple-ablate      Run the Apple Silicon multi-backend ablation lab
+  --cpu-lab           Launch the extracted cpu-llama-lab toolkit
   --submit-benchmarks  Prepare a benchmark report file for PR submission
   --help               Show this help
 
@@ -182,6 +190,11 @@ while [[ $# -gt 0 ]]; do
                            fi
                            ;;
         --orchestrator)    MODE="orchestrator"   ; MODE_EXPLICIT=true ; shift ;;
+        --qwen38)          MODE="qwen38"         ; MODE_EXPLICIT=true ; shift ;;
+        --qwen38-cuda)     MODE="qwen38-cuda"    ; MODE_EXPLICIT=true ; shift ;;
+        --glm52)           MODE="glm52"          ; MODE_EXPLICIT=true ; shift ;;
+        --apple-ablate)    MODE="apple-ablate"   ; MODE_EXPLICIT=true ; shift ;;
+        --cpu-lab)         MODE="cpu-lab"        ; MODE_EXPLICIT=true ; shift ;;
         --submit-benchmarks) MODE="submit-benchmarks" ; MODE_EXPLICIT=true ; shift ;;
         --help|-h)         print_help ; exit 0   ;;
         --project)         PROJECT_DIR="$2"      ; shift 2 ;;
@@ -337,6 +350,40 @@ mode_submit_benchmarks() {
     prepare_system_benchmark_submission
 }
 
+mode_qwen38() {
+    tui_header "PushbuttonLocalCoders — Qwen3.8 llama.cpp"
+    eval "$(detect_all)"
+    if ! command -v nvcc &>/dev/null && [[ ! -x "${CUDA_ROOT:-}/bin/nvcc" ]]; then
+        tui_error "No system nvcc detected. Use --qwen38-cuda to bootstrap a private CUDA toolkit."
+        return 1
+    fi
+    build_llamacpp
+    GGUF_SKIP_BUILD=1 setup_qwen38_cuda "${MODEL_REPO:-unsloth/Qwen3.8-27B-GGUF}" "${GGUF_QWEN38_STATE_DIR:-$HOME/.local/share/pushbutton/qwen38}" "${GGUF_QWEN38_PORT:-8080}" "${GGUF_QWEN38_INSTANCE:-main}"
+}
+
+mode_qwen38_cuda() {
+    tui_header "PushbuttonLocalCoders — Qwen3.8 llama.cpp + private CUDA"
+    eval "$(detect_all)"
+    ensure_nvcc >/dev/null
+    build_llamacpp
+    GGUF_SKIP_BUILD=1 setup_qwen38_cuda "${MODEL_REPO:-unsloth/Qwen3.8-27B-GGUF}" "${GGUF_QWEN38_STATE_DIR:-$HOME/.local/share/pushbutton/qwen38}" "${GGUF_QWEN38_PORT:-8080}" "${GGUF_QWEN38_INSTANCE:-main}"
+}
+
+mode_glm52() {
+    tui_header "PushbuttonLocalCoders — GLM-5.2 AWQ INT4"
+    setup_glm52_a100 "${MODEL_REPO:-cyankiwi/GLM-5.2-AWQ-INT4}" "${GLM_MAX_MODEL_LEN:-32768}"
+}
+
+mode_apple_ablate() {
+    tui_header "PushbuttonLocalCoders — Apple Silicon Ablation"
+    setup_apple_ablate "${APPLE_ABLATE_LAB_DIR:-$PWD/.apple-llm-lab}"
+}
+
+mode_cpu_lab() {
+    tui_header "PushbuttonLocalCoders — CPU llama lab"
+    bash "$SCRIPT_DIR/cpu-llama-lab/cpu-llama-lab.sh"
+}
+
 # ── Dispatch ───────────────────────────────────────────────────────────────────
 case "$MODE" in
     quick)        mode_quick       ;;
@@ -348,6 +395,11 @@ case "$MODE" in
     benchmark)    mode_benchmark   ;;
     nodes)        mode_nodes        ;;
     orchestrator) mode_orchestrator ;;
+    qwen38)       mode_qwen38      ;;
+    qwen38-cuda)  mode_qwen38_cuda ;;
+    glm52)        mode_glm52       ;;
+    apple-ablate) mode_apple_ablate ;;
+    cpu-lab)      mode_cpu_lab     ;;
     submit-benchmarks) mode_submit_benchmarks ;;
     *)
         tui_error "Unknown mode: $MODE"

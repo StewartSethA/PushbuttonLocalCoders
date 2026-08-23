@@ -1,0 +1,26 @@
+CPU llama.cpp Lab v5.3.5 validation
+
+PASS test_plan
+PASS test_hardening
+PASS test_models
+PASS test_sweep
+PASS test_agent_quality
+PASS test_platforms
+PASS patch dry-run/apply/check/idempotence/revert/transactionality
+PASS native q4 numerical equivalence
+PASS GCC-14 KNL cross-compile
+PASS KNL ISA macro audit
+PASS objdump hot-loop audit
+
+Calibration ladder:
+  granite4-350m Q4_K_M
+  qwen3-0.6b Q4_0
+  granite4-1b Q4_K_M
+  granite4.1-3b Q4_K_M
+
+Cross-platform plan regression targets:
+  KNL / Xeon Phi 7250
+  2x Xeon Platinum 8168
+  EPYC Milan NPS4
+  EPYC Genoa NPS4
+  Threadripper Pro 5995WX

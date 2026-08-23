@@ -1,0 +1,16 @@
+CPU llama.cpp Lab v5.3.2 validation summary
+Date: 2026-08-22
+
+PASS test_plan
+PASS test_hardening
+PASS test_models
+PASS test_sweep
+
+PASS: patch dry-run/apply/check/idempotence/revert/transactionality
+
+compiler=gcc-14 (Debian 14.2.0-19) 14.2.0
+baseline=15509.0566 knl_unrolled=15509.0625 abs_err=0.00585938 tol=15.5091 PASS
+cc1: warning: '-march=knl' support will be removed in GCC 15 [-Wdeprecated]
+PASS: native correctness + KNL cross-compile + macro ISA audit + objdump hot-loop audit
+
+The KNL patcher test and codegen audit were also rerun separately after the sweep-policy changes and passed. The new test_sweep regression proves: no pre-winner depth >8192; cached PP suffixes 0->512, 512->2048, 2048->8192; deep continuation measures 8192->16384 rather than refilling 0->16384; and exactly one quant/configuration per model family enters the deep phase.

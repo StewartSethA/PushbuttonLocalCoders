@@ -1,0 +1,11 @@
+CPU llama.cpp Lab v5.4.1 validation
+PASS test_plan
+PASS test_hardening
+PASS test_models
+PASS test_agent_quality
+PASS test_platforms
+PASS prefix-smoke fake--Q4: cache_n=512 prompt_n=1536
+PASS test_sweep (includes KNL thread probe 34/68/136/272)
+PASS patch dry-run/apply/check/idempotence/revert/transactionality
+baseline=15509.0566 knl_unrolled=15509.0625 abs_err=0.00585938 PASS
+PASS native correctness + KNL cross-compile + macro ISA audit + objdump hot-loop audit

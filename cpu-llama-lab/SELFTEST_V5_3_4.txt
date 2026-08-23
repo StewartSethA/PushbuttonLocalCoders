@@ -1,0 +1,24 @@
+CPU llama.cpp Lab v5.3.4 validation
+
+PASS tests/test_plan.py
+PASS tests/test_hardening.py
+PASS tests/test_models.py
+PASS tests/test_sweep.py
+PASS tests/test_agent_quality.py
+PASS Python py_compile for lib/, scripts/, KNL patcher
+PASS shell syntax for cpu-llama-lab.sh and install-deps.sh
+PASS KNL patch dry-run/apply/check/idempotence/revert/transactionality
+PASS native numerical correctness
+PASS GCC-14 -march=knl cross-compile
+PASS KNL macro ISA audit
+PASS objdump hot-loop audit
+
+The agent-quality unit test verifies quant fallback ordering, 100% default fixture gate,
+PP/TG responsiveness floors, intentionally failing repo fixtures, and immutable tests.
+Actual model-dependent Anthropic Messages/Claude Code behavior is intentionally verified
+on the target host by `agent-quality`; no multi-GB GGUF was downloaded in the packaging
+environment.
+
+A single monolithic shell selftest invocation exceeded the packaging environment's
+execution ceiling after test_sweep; the remaining component tests were then executed
+individually and passed as listed above.

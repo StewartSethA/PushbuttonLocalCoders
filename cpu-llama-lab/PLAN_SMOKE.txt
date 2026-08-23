@@ -1,0 +1,321 @@
+{
+  "hostname": "00a1401113c9",
+  "kernel": "6.18.35",
+  "os": "Linux-6.18.35-x86_64-with-glibc2.41",
+  "cpu": {
+    "name": "INTEL(R) XEON(R) PLATINUM 8573C",
+    "vendor": "GenuineIntel",
+    "family": "6",
+    "model": "207",
+    "class": "xeon",
+    "generation": "emerald-rapids",
+    "sockets": 1,
+    "cores_per_socket": 5,
+    "threads_per_core": 1,
+    "logical_cpus": 5,
+    "flags": [
+      "3dnowprefetch",
+      "abm",
+      "adx",
+      "aes",
+      "apic",
+      "arat",
+      "arch_capabilities",
+      "avx",
+      "avx2",
+      "avx512_bf16",
+      "avx512_bitalg",
+      "avx512_fp16",
+      "avx512_vbmi2",
+      "avx512_vnni",
+      "avx512_vpopcntdq",
+      "avx512bw",
+      "avx512cd",
+      "avx512dq",
+      "avx512f",
+      "avx512ifma",
+      "avx512vbmi",
+      "avx512vl",
+      "avx_vnni",
+      "bmi1",
+      "bmi2",
+      "cldemote",
+      "clflush",
+      "clflushopt",
+      "clwb",
+      "cmov",
+      "constant_tsc",
+      "cpuid",
+      "cpuid_fault",
+      "cx16",
+      "cx8",
+      "de",
+      "erms",
+      "f16c",
+      "fma",
+      "fpu",
+      "fsgsbase",
+      "fsrm",
+      "fxsr",
+      "gfni",
+      "hle",
+      "ht",
+      "hypervisor",
+      "invpcid",
+      "lahf_lm",
+      "lm",
+      "mca",
+      "mce",
+      "mmx",
+      "movbe",
+      "movdir64b",
+      "movdiri",
+      "msr",
+      "mtrr",
+      "nonstop_tsc",
+      "nopl",
+      "nx",
+      "pae",
+      "pat",
+      "pcid",
+      "pclmulqdq",
+      "pdpe1gb",
+      "pge",
+      "pni",
+      "popcnt",
+      "pse",
+      "pse36",
+      "rdpid",
+      "rdrand",
+      "rdseed",
+      "rdtscp",
+      "rep_good",
+      "rtm",
+      "sep",
+      "serialize",
+      "sha_ni",
+      "smap",
+      "smep",
+      "ss",
+      "sse",
+      "sse2",
+      "sse4_1",
+      "sse4_2",
+      "ssse3",
+      "syscall",
+      "tsc",
+      "tsc_adjust",
+      "tsc_deadline_timer",
+      "tsc_known_freq",
+      "tsxldtrk",
+      "umip",
+      "vaes",
+      "vme",
+      "vpclmulqdq",
+      "waitpkg",
+      "x2apic",
+      "xgetbv1",
+      "xsave",
+      "xsavec",
+      "xsaveopt",
+      "xsaves",
+      "xtopology"
+    ]
+  },
+  "numa": {
+    "count": 1,
+    "nodes": [
+      {
+        "id": 0,
+        "cpulist": "0-4",
+        "memory_bytes": 6368813056
+      }
+    ]
+  },
+  "memory": {
+    "populated_dimms": null,
+    "dimms": [],
+    "platform_channels_per_socket_hint": 8,
+    "mcdram": {
+      "mode_hint": "not-applicable",
+      "visible_nodes": [],
+      "visible_bytes": 0
+    }
+  },
+  "toolchain": [
+    {
+      "name": "gcc-14",
+      "path": "/usr/bin/gcc-14",
+      "version": "gcc-14 (Debian 14.2.0-19) 14.2.0"
+    },
+    {
+      "name": "g++-14",
+      "path": "/usr/bin/g++-14",
+      "version": "g++-14 (Debian 14.2.0-19) 14.2.0"
+    },
+    {
+      "name": "gcc",
+      "path": "/usr/bin/gcc",
+      "version": "gcc (Debian 14.2.0-19) 14.2.0"
+    },
+    {
+      "name": "g++",
+      "path": "/usr/bin/g++",
+      "version": "g++ (Debian 14.2.0-19) 14.2.0"
+    },
+    {
+      "name": "clang",
+      "path": "/usr/local/swift/usr/bin/clang",
+      "version": "clang version 17.0.0 (https://github.com/swiftlang/llvm-project.git 10999b6d034fe318f3d56c83bddb6572593a8bb0)"
+    },
+    {
+      "name": "clang++",
+      "path": "/usr/local/swift/usr/bin/clang++",
+      "version": "clang version 17.0.0 (https://github.com/swiftlang/llvm-project.git 10999b6d034fe318f3d56c83bddb6572593a8bb0)"
+    }
+  ],
+  "features": {
+    "avx2": true,
+    "avx512f": true,
+    "avx512bw": true,
+    "avx512dq": true,
+    "avx512vl": true,
+    "avx512vnni": true,
+    "avxvnni": true,
+    "avx512bf16": true,
+    "amxint8": false,
+    "amxbf16": false,
+    "knl_pf": false,
+    "knl_er": false,
+    "prefetchwt1": false
+  }
+}
+--- PLAN ---
+{
+  "hardware_summary": {
+    "class": "xeon",
+    "generation": "emerald-rapids",
+    "phys_cores": 5,
+    "logical": 5,
+    "numa_nodes": 1
+  },
+  "builds": [
+    {
+      "name": "native",
+      "cmake": [
+        "-DGGML_NATIVE=ON",
+        "-DGGML_CPU_REPACK=ON"
+      ]
+    },
+    {
+      "name": "native-norepack",
+      "cmake": [
+        "-DGGML_NATIVE=ON",
+        "-DGGML_CPU_REPACK=OFF"
+      ]
+    },
+    {
+      "name": "native-lto",
+      "cmake": [
+        "-DGGML_NATIVE=ON",
+        "-DGGML_CPU_REPACK=ON",
+        "-DGGML_LTO=ON"
+      ]
+    },
+    {
+      "name": "native-openblas",
+      "cmake": [
+        "-DGGML_NATIVE=ON",
+        "-DGGML_CPU_REPACK=ON",
+        "-DGGML_BLAS=ON",
+        "-DGGML_BLAS_VENDOR=OpenBLAS"
+      ],
+      "optional": "openblas"
+    },
+    {
+      "name": "isa-avx2",
+      "cmake": [
+        "-DGGML_NATIVE=OFF",
+        "-DGGML_SSE42=ON",
+        "-DGGML_AVX=ON",
+        "-DGGML_F16C=ON",
+        "-DGGML_FMA=ON",
+        "-DGGML_AVX2=ON",
+        "-DGGML_BMI2=ON",
+        "-DGGML_AVX512=OFF"
+      ]
+    },
+    {
+      "name": "isa-avx2-vnni",
+      "cmake": [
+        "-DGGML_NATIVE=OFF",
+        "-DGGML_SSE42=ON",
+        "-DGGML_AVX=ON",
+        "-DGGML_F16C=ON",
+        "-DGGML_FMA=ON",
+        "-DGGML_AVX2=ON",
+        "-DGGML_BMI2=ON",
+        "-DGGML_AVX_VNNI=ON",
+        "-DGGML_AVX512=OFF"
+      ]
+    },
+    {
+      "name": "isa-avx512",
+      "cmake": [
+        "-DGGML_NATIVE=OFF",
+        "-DGGML_SSE42=ON",
+        "-DGGML_AVX=ON",
+        "-DGGML_F16C=ON",
+        "-DGGML_FMA=ON",
+        "-DGGML_AVX2=ON",
+        "-DGGML_BMI2=ON",
+        "-DGGML_AVX512=ON",
+        "-DGGML_AVX512_VNNI=ON",
+        "-DGGML_AVX512_BF16=ON"
+      ]
+    }
+  ],
+  "threads": [
+    2,
+    5
+  ],
+  "numa_policies": [
+    {
+      "name": "disabled",
+      "llama": [],
+      "prefix": []
+    }
+  ],
+  "depths": [
+    512,
+    2048,
+    8192,
+    32768,
+    65536,
+    131072,
+    262144
+  ],
+  "kv_types": [
+    "q4_0",
+    "q8_0",
+    "f16"
+  ],
+  "search": {
+    "quick_depths": [
+      512,
+      2048
+    ],
+    "full_depths": [
+      512,
+      2048,
+      8192,
+      32768,
+      65536,
+      131072,
+      262144
+    ],
+    "quick_reps": 1,
+    "final_reps": 3,
+    "prune_fraction": 0.5
+  }
+}

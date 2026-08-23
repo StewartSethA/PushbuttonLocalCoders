@@ -1,0 +1,22 @@
+PASS test_plan
+PASS test_hardening
+KNL patch compatibility: PASS (all semantic anchors resolved; source unchanged)
+KNL patch applied transactionally; backups at /mnt/data/cpu-lab-selftest/tmpbm0oilfw/.knl-llama-lab-v3-backup
+PATCHED ggml/CMakeLists.txt
+PATCHED ggml/src/CMakeLists.txt
+PATCHED ggml/src/ggml-cpu/CMakeLists.txt
+PATCHED ggml/src/ggml-cpu/arch/x86/cpu-feats.cpp
+PATCHED ggml/src/ggml-cpu/arch/x86/quants.c
+KNL patch already present; no changes made
+RESTORED ggml/CMakeLists.txt
+RESTORED ggml/src/CMakeLists.txt
+RESTORED ggml/src/ggml-cpu/CMakeLists.txt
+RESTORED ggml/src/ggml-cpu/arch/x86/cpu-feats.cpp
+RESTORED ggml/src/ggml-cpu/arch/x86/quants.c
+PASS: patch dry-run/apply/check/idempotence/revert/transactionality
+compiler=gcc-14 (Debian 14.2.0-19) 14.2.0
+baseline=15509.0566 knl_unrolled=15509.0625 abs_err=0.00585938 tol=15.5091 PASS
+native_probe baseline_ms=0.0190 unrolled_ms=0.0189 speedup=1.005x sink=1.24072e+07
+cc1: warning: '-march=knl' support will be removed in GCC 15 [-Wdeprecated]
+PASS: native correctness + KNL cross-compile + macro ISA audit + objdump hot-loop audit
+PASS: suite self-tests

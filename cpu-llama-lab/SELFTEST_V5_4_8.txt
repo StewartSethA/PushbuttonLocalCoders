@@ -1,0 +1,10 @@
+CPU llama.cpp Lab v5.4.8 validation summary
+
+PASS Python 3.8 grammar / py_compile / shell syntax via package selftest components.
+PASS test_plan, test_hardening, test_clock, test_models, test_sweep, test_agent_quality, test_platforms.
+PASS KNL patch dry-run/apply/check/idempotence/revert/transactionality.
+PASS KNL numerical equivalence, GCC14 -march=knl cross-compile, ISA macro audit, and objdump hot-loop audit.
+PASS synthetic primary-ballpark: one llama-bench load/config parsed PP128/TG32 at depth 0/512, KNL causal pairs, promotion decision, and result JSON.
+PASS synthetic batch-report: recovered raw[].avg_ts, ranked batch/ubatch settings, and wrote JSON/TSV.
+
+The combined top-level selftest exceeded the external execution wrapper timeout after the normal Python/platform tests; the remaining KNL patch/codegen checks were then executed separately and passed. This is an execution-wrapper limit, not a test failure.

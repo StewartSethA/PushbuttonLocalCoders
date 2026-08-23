@@ -16,6 +16,9 @@ declare -a MODEL_CATALOGUE=(
     "qwen3.6:35b|Qwen 3.6 35B-A3B|35|99|262144|coder"
     "qwen3.8:27b|Qwen 3.8 27B|27|97|262144|coder"
     "nemotron-3.5-lightning|Nemotron 3.5 Lightning 30B-A3B|30|95|262144|coder"
+    "qwen3.8-27b:q4_K_M|Qwen3.8-27B Q4_K_M|27|90|262144|coder"
+    "qwen3.6:35b-a3b-q4_K_M|Qwen3.6-35B-A3B Q4_K_M|35|88|131072|coder"
+    "nemotron-3.5-lightning:30b-a3b-q4_K_M|Nemotron-Lightning-30B-A3B Q4_K_M|30|86|32768|coder"
 )
 
 declare -a ORCHESTRATOR_CATALOGUE=(

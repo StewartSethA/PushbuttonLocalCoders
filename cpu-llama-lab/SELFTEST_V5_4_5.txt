@@ -1,0 +1,14 @@
+CPU llama.cpp Lab v5.4.5 validation
+PASS Python 3.8 grammar parse for every .py file
+PASS current-Python py_compile for every .py file
+PASS bash -n cpu-llama-lab.sh + install-deps.sh
+PASS test_plan
+PASS test_hardening
+PASS test_models
+PASS test_sweep
+PASS test_agent_quality
+PASS test_platforms (includes 1920X/1950X Zen1 + 4-channel detection)
+PASS LLAMA_REF repin of an existing clean checkout across two test commits
+PASS selftest fail-closed: injected Python syntax error returns rc=1 immediately
+PASS KNL patch dry-run/apply/idempotence/revert/transactionality
+PASS native numerical equivalence + KNL cross-compile + ISA + objdump verifier

@@ -1,0 +1,19 @@
+CPU llama.cpp Lab v5.4.6 validation
+
+PASS Python 3.8 grammar parse for every .py file
+PASS current-Python py_compile for every .py file
+PASS shell syntax
+PASS test_plan
+PASS test_hardening
+PASS test_clock
+PASS test_models
+PASS test_sweep (bootstrap/prefix/thread/KV fixtures; Q4 injected SIGILL remains correctly classified)
+PASS test_agent_quality
+PASS test_platforms (including 7250/1920X/1950X nominal-base detection)
+PASS KNL patch dry-run/apply/check/idempotence/revert/transactionality
+PASS numerical equivalence
+PASS GCC14 KNL cross-compile
+PASS ISA macro audit
+PASS objdump hot-loop audit
+
+Note: validation components were executed in segments in the build container because the outer tool has a wall-time cap; every command used by ./cpu-llama-lab.sh selftest passed independently. The shipped selftest still runs them sequentially and fails closed on the first error.

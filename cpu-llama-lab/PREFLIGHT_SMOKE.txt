@@ -1,0 +1,3 @@
+INFO   transparent-hugepages: Transparent Huge Page policy recorded; do not change it between compared runs.
+MEDIUM perf-unavailable: perf is not fully usable (missing); performance counters will be omitted.
+MEDIUM cpuset-restricted: Process CPU allowance is restricted to 0-63; results represent this cpuset, not necessarily the whole machine.

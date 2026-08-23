@@ -1,0 +1,24 @@
+CPU llama.cpp Lab v5.3.1 release validation
+
+PASS test_plan
+PASS test_hardening
+PASS test_models
+PASS test_sweep
+PASS: patch dry-run/apply/check/idempotence/revert/transactionality
+compiler=gcc-14 (Debian 14.2.0-19) 14.2.0
+baseline=15509.0566 knl_unrolled=15509.0625 abs_err=0.00585938 tol=15.5091 PASS
+native_probe baseline_ms=0.0168 unrolled_ms=0.0160 speedup=1.054x sink=1.24072e+07
+PASS: native correctness + KNL cross-compile + macro ISA audit + objdump hot-loop audit
+
+Additional v5.3.1 sweep regression coverage:
+- timeout/process-group termination helpers
+- experiment-tagged append-only result resume keys
+- persistent-server cache reuse proof
+- incremental PP suffix accounting (0->512, 512->2048 in fake-server E2E)
+- TG endpoint recording
+- interrupted-run shallow-TG backfill + deepest-prefix restoration
+- quick -> finalist -> batch -> full fake orchestration
+
+No production GGUF payload was downloaded in the artifact build environment.
+The target-machine `models-plan` command performs a metadata-only live inventory/fit preview;
+`overnight` performs the actual downloads and measurements.

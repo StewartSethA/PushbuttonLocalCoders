@@ -1,0 +1,16 @@
+CPU llama.cpp Lab v5.4.7 validation
+
+PASS Python 3.8 grammar parse for every .py file
+PASS test_plan
+PASS test_hardening
+PASS test_clock
+PASS test_models
+PASS test_sweep (including exact five-control KNL fast platform plan)
+PASS test_agent_quality
+PASS test_platforms
+PASS KNL patch dry-run/apply/check/idempotence/revert/transactionality
+PASS native numerical correctness + GCC14 KNL cross-compile + macro ISA audit + objdump hot-loop audit
+PASS synthetic KNL fast-plan: 5 causal configs, 34/68/136/272 thread probe, 512/2048 depths, 300 s budget
+PASS synthetic TR1950X fast-plan: native/no-repack, native, AVX2, interleave; 8/16/32 thread probe; 512/2048 depths, 300 s budget
+
+The all-in-one selftest invocation exceeded the external validation wrapper timeout after test_sweep; the remaining tests and KNL verifier were then run separately and passed. This is a validation-wrapper timeout, not a package test failure.
