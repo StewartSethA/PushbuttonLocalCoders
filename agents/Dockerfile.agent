@@ -20,8 +20,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # ── Python tooling ───────────────────────────────────────────────────────────
 RUN pip3 install --no-cache-dir anthropic requests 2>/dev/null || true
 
-# ── Claude CLI ───────────────────────────────────────────────────────────────
-RUN npm install -g @anthropic-ai/claude-cli 2>/dev/null || true
+# ── Claude Code ──────────────────────────────────────────────────────────────
+RUN npm install -g @anthropic-ai/claude-code 2>/dev/null || true
 
 # ── Agent entrypoint script ──────────────────────────────────────────────────
 COPY agent_entrypoint.sh /usr/local/bin/agent_entrypoint.sh

@@ -48,7 +48,9 @@ resolve_agent_models() {
         DEVELOPER_MODEL="$SELECTED_MODEL"
     fi
 
-    export ORCHESTRATOR_MODEL DEVELOPER_MODEL
+    DEVELOPER_MODELS="${DEVELOPER_MODELS:-$DEVELOPER_MODEL}"
+
+    export ORCHESTRATOR_MODEL DEVELOPER_MODEL DEVELOPER_MODELS
 }
 
 # ── Launch a single agent process ─────────────────────────────────────────────
@@ -95,7 +97,7 @@ run_orchestrator() {
     tui_header "Launching Agent Team"
     tui_info "Objective   : $objective"
     tui_info "Orchestrator: $ORCHESTRATOR_MODEL"
-    tui_info "Developer(s): $DEVELOPER_MODEL (×${num_developers})"
+    tui_info "Developer(s): $DEVELOPER_MODELS"
     echo ""
 
     # Create FIFOs
@@ -111,8 +113,11 @@ run_orchestrator() {
     launch_agent "orchestrator" "$ORCHESTRATOR_MODEL" "0" "$orch_fifo"
 
     # Launch developer agents
+    local developer_models=()
+    IFS=',' read -r -a developer_models <<< "$DEVELOPER_MODELS"
     for (( d=0; d<num_developers; d++ )); do
-        launch_agent "developer" "$DEVELOPER_MODEL" "$d" "${dev_fifos[$d]}"
+        local dev_model="${developer_models[$(( d % ${#developer_models[@]} ))]}"
+        launch_agent "developer" "$dev_model" "$d" "${dev_fifos[$d]}"
     done
 
     tui_success "Agent team running. PIDs: ${AGENT_PIDS[*]}"

@@ -11,12 +11,13 @@
 #
 # Modes:
 #   --quick          Just get me running (default): install Ollama + Claude CLI,
-#                    pull best-fit coder model.
+#                    prompt before pulling modern coder models.
 #   --explore        Explore better/faster models: run hardware ablation to find
 #                    the optimal model and quantisation for this machine.
 #   --agent          Wrap a project directory in a sandboxed Docker agent team.
 #   --monitor        Launch live GPU/CPU/node monitor TUI.
 #   --build-llamacpp Build llama.cpp with GPU optimisations.
+#   --submit-benchmarks  Prepare a benchmark contribution file for a PR.
 #   --help           Show this help.
 # ═══════════════════════════════════════════════════════════════════════════════
 set -euo pipefail
@@ -24,13 +25,23 @@ set -euo pipefail
 REPO_URL="https://github.com/StewartSethA/PushbuttonLocalCoders.git"
 INSTALL_DIR="${PUSHBUTTON_DIR:-$HOME/.local/share/pushbutton}"
 CONFIG_DIR="$HOME/.config/pushbutton"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR=""
+
+if [[ ${BASH_SOURCE[0]+set} ]]; then
+    SCRIPT_PATH="${BASH_SOURCE[0]}"
+elif [[ -n "${0:-}" ]] && [[ -f "$0" ]]; then
+    SCRIPT_PATH="$0"
+fi
+
+if [[ -n "${SCRIPT_PATH:-}" ]]; then
+    SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+fi
 
 # ── Determine lib directory ────────────────────────────────────────────────────
 # When run via curl pipe the script is downloaded to a tmp file without the lib/
 # directory next to it, so we clone the repo first.
 bootstrap_repo() {
-    if [[ -d "$SCRIPT_DIR/lib" ]]; then
+    if [[ -n "$SCRIPT_DIR" ]] && [[ -d "$SCRIPT_DIR/lib" ]]; then
         LIB_DIR="$SCRIPT_DIR/lib"
         AGENTS_DIR="$SCRIPT_DIR/agents"
         ENTRY_SCRIPT="$SCRIPT_DIR/install.sh"
@@ -81,6 +92,34 @@ BENCHMARK_CONTEXT_SWEEP="ask"
 BENCHMARK_FRAMEWORK="ollama"
 MODE_EXPLICIT=false
 
+collect_requested_models() {
+    local models=()
+    local seen="|"
+    local candidate
+
+    for candidate in "${PRIMARY_CODER_MODEL:-}" "${ORCHESTRATOR_MODEL:-}"; do
+        [[ -z "$candidate" ]] && continue
+        if [[ "$seen" != *"|$candidate|"* ]]; then
+            models+=("$candidate")
+            seen="${seen}${candidate}|"
+        fi
+    done
+
+    if [[ -n "${ADDITIONAL_CODER_MODELS:-}" ]]; then
+        local extras=()
+        IFS=',' read -r -a extras <<< "$ADDITIONAL_CODER_MODELS"
+        for candidate in "${extras[@]}"; do
+            [[ -z "$candidate" ]] && continue
+            if [[ "$seen" != *"|$candidate|"* ]]; then
+                models+=("$candidate")
+                seen="${seen}${candidate}|"
+            fi
+        done
+    fi
+
+    printf '%s\n' "${models[@]}"
+}
+
 print_help() {
     cat <<HELP
 ${BOLD}PushbuttonLocalCoders${RESET} — Local AI coding assistant bootstrap
@@ -88,7 +127,7 @@ ${BOLD}PushbuttonLocalCoders${RESET} — Local AI coding assistant bootstrap
 Usage: install.sh [MODE] [OPTIONS]
 
 Modes:
-  --quick              (default) Install Ollama + Claude CLI, pull best model
+  --quick              (default) Install Ollama + Claude Code, bridge it to the local model, and launch it
   --explore            Run hardware ablation to find optimal model/quant
   --agent              Wrap project in Docker agent sandbox
   --team               Launch multi-agent team via Docker Compose
@@ -97,6 +136,7 @@ Modes:
   --benchmark          Run an Ollama speed benchmark and save the runtime profile
   --nodes              Network node monitor (add/list/scan/live)
   --orchestrator       Start local orchestrator + developer agents
+  --submit-benchmarks  Prepare a benchmark report file for PR submission
   --help               Show this help
 
 Options:
@@ -113,8 +153,10 @@ Options:
 Environment:
   ANTHROPIC_API_KEY    Anthropic API key for Claude cloud features
   OLLAMA_HOST          Ollama API host (default: http://localhost:11434)
-  DEVELOPER_MODEL      Override developer model
+  DEVELOPER_MODEL      Override primary developer model
   ORCHESTRATOR_MODEL   Override orchestrator model
+  PUSHBUTTON_CLAUDE_GATEWAY_PORT  LiteLLM bridge port (default: 4000)
+  PUSHBUTTON_ACCEPT_MODEL_PLAN=1   Accept the shown plan non-interactively
 
 HELP
 }
@@ -140,6 +182,7 @@ while [[ $# -gt 0 ]]; do
                            fi
                            ;;
         --orchestrator)    MODE="orchestrator"   ; MODE_EXPLICIT=true ; shift ;;
+        --submit-benchmarks) MODE="submit-benchmarks" ; MODE_EXPLICIT=true ; shift ;;
         --help|-h)         print_help ; exit 0   ;;
         --project)         PROJECT_DIR="$2"      ; shift 2 ;;
         --task)            TASK="$2"             ; shift 2 ;;
@@ -159,20 +202,26 @@ done
 mode_quick() {
     tui_header "PushbuttonLocalCoders — Quick Setup"
 
-    # 1. Detect hardware and pick best model
+    # 1. Detect hardware and confirm a model plan
     print_model_recommendation
-    eval "$(detect_inference_memory)"
+    configure_model_plan || {
+        tui_warn "Cancelled before installing models."
+        return 0
+    }
 
-    if [[ -z "${SELECTED_MODEL:-}" ]]; then
-        auto_select_model
-    fi
+    tui_info "Primary coder: $PRIMARY_CODER_MODEL"
 
-    tui_info "Selected model: $SELECTED_MODEL"
+    # 2. Install Ollama and pull selected models
+    local requested_models=()
+    while IFS= read -r model_tag; do
+        [[ -n "$model_tag" ]] && requested_models+=("$model_tag")
+    done < <(collect_requested_models)
+    setup_ollama "${requested_models[@]}"
 
-    # 2. Install Ollama and pull model
-    setup_ollama "$SELECTED_MODEL"
+    # 3. Record estimated vs actual PP/TG
+    benchmark_selected_models "${requested_models[@]}"
 
-    # 3. Install Claude CLI
+    # 4. Install Claude CLI
     setup_claude
 
     # 4. Offer a quick speed benchmark and persist the runtime profile
@@ -180,17 +229,20 @@ mode_quick() {
 
     tui_header "Setup Complete"
     echo ""
+    echo "  Claude Code :  ANTHROPIC_BASE_URL=http://${PUSHBUTTON_CLAUDE_GATEWAY_HOST:-127.0.0.1}:${PUSHBUTTON_CLAUDE_GATEWAY_PORT:-4000} claude --model ${PUSHBUTTON_CLAUDE_GATEWAY_MODEL:-pushbutton-local}"
     echo "  Run a query :  ollama run $SELECTED_MODEL \"Write a hello world in Python\""
     echo "  Monitor     :  bash $ENTRY_SCRIPT --monitor"
     echo "  Agent mode  :  bash $ENTRY_SCRIPT --agent --project /your/project --task 'Improve this code'"
     echo "  Explore     :  bash $ENTRY_SCRIPT --explore"
     echo "  Runtime env :  source $RUNTIME_ENV_FILE"
     echo ""
+
+    launch_interactive_claude_session "$SELECTED_MODEL" "$PWD" || true
 }
 
 mode_explore() {
     tui_header "PushbuttonLocalCoders — Explore Mode"
-    tui_info "Running hardware ablation to find optimal model/quant…"
+    tui_info "Running modern PP/TG benchmarks and recording estimate accuracy…"
 
     setup_ollama  # ensure Ollama is running
     run_hardware_ablation
@@ -201,18 +253,37 @@ mode_agent() {
     [[ -z "$PROJECT_DIR" ]] && PROJECT_DIR="$(pwd)"
     [[ -z "$TASK"        ]] && TASK="Improve code quality and fix any issues"
 
-    eval "$(detect_inference_memory)"
-    if [[ -z "${SELECTED_MODEL:-}" ]]; then
-        auto_select_model
-    fi
+    configure_model_plan || {
+        tui_warn "Cancelled before installing models."
+        return 0
+    }
 
-    run_agent_sandbox "$PROJECT_DIR" "$TASK" "$SELECTED_MODEL"
+    local requested_models=()
+    while IFS= read -r model_tag; do
+        [[ -n "$model_tag" ]] && requested_models+=("$model_tag")
+    done < <(collect_requested_models)
+    setup_ollama "${requested_models[@]}"
+    benchmark_selected_models "$PRIMARY_CODER_MODEL"
+
+    run_agent_sandbox "$PROJECT_DIR" "$TASK" "$PRIMARY_CODER_MODEL"
 }
 
 mode_team() {
     tui_header "PushbuttonLocalCoders — Agent Team Mode"
     [[ -z "$PROJECT_DIR" ]] && PROJECT_DIR="$(pwd)"
     [[ -z "$TASK"        ]] && TASK="Develop and iterate on this codebase"
+
+    configure_model_plan || {
+        tui_warn "Cancelled before installing models."
+        return 0
+    }
+
+    local requested_models=()
+    while IFS= read -r model_tag; do
+        [[ -n "$model_tag" ]] && requested_models+=("$model_tag")
+    done < <(collect_requested_models)
+    setup_ollama "${requested_models[@]}"
+    benchmark_selected_models "${requested_models[@]}"
 
     start_agent_team "$PROJECT_DIR" "$TASK"
 }
@@ -239,6 +310,16 @@ mode_nodes() {
 mode_orchestrator() {
     tui_header "PushbuttonLocalCoders — Local Orchestrator"
     [[ -z "$TASK" ]] && TASK="Improve this codebase"
+    configure_model_plan || {
+        tui_warn "Cancelled before installing models."
+        return 0
+    }
+    local requested_models=()
+    while IFS= read -r model_tag; do
+        [[ -n "$model_tag" ]] && requested_models+=("$model_tag")
+    done < <(collect_requested_models)
+    setup_ollama "${requested_models[@]}"
+    benchmark_selected_models "${requested_models[@]}"
     run_orchestrator "$TASK" "$NUM_DEVS"
 }
 
@@ -249,6 +330,11 @@ mode_benchmark() {
     fi
     setup_ollama "$SELECTED_MODEL"
     maybe_run_post_setup_benchmark "$SELECTED_MODEL" "$BENCHMARK_FRAMEWORK" "yes" "$BENCHMARK_CONTEXT_SWEEP"
+}
+
+mode_submit_benchmarks() {
+    tui_header "PushbuttonLocalCoders — Submit Benchmarks"
+    prepare_system_benchmark_submission
 }
 
 # ── Dispatch ───────────────────────────────────────────────────────────────────
@@ -262,6 +348,7 @@ case "$MODE" in
     benchmark)    mode_benchmark   ;;
     nodes)        mode_nodes        ;;
     orchestrator) mode_orchestrator ;;
+    submit-benchmarks) mode_submit_benchmarks ;;
     *)
         tui_error "Unknown mode: $MODE"
         print_help
