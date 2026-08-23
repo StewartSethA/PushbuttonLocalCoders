@@ -457,7 +457,8 @@ configure_cloud_preferences() {
                 read -r -p "Cloud provider name (e.g. openrouter): " provider_name
                 read -r -p "Provider base URL: " provider_url
                 read -r -p "Auth type (bearer/api-key): " provider_auth
-                read -r -p "Auth token/key: " provider_token
+                read -r -s -p "Auth token/key: " provider_token
+                echo ""
                 if [[ -n "$provider_name" && -n "$provider_url" && -n "$provider_auth" && -n "$provider_token" ]]; then
                     CLOUD_PROVIDER_ENTRIES="${provider_name}|${provider_url}|${provider_auth}|${provider_token}"
                     PUSHBUTTON_CLOUD_PROVIDERS="$CLOUD_PROVIDER_ENTRIES"
@@ -504,7 +505,6 @@ configure_cloud_preferences() {
 build_agent_catalog() {
     local hardware_target="$1"
     local source_model
-    : > "$AGENT_CATALOG_FILE"
     printf "agent\tmodel\tsource\thardware_target\n" > "$AGENT_CATALOG_FILE"
 
     printf "developer\t%s\tlocal\t%s\n" "${PRIMARY_CODER_MODEL:-}" "$hardware_target" >> "$AGENT_CATALOG_FILE"
