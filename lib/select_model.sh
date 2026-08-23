@@ -161,8 +161,12 @@ estimate_effective_context() {
 }
 
 estimate_hardware_speed_multiplier() {
-    eval "$(detect_gpu)"
-    eval "$(detect_cpu)"
+    if [[ -z "${GPU_VENDOR:-}" || -z "${GPU_COUNT:-}" ]]; then
+        eval "$(detect_gpu)"
+    fi
+    if [[ -z "${CPU_THREADS:-}" ]]; then
+        eval "$(detect_cpu)"
+    fi
 
     case "$GPU_VENDOR" in
         nvidia) echo "$(float_eval "1.35 * ($GPU_COUNT > 0 ? $GPU_COUNT : 1)")" ;;
@@ -372,7 +376,18 @@ menu_choose_additional_models() {
                 return 0
             fi
             if [[ -n "${choice:-}" ]]; then
-                selected+=("${menu_tags[$((REPLY-1))]}")
+                local selection_index selected_tag
+                selection_index=$((REPLY-1))
+                if (( selection_index < 0 || selection_index >= ${#menu_tags[@]} )); then
+                    tui_warn "Invalid selection."
+                    continue
+                fi
+                selected_tag="${menu_tags[$selection_index]}"
+                [[ -n "$selected_tag" ]] || {
+                    tui_warn "Invalid selection."
+                    continue
+                }
+                selected+=("$selected_tag")
                 break
             fi
             tui_warn "Invalid selection."

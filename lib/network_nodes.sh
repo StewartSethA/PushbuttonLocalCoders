@@ -11,6 +11,7 @@ NODES_FILE="${NODES_FILE:-$HOME/.config/pushbutton/nodes.txt}"
 SSH_USER="${SSH_USER:-$USER}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_rsa}"
 SSH_TIMEOUT="${SSH_TIMEOUT:-5}"
+OLLAMA_PORT="${OLLAMA_PORT:-11434}"
 
 # ── Node file management ───────────────────────────────────────────────────────
 ensure_nodes_file() {
@@ -89,6 +90,34 @@ REMOTE
     echo "$ip|$result"
 }
 
+query_node_ollama() {
+    local ip="$1"
+    local endpoint="http://${ip}:${OLLAMA_PORT}/api/tags"
+    local payload
+
+    payload=$(curl -fsS --max-time "$SSH_TIMEOUT" "$endpoint" 2>/dev/null || true)
+    if [[ -z "$payload" ]]; then
+        echo "offline|0|"
+        return 0
+    fi
+
+    printf '%s' "$payload" | python3 -c '
+import json
+import sys
+
+try:
+    payload = json.load(sys.stdin)
+except Exception:
+    print("online|0|")
+    raise SystemExit(0)
+
+models = payload.get("models", []) or []
+names = [m.get("name", "") for m in models if m.get("name")]
+summary = ", ".join(names[:6])
+print(f"online|{len(names)}|{summary}")
+'
+}
+
 # ── Monitor all nodes ──────────────────────────────────────────────────────────
 monitor_nodes_snapshot() {
     local nodes
@@ -100,8 +129,8 @@ monitor_nodes_snapshot() {
     fi
 
     tui_header "Network Node Monitor"
-    printf "%-22s  %-12s  %-20s  %s\n" "Node" "CPU%" "RAM" "GPU"
-    printf '%0.s─' {1..90}; echo ""
+    printf "%-22s  %-12s  %-20s  %-28s  %s\n" "Node" "CPU%" "RAM" "Ollama" "GPU"
+    printf '%0.s─' {1..120}; echo ""
 
     for ip in "${nodes[@]}"; do
         local info
@@ -111,11 +140,44 @@ monitor_nodes_snapshot() {
         if [[ "$data" == "UNREACHABLE" ]]; then
             printf "%-22s  %-12s\n" "$node_ip" "UNREACHABLE"
         else
-            local cpu ram gpu
+            local cpu ram gpu ollama_state ollama_count ollama_summary ollama_cell ollama_info
             cpu=$(echo "$data" | grep -oP '(?<=cpu=)\S+' || echo "N/A")
             ram=$(echo "$data" | grep -oP '(?<=ram=)[^\s]+\s+[^\s]+\s+[^\s]+' || echo "N/A")
             gpu=$(echo "$data" | grep -oP '(?<=gpu=).*' || echo "N/A")
-            printf "%-22s  %-12s  %-20s  %s\n" "$node_ip" "$cpu%" "$ram" "$gpu"
+            ollama_info=$(query_node_ollama "$node_ip")
+            IFS='|' read -r ollama_state ollama_count ollama_summary <<< "$ollama_info"
+            if [[ "$ollama_state" == "online" ]]; then
+                ollama_cell="${ollama_count} model(s)"
+            else
+                ollama_cell="offline"
+            fi
+            printf "%-22s  %-12s  %-20s  %-28s  %s\n" "$node_ip" "$cpu%" "$ram" "$ollama_cell" "$gpu"
+        fi
+    done
+    echo ""
+}
+
+scan_nodes_models() {
+    local nodes
+    mapfile -t nodes < <(read_nodes)
+
+    if (( ${#nodes[@]} == 0 )); then
+        tui_warn "No nodes configured. Add entries to $NODES_FILE"
+        return 0
+    fi
+
+    tui_header "Network Ollama Scan"
+    local ip ollama_info ollama_state ollama_count ollama_summary
+    for ip in "${nodes[@]}"; do
+        ollama_info=$(query_node_ollama "$ip")
+        IFS='|' read -r ollama_state ollama_count ollama_summary <<< "$ollama_info"
+        if [[ "$ollama_state" == "online" ]]; then
+            printf "  %-22s %s model(s)\n" "$ip" "$ollama_count"
+            if [[ -n "$ollama_summary" ]]; then
+                printf "    %s\n" "$ollama_summary"
+            fi
+        else
+            printf "  %-22s offline\n" "$ip"
         fi
     done
     echo ""
@@ -136,6 +198,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         add)       add_node "${2:?IP required}"    ;;
         remove)    remove_node "${2:?IP required}" ;;
         list)      read_nodes                       ;;
+        scan)      scan_nodes_models               ;;
         snapshot)  monitor_nodes_snapshot           ;;
         live)      monitor_nodes_live "${2:-5}"     ;;
         *)         monitor_nodes_snapshot           ;;

@@ -25,7 +25,10 @@ cleanup() {
     fi
     tui_success "All agents stopped."
 }
-trap cleanup EXIT INT TERM
+
+register_orchestrator_cleanup() {
+    trap cleanup EXIT INT TERM
+}
 
 # ── Determine models ───────────────────────────────────────────────────────────
 resolve_agent_models() {
@@ -88,6 +91,7 @@ run_orchestrator() {
     local objective="${1:-Improve code quality and fix any issues}"
     local num_developers="${2:-1}"
 
+    register_orchestrator_cleanup
     resolve_agent_models
 
     tui_header "Launching Agent Team"

@@ -48,7 +48,12 @@ install_claude_cli() {
     fi
 
     npm install -g @anthropic-ai/claude-code 2>/dev/null || true
-    export PATH="$(npm prefix -g 2>/dev/null)/bin:$PATH"
+
+    local npm_prefix
+    npm_prefix="$(npm prefix -g 2>/dev/null || true)"
+    if [[ -n "$npm_prefix" ]]; then
+        export PATH="$npm_prefix/bin:$PATH"
+    fi
 
     if command -v claude &>/dev/null; then
         tui_success "Claude Code installed ✓"
