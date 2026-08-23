@@ -32,7 +32,7 @@ services:
       - ollama
     environment:
       OLLAMA_HOST: http://ollama:11434
-      MODEL_TAG: ${ORCHESTRATOR_MODEL:-qwen2.5:7b-instruct-q4_K_M}
+      MODEL_TAG: ${ORCHESTRATOR_MODEL:-nemotron-3.5-lightning-q4_K_M}
       TASK: |
         You are the orchestrator. Your objective: ${TASK:-Improve this codebase}.
         Decompose the task into subtasks and coordinate with developer agents.
@@ -52,7 +52,7 @@ services:
       - ollama
     environment:
       OLLAMA_HOST: http://ollama:11434
-      MODEL_TAG: ${DEVELOPER_MODEL:-qwen2.5-coder:7b-instruct-q4_K_M}
+      MODEL_TAG: ${DEVELOPER_MODEL:-qwen3.8:27b-q4_K_M}
       TASK: |
         You are a developer agent. Your objective: ${TASK:-Implement features and fix bugs}.
         Write clean, well-tested code. Files are in /workspace.
