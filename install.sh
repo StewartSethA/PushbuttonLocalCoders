@@ -24,13 +24,23 @@ set -euo pipefail
 REPO_URL="https://github.com/StewartSethA/PushbuttonLocalCoders.git"
 INSTALL_DIR="${PUSHBUTTON_DIR:-$HOME/.local/share/pushbutton}"
 CONFIG_DIR="$HOME/.config/pushbutton"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR=""
+
+if [[ ${BASH_SOURCE[0]+set} ]]; then
+    SCRIPT_PATH="${BASH_SOURCE[0]}"
+elif [[ -n "${0:-}" ]] && [[ -f "$0" ]]; then
+    SCRIPT_PATH="$0"
+fi
+
+if [[ -n "${SCRIPT_PATH:-}" ]]; then
+    SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+fi
 
 # ── Determine lib directory ────────────────────────────────────────────────────
 # When run via curl pipe the script is downloaded to a tmp file without the lib/
 # directory next to it, so we clone the repo first.
 bootstrap_repo() {
-    if [[ -d "$SCRIPT_DIR/lib" ]]; then
+    if [[ -n "$SCRIPT_DIR" ]] && [[ -d "$SCRIPT_DIR/lib" ]]; then
         LIB_DIR="$SCRIPT_DIR/lib"
         AGENTS_DIR="$SCRIPT_DIR/agents"
         return 0
