@@ -1,7 +1,7 @@
 # PushbuttonLocalCoders
 
 > **Pushbutton bootstrap for a powerful local AI coding assistant.**
-> One `curl` command installs Ollama, Claude CLI, and the best local coder model
+> One `curl` command installs Ollama, Claude Code, and the best local coder model
 > your hardware can run — with GPU-optimised llama.cpp builds, a multi-agent
 > Docker sandbox, hardware ablation, and a live TUI monitor.
 
@@ -27,8 +27,8 @@ bash install.sh          # "just get me running" mode
 
 | Flag | Description |
 |------|-------------|
-| *(default)* `--quick` | Install Ollama + Claude CLI after an interactive modern-model plan review |
-| `--explore` | Run PP/TG benchmarks for the modern model/quant combinations that fit this machine |
+| *(default)* `--quick` | Install Ollama + Claude Code, auto-select and pull the best coder model for your hardware, then drop you into an interactive Claude Code session bridged to that local model |
+| `--explore` | Run rapid model/quant ablations to find the optimal setup for this machine |
 | `--agent` | Wrap a project directory in a sandboxed Docker agent (dangerously-skip-permissions enabled) |
 | `--team` | Launch a full orchestrator + developer agent team via Docker Compose |
 | `--monitor` | Live TUI showing GPU, CPU, VRAM and RAM utilisation |
@@ -40,6 +40,9 @@ bash install.sh          # "just get me running" mode
 ### Examples
 
 ```bash
+# Install everything, then jump straight into Claude Code on the local model
+bash install.sh
+
 # Explore optimal model/quant for your hardware
 bash install.sh --explore
 
@@ -63,10 +66,12 @@ bash install.sh --build-llamacpp
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ANTHROPIC_API_KEY` | *(prompt)* | Anthropic key for Claude cloud features |
+| `ANTHROPIC_API_KEY` | *(optional)* | Anthropic key for Claude cloud features |
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama API endpoint |
 | `DEVELOPER_MODEL` | *auto-selected* | Override developer model (Ollama tag) |
 | `ORCHESTRATOR_MODEL` | *auto-selected* | Override orchestrator model |
+| `PUSHBUTTON_CLAUDE_GATEWAY_PORT` | `4000` | LiteLLM bridge port used to connect Claude Code to the local Ollama model |
+| `PUSHBUTTON_PROMPT_FOR_ANTHROPIC_KEY` | `0` | Set to `1` to prompt for an Anthropic API key during setup |
 | `PUSHBUTTON_DIR` | `~/.local/share/pushbutton` | Install directory when run via curl |
 
 ---
@@ -79,7 +84,7 @@ lib/
   detect_hardware.sh        ← GPU/CPU/VRAM/RAM detection (Linux, Mac, Windows)
   select_model.sh           ← Model + quant selection based on inference memory
   install_ollama.sh         ← Ollama install + service management + model pull
-  install_claude.sh         ← Claude CLI install + API key config
+  install_claude.sh         ← Claude Code install + LiteLLM/Ollama bridge setup
   install_llamacpp.sh       ← llama.cpp build (CUDA / Metal / ROCm / CPU)
   ablation.sh               ← Rapid model/quant benchmarking with progress bar
   tui.sh                    ← TUI helpers: progress bars, spinners, monitor

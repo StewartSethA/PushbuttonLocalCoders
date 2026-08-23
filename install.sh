@@ -120,8 +120,8 @@ ${BOLD}PushbuttonLocalCoders${RESET} — Local AI coding assistant bootstrap
 Usage: install.sh [MODE] [OPTIONS]
 
 Modes:
-  --quick              (default) Install Ollama + Claude CLI, prompt modern model plan
-  --explore            Run PP/TG benchmarks for modern models that fit this machine
+  --quick              (default) Install Ollama + Claude Code, bridge it to the local model, and launch it
+  --explore            Run hardware ablation to find optimal model/quant
   --agent              Wrap project in Docker agent sandbox
   --team               Launch multi-agent team via Docker Compose
   --monitor            Live GPU/CPU/node monitor
@@ -143,6 +143,7 @@ Environment:
   OLLAMA_HOST          Ollama API host (default: http://localhost:11434)
   DEVELOPER_MODEL      Override primary developer model
   ORCHESTRATOR_MODEL   Override orchestrator model
+  PUSHBUTTON_CLAUDE_GATEWAY_PORT  LiteLLM bridge port (default: 4000)
   PUSHBUTTON_ACCEPT_MODEL_PLAN=1   Accept the shown plan non-interactively
 
 HELP
@@ -207,11 +208,14 @@ mode_quick() {
 
     tui_header "Setup Complete"
     echo ""
+    echo "  Claude Code :  ANTHROPIC_BASE_URL=http://${PUSHBUTTON_CLAUDE_GATEWAY_HOST:-127.0.0.1}:${PUSHBUTTON_CLAUDE_GATEWAY_PORT:-4000} claude --model ${PUSHBUTTON_CLAUDE_GATEWAY_MODEL:-pushbutton-local}"
     echo "  Run a query :  ollama run $SELECTED_MODEL \"Write a hello world in Python\""
     echo "  Monitor     :  bash $0 --monitor"
     echo "  Agent mode  :  bash $0 --agent --project /your/project --task 'Improve this code'"
     echo "  Explore     :  bash $0 --explore"
     echo ""
+
+    launch_interactive_claude_session "$SELECTED_MODEL" "$PWD" || true
 }
 
 mode_explore() {
