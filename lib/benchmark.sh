@@ -10,6 +10,7 @@ source "$SCRIPT_DIR/tui.sh"
 PUSHBUTTON_CONFIG_DIR="${PUSHBUTTON_CONFIG_DIR:-$HOME/.config/pushbutton}"
 RUNTIME_ENV_FILE="${RUNTIME_ENV_FILE:-$PUSHBUTTON_CONFIG_DIR/runtime.env}"
 RUNTIME_HISTORY_FILE="${RUNTIME_HISTORY_FILE:-$PUSHBUTTON_CONFIG_DIR/runtime_history.tsv}"
+CONTEXT_SWEEP_MAX_S="${CONTEXT_SWEEP_MAX_S:-1800}"
 
 ensure_runtime_store() {
     mkdir -p "$PUSHBUTTON_CONFIG_DIR"
@@ -199,6 +200,15 @@ run_ollama_benchmark_once() {
     local payload_file result_file
     local curl_pid start_ms now_ms elapsed_ms est_pp_ms est_tg_ms phase_elapsed
     local num_gpu="-1"
+    # Expose the latest benchmark result to callers that optionally perform a
+    # follow-up sweep after the initial run.
+    GUESSED_PP=0
+    GUESSED_TG=0
+    ACTUAL_PP=0
+    ACTUAL_TG=0
+    ACTUAL_TOTAL=0
+    PROMPT_EVAL_COUNT=0
+    EVAL_COUNT=0
 
     IFS=$'\t' read -r GUESSED_PP GUESSED_TG < <(estimate_ollama_speeds "$model" "$framework")
     guessed_total=$(awk -v pp="$GUESSED_PP" -v tg="$GUESSED_TG" 'BEGIN { printf "%.1f", (pp + tg) / 2.0 }')
@@ -206,6 +216,7 @@ run_ollama_benchmark_once() {
     prompt=$(benchmark_prompt "$prompt_tokens")
     payload_file=$(mktemp /tmp/pushbutton-benchmark-payload-XXXXXX.json)
     result_file=$(mktemp /tmp/pushbutton-benchmark-result-XXXXXX.json)
+    trap 'rm -f "$payload_file" "$result_file"' RETURN
 
     [[ "$framework" == "ollama-cpu" ]] && num_gpu="0"
 
@@ -311,6 +322,7 @@ PY
     fi
 
     rm -f "$payload_file" "$result_file"
+    trap - RETURN
 }
 
 run_ollama_context_sweep() {
@@ -328,7 +340,7 @@ run_ollama_context_sweep() {
         local projected
         projected=$(awk -v ctx="$ctx" -v total="${initial_total:-1}" 'BEGIN { if (total <= 0) total = 1; printf "%.2f", (ctx + 64) / total }')
         total_budget_s=$(awk -v a="$total_budget_s" -v b="$projected" 'BEGIN { printf "%.2f", a + b }')
-        if awk -v total="$total_budget_s" 'BEGIN { exit !(total <= 1800) }'; then
+        if awk -v total="$total_budget_s" -v max_s="$CONTEXT_SWEEP_MAX_S" 'BEGIN { exit !(total <= max_s) }'; then
             contexts+=("$ctx")
             ctx=$(( ctx * 2 ))
         else
