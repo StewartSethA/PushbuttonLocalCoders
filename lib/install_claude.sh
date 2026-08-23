@@ -13,6 +13,27 @@ CLAUDE_GATEWAY_HOST="${PUSHBUTTON_CLAUDE_GATEWAY_HOST:-127.0.0.1}"
 CLAUDE_GATEWAY_MODEL="${PUSHBUTTON_CLAUDE_GATEWAY_MODEL:-pushbutton-local}"
 LITELLM_PYPI_SPEC="${LITELLM_PYPI_SPEC:-litellm[proxy]==1.98.0}"
 
+prepend_python_user_bin_to_path() {
+    if ! command -v python3 &>/dev/null; then
+        return 0
+    fi
+
+    local user_base
+    user_base="$(python3 -m site --user-base 2>/dev/null || true)"
+    if [[ -n "$user_base" ]]; then
+        export PATH="$user_base/bin:$PATH"
+    fi
+}
+
+generate_local_claude_api_key() {
+    if command -v openssl &>/dev/null; then
+        openssl rand -hex 16
+        return 0
+    fi
+
+    printf 'pushbutton-local-%s-%s\n' "$$" "$(date +%s)"
+}
+
 # ── Installation ───────────────────────────────────────────────────────────────
 install_claude_cli() {
     local os
@@ -115,9 +136,7 @@ claude_model_for_role() {
 }
 
 ensure_litellm_proxy() {
-    if command -v python3 &>/dev/null; then
-        export PATH="$(python3 -m site --user-base 2>/dev/null)/bin:$PATH"
-    fi
+    prepend_python_user_bin_to_path
 
     if command -v litellm &>/dev/null; then
         tui_success "LiteLLM proxy available ✓"
@@ -135,12 +154,14 @@ ensure_litellm_proxy() {
     fi
 
     tui_step "Installing LiteLLM proxy…"
-    pip3 install --user "$LITELLM_PYPI_SPEC" 2>/dev/null || pip3 install "$LITELLM_PYPI_SPEC" || {
+    local install_log="$PUSHBUTTON_CONFIG_DIR/litellm-install.log"
+    mkdir -p "$PUSHBUTTON_CONFIG_DIR"
+    pip3 install --user "$LITELLM_PYPI_SPEC" >>"$install_log" 2>&1 || pip3 install "$LITELLM_PYPI_SPEC" 2>&1 | tee -a "$install_log" || {
         tui_warn "LiteLLM install failed; falling back to direct Ollama chat."
         return 1
     }
 
-    export PATH="$(python3 -m site --user-base 2>/dev/null)/bin:$PATH"
+    prepend_python_user_bin_to_path
 
     if command -v litellm &>/dev/null; then
         tui_success "LiteLLM proxy installed ✓"
@@ -224,6 +245,8 @@ launch_interactive_claude_session() {
     local model_tag="${1:?model_tag required}"
     local session_dir="${2:-$PWD}"
     local base_url="http://$CLAUDE_GATEWAY_HOST:$CLAUDE_GATEWAY_PORT"
+    local local_api_key
+    local_api_key="$(generate_local_claude_api_key)"
 
     if ! command -v claude &>/dev/null; then
         tui_warn "Claude Code is unavailable; falling back to an interactive Ollama session."
@@ -252,7 +275,7 @@ launch_interactive_claude_session() {
     (
         cd "$session_dir"
         export ANTHROPIC_BASE_URL="$base_url"
-        export ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-pushbutton-local}"
+        export ANTHROPIC_API_KEY="$local_api_key"
         unset ANTHROPIC_AUTH_TOKEN
         claude --model "$CLAUDE_GATEWAY_MODEL" < /dev/tty
     )
