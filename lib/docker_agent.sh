@@ -17,7 +17,7 @@ ensure_docker() {
         tui_error "Docker not installed. Visit https://docs.docker.com/get-docker/"
         return 1
     fi
-    if ! docker info &>/dev/null 2>&1; then
+    if ! docker info &>/dev/null; then
         tui_error "Docker daemon not running. Start Docker and retry."
         return 1
     fi
@@ -48,7 +48,7 @@ run_agent_sandbox() {
 
     ensure_docker
 
-    if ! docker image inspect "$DOCKER_IMAGE" &>/dev/null 2>&1; then
+    if ! docker image inspect "$DOCKER_IMAGE" &>/dev/null; then
         build_agent_image
     fi
 

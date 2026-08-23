@@ -80,7 +80,7 @@ REMOTE
 
     local result
     result=$(ssh -o ConnectTimeout="$SSH_TIMEOUT" \
-                 -o StrictHostKeyChecking=no \
+                 -o StrictHostKeyChecking=accept-new \
                  -o BatchMode=yes \
                  -i "$SSH_KEY" \
                  "${SSH_USER}@${ip}" \

@@ -71,6 +71,8 @@ PROJECT_DIR=""
 TASK=""
 NUM_DEVS=1
 MONITOR_INTERVAL=2
+NODES_SUBCMD="live"
+NODES_ARG=""
 
 print_help() {
     cat <<HELP
@@ -113,7 +115,16 @@ while [[ $# -gt 0 ]]; do
         --team)            MODE="team"           ; shift ;;
         --monitor)         MODE="monitor"        ; shift ;;
         --build-llamacpp)  MODE="llamacpp"       ; shift ;;
-        --nodes)           MODE="nodes"          ; shift ;;
+        --nodes)           MODE="nodes"          ; shift
+                           # Capture optional subcommand (add/rm/list/live)
+                           if [[ $# -gt 0 ]] && [[ "$1" != --* ]]; then
+                               NODES_SUBCMD="$1"; shift
+                               # Some subcommands take an extra argument (IP)
+                               if [[ "$NODES_SUBCMD" =~ ^(add|rm)$ ]] && [[ $# -gt 0 ]] && [[ "$1" != --* ]]; then
+                                   NODES_ARG="$1"; shift
+                               fi
+                           fi
+                           ;;
         --orchestrator)    MODE="orchestrator"   ; shift ;;
         --help|-h)         print_help ; exit 0   ;;
         --project)         PROJECT_DIR="$2"      ; shift 2 ;;
@@ -194,12 +205,11 @@ mode_llamacpp() {
 }
 
 mode_nodes() {
-    local sub="${1:-live}"
-    case "$sub" in
-        add)  add_node "${2:?IP required}"    ;;
-        rm)   remove_node "${2:?IP required}" ;;
-        list) read_nodes                       ;;
-        *)    monitor_nodes_live "$MONITOR_INTERVAL" ;;
+    case "$NODES_SUBCMD" in
+        add)  add_node "${NODES_ARG:?IP required}"    ;;
+        rm)   remove_node "${NODES_ARG:?IP required}" ;;
+        list) read_nodes                               ;;
+        *)    monitor_nodes_live "$MONITOR_INTERVAL"   ;;
     esac
 }
 
@@ -217,7 +227,7 @@ case "$MODE" in
     team)         mode_team        ;;
     monitor)      mode_monitor     ;;
     llamacpp)     mode_llamacpp    ;;
-    nodes)        mode_nodes "${2:-}" ;;
+    nodes)        mode_nodes        ;;
     orchestrator) mode_orchestrator ;;
     *)
         tui_error "Unknown mode: $MODE"

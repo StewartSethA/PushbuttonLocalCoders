@@ -13,12 +13,16 @@ source "$SCRIPT_DIR/tui.sh"
 AGENT_PIDS=()
 LOG_DIR="${LOG_DIR:-$HOME/.config/pushbutton/logs}"
 mkdir -p "$LOG_DIR"
+FIFO_DIR=""
 
 cleanup() {
     tui_step "Shutting down agents…"
     for pid in "${AGENT_PIDS[@]}"; do
         kill "$pid" 2>/dev/null || true
     done
+    if [[ -n "$FIFO_DIR" ]] && [[ -d "$FIFO_DIR" ]]; then
+        rm -rf "$FIFO_DIR"
+    fi
     tui_success "All agents stopped."
 }
 trap cleanup EXIT INT TERM
@@ -70,8 +74,6 @@ launch_agent() {
 }
 
 # ── Setup FIFOs ────────────────────────────────────────────────────────────────
-FIFO_DIR=$(mktemp -d /tmp/pushbutton-fifos-XXXXX)
-
 create_agent_fifo() {
     local name="$1"
     local fifo="$FIFO_DIR/$name"
@@ -93,6 +95,7 @@ run_orchestrator() {
     echo ""
 
     # Create FIFOs
+    FIFO_DIR=$(mktemp -d /tmp/pushbutton-fifos-XXXXX)
     local orch_fifo
     orch_fifo=$(create_agent_fifo "orchestrator")
     local dev_fifos=()
