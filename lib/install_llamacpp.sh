@@ -437,6 +437,16 @@ build_cpu_optimised() {
     cmake --build "$LLAMACPP_DIR/build" --config Release -j"$nthreads" 2>&1
 }
 
+ensure_cpu_optimizations() {
+    local os
+    os=$(detect_os)
+    ensure_build_deps "$os"
+    clone_or_update_llamacpp
+    build_cpu_optimised "$os"
+    export PATH="$LLAMACPP_BIN:$PATH"
+    tui_success "CPU optimization pack ready at $LLAMACPP_BIN ✓"
+}
+
 # ── Main build entry ───────────────────────────────────────────────────────────
 build_llamacpp() {
     eval "$(detect_gpu)"

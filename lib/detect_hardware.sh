@@ -43,6 +43,30 @@ detect_cpu() {
     echo "CPU_THREADS=$cpu_threads"
 }
 
+detect_cpu_capabilities() {
+    local os
+    os=$(detect_os)
+    local caps=()
+
+    if [[ "$os" == "linux" ]] && [[ -r /proc/cpuinfo ]]; then
+        grep -qi "avx512" /proc/cpuinfo 2>/dev/null && caps+=("avx512")
+        grep -qi "avx2" /proc/cpuinfo 2>/dev/null && caps+=("avx2")
+        grep -qi "avx" /proc/cpuinfo 2>/dev/null && caps+=("avx")
+        grep -qi "sse4_2" /proc/cpuinfo 2>/dev/null && caps+=("sse4_2")
+    elif [[ "$os" == "mac" ]]; then
+        caps+=("neon")
+        if [[ "$(uname -m)" == "arm64" ]]; then
+            caps+=("apple-silicon")
+        fi
+    fi
+
+    if (( ${#caps[@]} == 0 )); then
+        caps+=("baseline")
+    fi
+
+    echo "CPU_CAPABILITIES=\"$(IFS=,; echo "${caps[*]}")\""
+}
+
 # ── RAM detection ─────────────────────────────────────────────────────────────
 detect_ram() {
     local os
@@ -115,6 +139,43 @@ detect_gpu() {
     echo "VRAM_GB=$(( vram_mb / 1024 ))"
 }
 
+detect_apple_silicon() {
+    if [[ "$(detect_os)" == "mac" ]] && [[ "$(uname -m)" == "arm64" ]]; then
+        echo "APPLE_SILICON=1"
+    else
+        echo "APPLE_SILICON=0"
+    fi
+}
+
+detect_cuda() {
+    local nvcc_path=""
+    local version="0.0"
+    local provider="none"
+
+    if [[ -n "${CUDA_HOME:-}" ]] && [[ -x "${CUDA_HOME}/bin/nvcc" ]]; then
+        nvcc_path="${CUDA_HOME}/bin/nvcc"
+        provider="env"
+    elif [[ -n "${CUDA_PATH:-}" ]] && [[ -x "${CUDA_PATH}/bin/nvcc" ]]; then
+        nvcc_path="${CUDA_PATH}/bin/nvcc"
+        provider="env"
+    elif command -v nvcc &>/dev/null; then
+        nvcc_path="$(command -v nvcc)"
+        provider="system"
+    fi
+
+    if [[ -n "$nvcc_path" ]]; then
+        version="$("$nvcc_path" --version 2>/dev/null | sed -n 's/.*release \([0-9]\+\.[0-9]\+\).*/\1/p' | tail -n1)"
+        [[ -z "$version" ]] && version="0.0"
+        echo "CUDA_AVAILABLE=1"
+    else
+        echo "CUDA_AVAILABLE=0"
+    fi
+
+    echo "CUDA_VERSION=\"$version\""
+    echo "CUDA_NVCC_PATH=\"$nvcc_path\""
+    echo "CUDA_PROVIDER=\"$provider\""
+}
+
 # ── MCDRAM detection (Intel Xeon Phi / HBM) ──────────────────────────────────
 detect_mcdram() {
     local mcdram_mb=0
@@ -162,13 +223,33 @@ detect_all() {
     os=$(detect_os)
     echo "OS=\"$os\""
     detect_cpu
+    detect_cpu_capabilities
     detect_ram
     detect_gpu
+    detect_apple_silicon
+    detect_cuda
     detect_mcdram
     detect_inference_memory
 }
 
+detect_hardware_profile() {
+    eval "$(detect_all)"
+    echo "HW_PROFILE_OS=\"$OS\""
+    echo "HW_PROFILE_GPU_VENDOR=\"$GPU_VENDOR\""
+    echo "HW_PROFILE_GPU_MODEL=\"$GPU_MODEL\""
+    echo "HW_PROFILE_GPU_COUNT=$GPU_COUNT"
+    echo "HW_PROFILE_VRAM_GB=$VRAM_GB"
+    echo "HW_PROFILE_RAM_GB=$RAM_GB"
+    echo "HW_PROFILE_INFERENCE_GB=$INFERENCE_GB"
+    echo "HW_PROFILE_MEMORY_TYPE=\"$MEMORY_TYPE\""
+    echo "HW_PROFILE_CUDA_AVAILABLE=$CUDA_AVAILABLE"
+    echo "HW_PROFILE_CUDA_VERSION=\"$CUDA_VERSION\""
+    echo "HW_PROFILE_CUDA_PROVIDER=\"$CUDA_PROVIDER\""
+    echo "HW_PROFILE_APPLE_SILICON=$APPLE_SILICON"
+    echo "HW_PROFILE_CPU_CAPABILITIES=\"$CPU_CAPABILITIES\""
+}
+
 # Run if executed directly
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-    detect_all
+    detect_hardware_profile
 fi

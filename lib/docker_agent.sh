@@ -10,6 +10,7 @@ source "$SCRIPT_DIR/tui.sh"
 DOCKER_IMAGE="${DOCKER_IMAGE:-pushbutton-agent:latest}"
 AGENT_DOCKERFILE="$SCRIPT_DIR/../agents/Dockerfile.agent"
 COMPOSE_FILE="$SCRIPT_DIR/../agents/docker-compose.yml"
+AGENT_NETWORK_MODE="${AGENT_NETWORK_MODE:-host}"
 
 # ── Prerequisite checks ────────────────────────────────────────────────────────
 ensure_docker() {
@@ -43,6 +44,7 @@ run_agent_sandbox() {
     local project_dir="${1:?project_dir required}"
     local task="${2:-Improve this codebase}"
     local model_tag="${3:-${SELECTED_MODEL:-qwen3.8:27b-q4_K_M}}"
+    local network_mode="${4:-$AGENT_NETWORK_MODE}"
 
     project_dir="$(realpath "$project_dir")"
 
@@ -55,13 +57,14 @@ run_agent_sandbox() {
     tui_step "Launching agent sandbox for: $project_dir"
     tui_info "Task: $task"
     tui_info "Model: $model_tag"
+    tui_info "Network: $network_mode"
 
     local container_name
     container_name="pushbutton-agent-$(date +%s)"
 
     docker run --rm \
         --name "$container_name" \
-        --network host \
+        --network "$network_mode" \
         -v "$project_dir":/workspace \
         -v "$HOME/.config/pushbutton":/root/.config/pushbutton:ro \
         -e TASK="$task" \
@@ -98,11 +101,11 @@ stop_agent_team() {
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     case "${1:-}" in
         build)   build_agent_image ;;
-        run)     run_agent_sandbox "${2:?}" "${3:-}" "${4:-}" ;;
+        run)     run_agent_sandbox "${2:?}" "${3:-}" "${4:-}" "${5:-}" ;;
         team)    start_agent_team  "${2:?}" "${3:-}" ;;
         stop)    stop_agent_team ;;
         *)
-            echo "Usage: $0 {build|run <project_dir> [task] [model]|team <project_dir> [task]|stop}"
+            echo "Usage: $0 {build|run <project_dir> [task] [model] [network]|team <project_dir> [task]|stop}"
             exit 1
             ;;
     esac

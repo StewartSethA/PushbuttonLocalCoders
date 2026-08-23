@@ -9,14 +9,13 @@
 #   git clone https://github.com/StewartSethA/PushbuttonLocalCoders.git
 #   cd PushbuttonLocalCoders && bash install.sh [options]
 #
-# Modes:
-#   --quick          Just get me running (default): install Ollama + Claude CLI,
-#                    prompt before pulling modern coder models.
-#   --explore        Explore better/faster models: run hardware ablation to find
-#                    the optimal model and quantisation for this machine.
-#   --agent          Wrap a project directory in a sandboxed Docker agent team.
+# Actions:
+#   --quick          Just get me running (default): capability-discover, install
+#                    local runtime, recommend models, then open a prompt shell.
+#   --explore        Explore model/quant tradeoffs for this machine.
+#   --agent          Wrap a project directory in a sandboxed Docker agent.
 #   --monitor        Launch live GPU/CPU/node monitor TUI.
-#   --build-llamacpp Build llama.cpp with GPU optimisations.
+#   --build-llamacpp Build llama.cpp with platform-appropriate optimisations.
 #   --submit-benchmarks  Prepare a benchmark contribution file for a PR.
 #   --help           Show this help.
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -76,8 +75,6 @@ source "$LIB_DIR/docker_agent.sh"
 source "$LIB_DIR/ablation.sh"
 source "$LIB_DIR/network_nodes.sh"
 source "$LIB_DIR/orchestrator.sh"
-source "$LIB_DIR/install_gguf.sh"
-source "$LIB_DIR/install_glm.sh"
 source "$LIB_DIR/apple_ablate.sh"
 
 mkdir -p "$CONFIG_DIR"
@@ -94,6 +91,10 @@ RUN_BENCHMARK="ask"
 BENCHMARK_CONTEXT_SWEEP="ask"
 BENCHMARK_FRAMEWORK="ollama"
 MODE_EXPLICIT=false
+PROMPT_SHELL="${PROMPT_SHELL:-claude}"
+SESSION_NETWORK_MODE="${SESSION_NETWORK_MODE:-host}"
+TARGET_AGENT_REQUEST="${TARGET_AGENT_REQUEST:-}"
+ENABLE_WEB_SEARCH="${ENABLE_WEB_SEARCH:-1}"
 
 collect_requested_models() {
     local models=()
@@ -120,6 +121,18 @@ collect_requested_models() {
         done
     fi
 
+    if [[ "${ENABLE_CPU_MODELS:-0}" == "1" ]] && [[ -n "${CPU_FALLBACK_MODELS:-}" ]]; then
+        local cpu_models=()
+        IFS=',' read -r -a cpu_models <<< "$CPU_FALLBACK_MODELS"
+        for candidate in "${cpu_models[@]}"; do
+            [[ -z "$candidate" ]] && continue
+            if [[ "$seen" != *"|$candidate|"* ]]; then
+                models+=("$candidate")
+                seen="${seen}${candidate}|"
+            fi
+        done
+    fi
+
     printf '%s\n' "${models[@]}"
 }
 
@@ -127,9 +140,9 @@ print_help() {
     cat <<HELP
 ${BOLD}PushbuttonLocalCoders${RESET} — Local AI coding assistant bootstrap
 
-Usage: install.sh [MODE] [OPTIONS]
+Usage: install.sh [ACTION] [OPTIONS]
 
-Modes:
+Actions:
   --quick              (default) Install Ollama + Claude Code, bridge it to the local model, and launch it
   --explore            Run hardware ablation to find optimal model/quant
   --agent              Wrap project in Docker agent sandbox
@@ -139,9 +152,6 @@ Modes:
   --benchmark          Run an Ollama speed benchmark and save the runtime profile
   --nodes              Network node monitor (add/list/scan/live)
   --orchestrator       Start local orchestrator + developer agents
-  --qwen38            Deploy Qwen3.8 GGUF on llama.cpp using system nvcc
-  --qwen38-cuda       Deploy Qwen3.8 GGUF on llama.cpp and bootstrap private CUDA if needed
-  --glm52             Deploy GLM-5.2 AWQ INT4 on 8×A100 via Docker/vLLM
   --apple-ablate      Run the Apple Silicon multi-backend ablation lab
   --cpu-lab           Launch the extracted cpu-llama-lab toolkit
   --submit-benchmarks  Prepare a benchmark report file for PR submission
@@ -153,6 +163,9 @@ Options:
   --devs     <n>       Number of developer agents (default: 1)
   --interval <s>       Monitor refresh interval in seconds (default: 2)
   --model    <tag>     Override model tag (Ollama format)
+  --prompt-shell <id>  Prompt shell: claude (default), opencode, hermes
+  --network-mode <id>  Session/agent sandbox network mode: host, bridge, none
+  --request  <text>    Target a specific hardware/model request for agent startup
   --framework <name>   Benchmark framework: ollama or ollama-cpu
   --run-benchmark      Force the post-setup benchmark in quick mode
   --skip-benchmark     Skip the post-setup benchmark prompt
@@ -165,6 +178,8 @@ Environment:
   ORCHESTRATOR_MODEL   Override orchestrator model
   PUSHBUTTON_CLAUDE_GATEWAY_PORT  LiteLLM bridge port (default: 4000)
   PUSHBUTTON_ACCEPT_MODEL_PLAN=1   Accept the shown plan non-interactively
+  PUSHBUTTON_CLOUD_PROVIDERS       Cloud provider entries (name|url|auth|token;...)
+  PUSHBUTTON_CLOUD_MODELS          Comma-separated cloud model IDs for agent inventory
 
 HELP
 }
@@ -190,9 +205,6 @@ while [[ $# -gt 0 ]]; do
                            fi
                            ;;
         --orchestrator)    MODE="orchestrator"   ; MODE_EXPLICIT=true ; shift ;;
-        --qwen38)          MODE="qwen38"         ; MODE_EXPLICIT=true ; shift ;;
-        --qwen38-cuda)     MODE="qwen38-cuda"    ; MODE_EXPLICIT=true ; shift ;;
-        --glm52)           MODE="glm52"          ; MODE_EXPLICIT=true ; shift ;;
         --apple-ablate)    MODE="apple-ablate"   ; MODE_EXPLICIT=true ; shift ;;
         --cpu-lab)         MODE="cpu-lab"        ; MODE_EXPLICIT=true ; shift ;;
         --submit-benchmarks) MODE="submit-benchmarks" ; MODE_EXPLICIT=true ; shift ;;
@@ -202,6 +214,9 @@ while [[ $# -gt 0 ]]; do
         --devs)            NUM_DEVS="$2"         ; shift 2 ;;
         --interval)        MONITOR_INTERVAL="$2" ; shift 2 ;;
         --model)           SELECTED_MODEL="$2"   ; shift 2 ;;
+        --prompt-shell)    PROMPT_SHELL="$2"     ; shift 2 ;;
+        --network-mode)    SESSION_NETWORK_MODE="$2" ; shift 2 ;;
+        --request)         TARGET_AGENT_REQUEST="$2" ; shift 2 ;;
         --framework)       BENCHMARK_FRAMEWORK="$2" ; shift 2 ;;
         --run-benchmark)   RUN_BENCHMARK="yes"      ; shift ;;
         --skip-benchmark)  RUN_BENCHMARK="no"       ; shift ;;
@@ -212,8 +227,79 @@ done
 
 # ── Mode implementations ───────────────────────────────────────────────────────
 
+validate_network_mode() {
+    case "${1:-host}" in
+        host|bridge|none) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+initialize_capability_profile() {
+    eval "$(detect_hardware_profile)"
+    tui_header "Hardware capability discovery"
+    tui_info "OS=$HW_PROFILE_OS GPU=${HW_PROFILE_GPU_MODEL} (${HW_PROFILE_GPU_VENDOR}) VRAM=${HW_PROFILE_VRAM_GB}GB RAM=${HW_PROFILE_RAM_GB}GB"
+    tui_info "CUDA available=${HW_PROFILE_CUDA_AVAILABLE} version=${HW_PROFILE_CUDA_VERSION} provider=${HW_PROFILE_CUDA_PROVIDER}"
+    tui_info "Apple silicon=${HW_PROFILE_APPLE_SILICON} CPU caps=${HW_PROFILE_CPU_CAPABILITIES}"
+
+    if [[ "$HW_PROFILE_GPU_VENDOR" == "nvidia" ]]; then
+        tui_step "Ensuring usable CUDA toolchain (auto-provisioning local nvcc if needed)…"
+        local nvcc_path=""
+        nvcc_path="$(ensure_nvcc 2>/dev/null || true)"
+        if [[ -n "$nvcc_path" ]]; then
+            tui_success "CUDA ready: $nvcc_path"
+        else
+            tui_warn "CUDA toolchain unavailable; GPU-specific builds may fall back to CPU."
+        fi
+    fi
+
+    if [[ "$HW_PROFILE_APPLE_SILICON" == "1" ]]; then
+        export PUSHBUTTON_APPLE_OPTIMIZED=1
+        tui_success "Apple Silicon optimizations enabled automatically."
+    fi
+}
+
+launch_selected_prompt_session() {
+    local model_tag="${1:?model required}"
+    local session_dir="${2:-$PWD}"
+    local shell_id="${PROMPT_SHELL:-claude}"
+
+    export PUSHBUTTON_WEB_SEARCH="${ENABLE_WEB_SEARCH:-1}"
+
+    case "$shell_id" in
+        claude)
+            launch_interactive_claude_session "$model_tag" "$session_dir"
+            ;;
+        opencode)
+            if command -v opencode >/dev/null 2>&1; then
+                (cd "$session_dir" && opencode < /dev/tty > /dev/tty 2> /dev/tty)
+            else
+                tui_warn "OpenCode not found; falling back to Claude Code."
+                launch_interactive_claude_session "$model_tag" "$session_dir"
+            fi
+            ;;
+        hermes)
+            if command -v hermes >/dev/null 2>&1; then
+                (cd "$session_dir" && hermes < /dev/tty > /dev/tty 2> /dev/tty)
+            else
+                tui_warn "Hermes CLI not found; falling back to Claude Code."
+                launch_interactive_claude_session "$model_tag" "$session_dir"
+            fi
+            ;;
+        *)
+            tui_warn "Unknown prompt shell '$shell_id'; using claude."
+            launch_interactive_claude_session "$model_tag" "$session_dir"
+            ;;
+    esac
+}
+
+if ! validate_network_mode "$SESSION_NETWORK_MODE"; then
+    tui_error "Invalid --network-mode '$SESSION_NETWORK_MODE' (expected host|bridge|none)."
+    exit 1
+fi
+
 mode_quick() {
     tui_header "PushbuttonLocalCoders — Quick Setup"
+    initialize_capability_profile
 
     # 1. Detect hardware and confirm a model plan
     print_model_recommendation
@@ -230,6 +316,9 @@ mode_quick() {
         [[ -n "$model_tag" ]] && requested_models+=("$model_tag")
     done < <(collect_requested_models)
     setup_ollama "${requested_models[@]}"
+    if [[ "${ENABLE_CPU_MODELS:-0}" == "1" ]]; then
+        ensure_cpu_optimizations
+    fi
 
     # 3. Record estimated vs actual PP/TG
     benchmark_selected_models "${requested_models[@]}"
@@ -243,6 +332,7 @@ mode_quick() {
     tui_header "Setup Complete"
     echo ""
     echo "  Claude Code :  ANTHROPIC_BASE_URL=http://${PUSHBUTTON_CLAUDE_GATEWAY_HOST:-127.0.0.1}:${PUSHBUTTON_CLAUDE_GATEWAY_PORT:-4000} claude --model ${PUSHBUTTON_CLAUDE_GATEWAY_MODEL:-pushbutton-local}"
+    echo "  Prompt shell:  ${PROMPT_SHELL:-claude}"
     echo "  Run a query :  ollama run $SELECTED_MODEL \"Write a hello world in Python\""
     echo "  Monitor     :  bash $ENTRY_SCRIPT --monitor"
     echo "  Agent mode  :  bash $ENTRY_SCRIPT --agent --project /your/project --task 'Improve this code'"
@@ -250,11 +340,12 @@ mode_quick() {
     echo "  Runtime env :  source $RUNTIME_ENV_FILE"
     echo ""
 
-    launch_interactive_claude_session "$SELECTED_MODEL" "$PWD" || true
+    launch_selected_prompt_session "$SELECTED_MODEL" "${PROJECT_DIR:-$PWD}" || true
 }
 
 mode_explore() {
     tui_header "PushbuttonLocalCoders — Explore Mode"
+    initialize_capability_profile
     tui_info "Running modern PP/TG benchmarks and recording estimate accuracy…"
 
     setup_ollama  # ensure Ollama is running
@@ -263,6 +354,7 @@ mode_explore() {
 
 mode_agent() {
     tui_header "PushbuttonLocalCoders — Agent Mode"
+    initialize_capability_profile
     [[ -z "$PROJECT_DIR" ]] && PROJECT_DIR="$(pwd)"
     [[ -z "$TASK"        ]] && TASK="Improve code quality and fix any issues"
 
@@ -277,12 +369,22 @@ mode_agent() {
     done < <(collect_requested_models)
     setup_ollama "${requested_models[@]}"
     benchmark_selected_models "$PRIMARY_CODER_MODEL"
+    if [[ "${ENABLE_CPU_MODELS:-0}" == "1" ]]; then
+        ensure_cpu_optimizations
+    fi
 
-    run_agent_sandbox "$PROJECT_DIR" "$TASK" "$PRIMARY_CODER_MODEL"
+    local target_model="$PRIMARY_CODER_MODEL"
+    if [[ -n "$TARGET_AGENT_REQUEST" ]]; then
+        eval "$(resolve_model_target_request "$TARGET_AGENT_REQUEST" "$PRIMARY_CODER_MODEL")"
+        target_model="$RESOLVED_AGENT_MODEL"
+        tui_info "Resolved request '$TARGET_AGENT_REQUEST' → $target_model ($RESOLVED_AGENT_SOURCE)"
+    fi
+    run_agent_sandbox "$PROJECT_DIR" "$TASK" "$target_model" "$SESSION_NETWORK_MODE"
 }
 
 mode_team() {
     tui_header "PushbuttonLocalCoders — Agent Team Mode"
+    initialize_capability_profile
     [[ -z "$PROJECT_DIR" ]] && PROJECT_DIR="$(pwd)"
     [[ -z "$TASK"        ]] && TASK="Develop and iterate on this codebase"
 
@@ -297,6 +399,9 @@ mode_team() {
     done < <(collect_requested_models)
     setup_ollama "${requested_models[@]}"
     benchmark_selected_models "${requested_models[@]}"
+    if [[ "${ENABLE_CPU_MODELS:-0}" == "1" ]]; then
+        ensure_cpu_optimizations
+    fi
 
     start_agent_team "$PROJECT_DIR" "$TASK"
 }
@@ -307,6 +412,7 @@ mode_monitor() {
 
 mode_llamacpp() {
     tui_header "PushbuttonLocalCoders — Build llama.cpp"
+    initialize_capability_profile
     build_llamacpp
 }
 
@@ -322,6 +428,7 @@ mode_nodes() {
 
 mode_orchestrator() {
     tui_header "PushbuttonLocalCoders — Local Orchestrator"
+    initialize_capability_profile
     [[ -z "$TASK" ]] && TASK="Improve this codebase"
     configure_model_plan || {
         tui_warn "Cancelled before installing models."
@@ -333,11 +440,21 @@ mode_orchestrator() {
     done < <(collect_requested_models)
     setup_ollama "${requested_models[@]}"
     benchmark_selected_models "${requested_models[@]}"
+    if [[ "${ENABLE_CPU_MODELS:-0}" == "1" ]]; then
+        ensure_cpu_optimizations
+    fi
+    if [[ -n "$TARGET_AGENT_REQUEST" ]]; then
+        eval "$(resolve_model_target_request "$TARGET_AGENT_REQUEST" "$DEVELOPER_MODEL")"
+        DEVELOPER_MODEL="$RESOLVED_AGENT_MODEL"
+        DEVELOPER_MODELS="$RESOLVED_AGENT_MODEL"
+        tui_info "Resolved request '$TARGET_AGENT_REQUEST' → $DEVELOPER_MODEL ($RESOLVED_AGENT_SOURCE)"
+    fi
     run_orchestrator "$TASK" "$NUM_DEVS"
 }
 
 mode_benchmark() {
     tui_header "PushbuttonLocalCoders — Benchmark"
+    initialize_capability_profile
     if [[ -z "${SELECTED_MODEL:-}" ]]; then
         auto_select_model
     fi
@@ -348,30 +465,6 @@ mode_benchmark() {
 mode_submit_benchmarks() {
     tui_header "PushbuttonLocalCoders — Submit Benchmarks"
     prepare_system_benchmark_submission
-}
-
-mode_qwen38() {
-    tui_header "PushbuttonLocalCoders — Qwen3.8 llama.cpp"
-    eval "$(detect_all)"
-    if ! command -v nvcc &>/dev/null && [[ ! -x "${CUDA_ROOT:-}/bin/nvcc" ]]; then
-        tui_error "No system nvcc detected. Use --qwen38-cuda to bootstrap a private CUDA toolkit."
-        return 1
-    fi
-    build_llamacpp
-    GGUF_SKIP_BUILD=1 setup_qwen38_cuda "${MODEL_REPO:-unsloth/Qwen3.8-27B-GGUF}" "${GGUF_QWEN38_STATE_DIR:-$HOME/.local/share/pushbutton/qwen38}" "${GGUF_QWEN38_PORT:-8080}" "${GGUF_QWEN38_INSTANCE:-main}"
-}
-
-mode_qwen38_cuda() {
-    tui_header "PushbuttonLocalCoders — Qwen3.8 llama.cpp + private CUDA"
-    eval "$(detect_all)"
-    ensure_nvcc >/dev/null
-    build_llamacpp
-    GGUF_SKIP_BUILD=1 setup_qwen38_cuda "${MODEL_REPO:-unsloth/Qwen3.8-27B-GGUF}" "${GGUF_QWEN38_STATE_DIR:-$HOME/.local/share/pushbutton/qwen38}" "${GGUF_QWEN38_PORT:-8080}" "${GGUF_QWEN38_INSTANCE:-main}"
-}
-
-mode_glm52() {
-    tui_header "PushbuttonLocalCoders — GLM-5.2 AWQ INT4"
-    setup_glm52_a100 "${MODEL_REPO:-cyankiwi/GLM-5.2-AWQ-INT4}" "${GLM_MAX_MODEL_LEN:-32768}"
 }
 
 mode_apple_ablate() {
@@ -395,14 +488,11 @@ case "$MODE" in
     benchmark)    mode_benchmark   ;;
     nodes)        mode_nodes        ;;
     orchestrator) mode_orchestrator ;;
-    qwen38)       mode_qwen38      ;;
-    qwen38-cuda)  mode_qwen38_cuda ;;
-    glm52)        mode_glm52       ;;
     apple-ablate) mode_apple_ablate ;;
     cpu-lab)      mode_cpu_lab     ;;
     submit-benchmarks) mode_submit_benchmarks ;;
     *)
-        tui_error "Unknown mode: $MODE"
+        tui_error "Unknown action: $MODE"
         print_help
         exit 1
         ;;

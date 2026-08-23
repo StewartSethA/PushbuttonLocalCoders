@@ -23,7 +23,7 @@ bash install.sh          # "just get me running" mode
 
 ---
 
-## Modes
+## Actions
 
 | Flag | Description |
 |------|-------------|
@@ -34,8 +34,11 @@ bash install.sh          # "just get me running" mode
 | `--monitor` | Live TUI showing GPU, CPU, VRAM and RAM utilisation |
 | `--benchmark` | Run a short Ollama benchmark, compare actual vs guessed tok/s, and save the runtime profile |
 | `--nodes` | Monitor networked boxes (GPU/CPU/VRAM/RAM over SSH) |
-| `--build-llamacpp` | Build llama.cpp with GPU acceleration (CUDA / Metal / ROCm) and CPU fallback |
+| `--build-llamacpp` | Build llama.cpp with automatic platform acceleration (auto-provisions local CUDA nvcc/libs on NVIDIA when needed, Metal on Apple, ROCm on AMD) |
 | `--orchestrator` | Start a local multi-agent orchestrator + developer processes |
+| `--prompt-shell <claude\|opencode\|hermes>` | Select prompt shell (default: `claude`) |
+| `--network-mode <host\|bridge\|none>` | Configure agent sandbox network access |
+| `--request "<target request>"` | Resolve explicit target request (example: `"V100 16GB 4-bit qwen3.8:27b model"`) |
 | `--submit-benchmarks` | Prepare a system benchmark contribution file (and optionally a PR) with true PP/TG data |
 
 ### Examples
@@ -95,7 +98,7 @@ bash install.sh --build-llamacpp
 ```
 install.sh                  ← Single entry point (curl-installable)
 lib/
-  detect_hardware.sh        ← GPU/CPU/VRAM/RAM detection (Linux, Mac, Windows)
+  detect_hardware.sh        ← Hardware capability profile (GPU/CPU/VRAM/RAM/CUDA/Apple/CPU caps)
   select_model.sh           ← Model + quant selection based on inference memory
   install_ollama.sh         ← Ollama install + service management + model pull
   install_claude.sh         ← Claude Code install + LiteLLM/Ollama bridge setup
@@ -115,6 +118,20 @@ configs/                    ← User config files (nodes.txt, claude.env, etc.)
 
 ---
 
+## Pushbutton capability flow
+
+Pushbutton now follows a unified capability-driven flow with no model-specific or CUDA-specific install mode:
+
+1. Auto-discover hardware capabilities.
+2. Auto-recommend local models and quants.
+3. Optionally add cloud providers/models.
+4. Auto-populate local+cloud agent inventory pinned to hardware targets.
+5. Launch selected prompt shell (Claude Code by default).
+
+On NVIDIA systems, local CUDA nvcc/libraries are automatically provisioned when system CUDA is missing or unsuitable.
+On Apple Silicon, Apple-specific optimizations are applied automatically.
+CPU optimization packs are offered when CPU fallback models are selected.
+
 ## Model Selection Logic
 
 `select_model.sh` now keeps the catalogue intentionally modern:
@@ -133,7 +150,8 @@ Before any model pull, the installer now:
 - lets you choose model quant, KV quant, primary coder, and additional coders from terminal dropdowns
 - records estimated prompt-processing (PP) and text-generation (TG) tok/s, then compares them with measured values after the benchmark run
 
-Override at any time with `--model <tag>` or the `DEVELOPER_MODEL` env var.
+Override at any time with `--model <tag>` or the `DEVELOPER_MODEL` env var.  
+Add cloud providers with `PUSHBUTTON_CLOUD_PROVIDERS` (`name|url|auth|token;...`) and cloud models with `PUSHBUTTON_CLOUD_MODELS` (`model1,model2`).
 
 ### Benchmark contribution flow
 

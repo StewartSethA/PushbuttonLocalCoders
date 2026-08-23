@@ -9,6 +9,8 @@ source "$SCRIPT_DIR/tui.sh"
 
 MODEL_PLAN_DIR="${MODEL_PLAN_DIR:-$HOME/.config/pushbutton}"
 MODEL_PLAN_FILE="$MODEL_PLAN_DIR/model_plan.env"
+AGENT_CATALOG_FILE="$MODEL_PLAN_DIR/agent_catalog.tsv"
+MODEL_PROVIDER_FILE="$MODEL_PLAN_DIR/cloud_providers.tsv"
 mkdir -p "$MODEL_PLAN_DIR"
 
 # Format: "base_tag|display_name|param_billions|quality_score|native_context|role"
@@ -30,6 +32,16 @@ declare -a ORCHESTRATOR_CATALOGUE=(
 declare -a MODEL_QUANT_OPTIONS=("q3_K_M" "q4_K_M" "q6_K" "q8_0")
 declare -a KV_QUANT_OPTIONS=("q4_0" "q6_K" "q8_0")
 declare -a CONTEXT_PRESETS=(16384 32768 65536 131072 262144)
+declare -a CPU_MODEL_CATALOGUE=(
+    "qwen3.8:27b-q4_K_M|Qwen 3.8 27B (CPU fallback)|27|82|32768|cpu"
+    "nemotron-3.5-lightning:30b-a3b-q4_K_M|Nemotron 3.5 Lightning (CPU fallback)|30|80|32768|cpu"
+)
+declare -a CLOUD_MODEL_CATALOGUE=(
+    "claude-sonnet-5|Claude Sonnet 5|cloud|high"
+    "claude-opus-5|Claude Opus 5|cloud|max"
+    "gpt-5.6-terra|GPT-5.6 Terra|cloud|high"
+    "gemini-3.1-pro-preview|Gemini 3.1 Pro|cloud|high"
+)
 
 float_eval() {
     local expr="$1"
@@ -409,6 +421,164 @@ best_context_preset() {
     echo "$best"
 }
 
+parse_cloud_provider_entries() {
+    local raw="${PUSHBUTTON_CLOUD_PROVIDERS:-}"
+    local providers=()
+    if [[ -n "$raw" ]]; then
+        IFS=';' read -r -a providers <<< "$raw"
+    fi
+    printf '%s\n' "${providers[@]}"
+}
+
+persist_cloud_providers() {
+    : > "$MODEL_PROVIDER_FILE"
+    local provider
+    while IFS= read -r provider; do
+        [[ -z "$provider" ]] && continue
+        printf '%s\n' "$provider" >> "$MODEL_PROVIDER_FILE"
+    done < <(parse_cloud_provider_entries)
+}
+
+configure_cloud_preferences() {
+    SELECTED_CLOUD_MODELS="${SELECTED_CLOUD_MODELS:-${PUSHBUTTON_CLOUD_MODELS:-}}"
+    CLOUD_PROVIDER_ENTRIES="${CLOUD_PROVIDER_ENTRIES:-${PUSHBUTTON_CLOUD_PROVIDERS:-}}"
+    ENABLE_CLOUD_MODELS=0
+    if [[ -n "$SELECTED_CLOUD_MODELS" ]]; then
+        ENABLE_CLOUD_MODELS=1
+    fi
+
+    if [[ -t 0 ]] && [[ "${PUSHBUTTON_SKIP_CLOUD_PROMPT:-0}" != "1" ]]; then
+        local attach_cloud=""
+        read -r -p "Add cloud models/providers to agent inventory? [y/N] " attach_cloud
+        if [[ "$attach_cloud" =~ ^[Yy]$ ]]; then
+            ENABLE_CLOUD_MODELS=1
+            if [[ -z "$CLOUD_PROVIDER_ENTRIES" ]]; then
+                local provider_name provider_url provider_auth provider_token
+                read -r -p "Cloud provider name (e.g. openrouter): " provider_name
+                read -r -p "Provider base URL: " provider_url
+                read -r -p "Auth type (bearer/api-key): " provider_auth
+                read -r -p "Auth token/key: " provider_token
+                if [[ -n "$provider_name" && -n "$provider_url" && -n "$provider_auth" && -n "$provider_token" ]]; then
+                    CLOUD_PROVIDER_ENTRIES="${provider_name}|${provider_url}|${provider_auth}|${provider_token}"
+                    PUSHBUTTON_CLOUD_PROVIDERS="$CLOUD_PROVIDER_ENTRIES"
+                fi
+            fi
+            if [[ -z "$SELECTED_CLOUD_MODELS" ]]; then
+                local cloud_options=()
+                local cloud_tags=()
+                local row
+                for row in "${CLOUD_MODEL_CATALOGUE[@]}"; do
+                    cloud_tags+=("${row%%|*}")
+                    cloud_options+=("${row#*|}")
+                done
+                local cloud_pick
+                PS3="Choose cloud model (or Done): "
+                local chosen=()
+                select cloud_pick in "${cloud_options[@]}" "Done"; do
+                    if [[ "$cloud_pick" == "Done" ]]; then
+                        break
+                    fi
+                    if [[ -n "${cloud_pick:-}" ]]; then
+                        local idx=$((REPLY-1))
+                        if (( idx >= 0 && idx < ${#cloud_tags[@]} )); then
+                            local picked="${cloud_tags[$idx]}"
+                            local found=0
+                            local existing
+                            for existing in "${chosen[@]}"; do
+                                [[ "$existing" == "$picked" ]] && found=1
+                            done
+                            (( found == 0 )) && chosen+=("$picked")
+                        fi
+                    fi
+                done
+                SELECTED_CLOUD_MODELS="$(IFS=,; echo "${chosen[*]}")"
+            fi
+        fi
+    fi
+
+    PUSHBUTTON_CLOUD_PROVIDERS="${CLOUD_PROVIDER_ENTRIES:-${PUSHBUTTON_CLOUD_PROVIDERS:-}}"
+    persist_cloud_providers
+    export ENABLE_CLOUD_MODELS SELECTED_CLOUD_MODELS CLOUD_PROVIDER_ENTRIES PUSHBUTTON_CLOUD_PROVIDERS
+}
+
+build_agent_catalog() {
+    local hardware_target="$1"
+    local source_model
+    : > "$AGENT_CATALOG_FILE"
+    printf "agent\tmodel\tsource\thardware_target\n" > "$AGENT_CATALOG_FILE"
+
+    printf "developer\t%s\tlocal\t%s\n" "${PRIMARY_CODER_MODEL:-}" "$hardware_target" >> "$AGENT_CATALOG_FILE"
+    printf "orchestrator\t%s\tlocal\t%s\n" "${ORCHESTRATOR_MODEL:-}" "$hardware_target" >> "$AGENT_CATALOG_FILE"
+
+    if [[ -n "${ADDITIONAL_CODER_MODELS:-}" ]]; then
+        local extra
+        local -a extras=()
+        IFS=',' read -r -a extras <<< "$ADDITIONAL_CODER_MODELS"
+        for extra in "${extras[@]}"; do
+            [[ -z "$extra" ]] && continue
+            printf "developer-extra\t%s\tlocal\t%s\n" "$extra" "$hardware_target" >> "$AGENT_CATALOG_FILE"
+        done
+    fi
+
+    if [[ "${ENABLE_CPU_MODELS:-0}" == "1" ]] && [[ -n "${CPU_FALLBACK_MODELS:-}" ]]; then
+        local cpu_model
+        local -a cpu_models=()
+        IFS=',' read -r -a cpu_models <<< "$CPU_FALLBACK_MODELS"
+        for cpu_model in "${cpu_models[@]}"; do
+            [[ -z "$cpu_model" ]] && continue
+            printf "developer-cpu\t%s\tlocal\tcpu\n" "$cpu_model" >> "$AGENT_CATALOG_FILE"
+        done
+    fi
+
+    if [[ "${ENABLE_CLOUD_MODELS:-0}" == "1" ]] && [[ -n "${SELECTED_CLOUD_MODELS:-}" ]]; then
+        local cloud_model
+        local -a cloud_models=()
+        IFS=',' read -r -a cloud_models <<< "$SELECTED_CLOUD_MODELS"
+        for cloud_model in "${cloud_models[@]}"; do
+            [[ -z "$cloud_model" ]] && continue
+            printf "developer-cloud\t%s\tcloud\tprovider\n" "$cloud_model" >> "$AGENT_CATALOG_FILE"
+        done
+    fi
+}
+
+resolve_model_target_request() {
+    local request="${1:-}"
+    local fallback_model="${2:-${PRIMARY_CODER_MODEL:-}}"
+    local resolved="$fallback_model"
+    local source="local"
+    local note="default"
+
+    if [[ -z "$request" ]]; then
+        echo "RESOLVED_AGENT_MODEL=\"$resolved\""
+        echo "RESOLVED_AGENT_SOURCE=\"$source\""
+        echo "RESOLVED_AGENT_NOTE=\"$note\""
+        return 0
+    fi
+
+    local lowered
+    lowered="$(echo "$request" | tr '[:upper:]' '[:lower:]')"
+    if [[ "$lowered" =~ qwen3\.8:27b ]]; then
+        resolved="qwen3.8:27b"
+        note="matched requested model family"
+    elif [[ "$lowered" =~ qwen3\.6:35b ]]; then
+        resolved="qwen3.6:35b"
+        note="matched requested model family"
+    elif [[ "$lowered" =~ nemotron ]]; then
+        resolved="nemotron-3.5-lightning"
+        note="matched requested model family"
+    fi
+
+    if [[ "$lowered" =~ cloud ]] && [[ -n "${SELECTED_CLOUD_MODELS:-}" ]]; then
+        source="cloud"
+        resolved="${SELECTED_CLOUD_MODELS%%,*}"
+        note="matched cloud request"
+    fi
+
+    echo "RESOLVED_AGENT_MODEL=\"$resolved\""
+    echo "RESOLVED_AGENT_SOURCE=\"$source\""
+    echo "RESOLVED_AGENT_NOTE=\"$note\""
+}
+
 print_model_recommendation() {
     eval "$(detect_all)"
     local quant kv_quant
@@ -436,6 +606,9 @@ print_model_recommendation() {
     echo "  GPU       : $GPU_MODEL ($GPU_VENDOR)"
     echo "  VRAM      : ${VRAM_GB} GB"
     echo "  Inference : ${INFERENCE_GB} GB ($MEMORY_TYPE)"
+    echo "  CUDA      : ${CUDA_AVAILABLE:-0} (v${CUDA_VERSION:-0.0}, ${CUDA_PROVIDER:-none})"
+    echo "  Apple SoC : ${APPLE_SILICON:-0}"
+    echo "  CPU caps  : ${CPU_CAPABILITIES:-baseline}"
     echo "════════════════════════════════════════════════"
     echo ""
     echo "  Recommended quant       : $quant"
@@ -462,6 +635,11 @@ TARGET_CONTEXT_LENGTH="${TARGET_CONTEXT_LENGTH:-4096}"
 DEVELOPER_MODEL="${DEVELOPER_MODEL:-}"
 DEVELOPER_MODELS="${DEVELOPER_MODELS:-}"
 ORCHESTRATOR_MODEL="${ORCHESTRATOR_MODEL:-}"
+ENABLE_CPU_MODELS="${ENABLE_CPU_MODELS:-0}"
+CPU_FALLBACK_MODELS="${CPU_FALLBACK_MODELS:-}"
+ENABLE_CLOUD_MODELS="${ENABLE_CLOUD_MODELS:-0}"
+SELECTED_CLOUD_MODELS="${SELECTED_CLOUD_MODELS:-}"
+CLOUD_PROVIDER_ENTRIES="${CLOUD_PROVIDER_ENTRIES:-}"
 EOF
 }
 
@@ -580,6 +758,24 @@ configure_model_plan() {
         ADDITIONAL_CODER_MODELS="${ADDITIONAL_CODER_MODELS:-}"
     fi
 
+    ENABLE_CPU_MODELS="${ENABLE_CPU_MODELS:-0}"
+    CPU_FALLBACK_MODELS="${CPU_FALLBACK_MODELS:-}"
+    if [[ -t 0 ]] && [[ "${PUSHBUTTON_SKIP_CPU_PROMPT:-0}" != "1" ]]; then
+        local include_cpu_models=""
+        read -r -p "Add CPU fallback model(s) and CPU optimization pack? [y/N] " include_cpu_models
+        if [[ "$include_cpu_models" =~ ^[Yy]$ ]]; then
+            ENABLE_CPU_MODELS=1
+            local cpu_models=()
+            local cpu_row
+            for cpu_row in "${CPU_MODEL_CATALOGUE[@]}"; do
+                cpu_models+=("${cpu_row%%|*}")
+            done
+            CPU_FALLBACK_MODELS="$(IFS=,; echo "${cpu_models[*]}")"
+        fi
+    fi
+
+    configure_cloud_preferences
+
     local primary_entry=""
     for entry in "${MODEL_CATALOGUE[@]}"; do
         if [[ "$(entry_field "$entry" tag)" == "$PRIMARY_CODER_ID" ]]; then
@@ -638,9 +834,13 @@ configure_model_plan() {
     fi
 
     persist_model_plan
+    local hardware_target="$GPU_VENDOR"
+    [[ "$hardware_target" == "none" ]] && hardware_target="cpu"
+    build_agent_catalog "$hardware_target"
     export PRIMARY_CODER_MODEL PRIMARY_CODER_NAME ADDITIONAL_CODER_MODELS
     export MODEL_QUANT KV_CACHE_QUANT TARGET_CONTEXT_LENGTH
     export DEVELOPER_MODEL DEVELOPER_MODELS ORCHESTRATOR_MODEL
+    export ENABLE_CPU_MODELS CPU_FALLBACK_MODELS ENABLE_CLOUD_MODELS SELECTED_CLOUD_MODELS CLOUD_PROVIDER_ENTRIES
     SELECTED_MODEL="$PRIMARY_CODER_MODEL"
     SELECTED_MODEL_NAME="$PRIMARY_CODER_NAME"
     export SELECTED_MODEL SELECTED_MODEL_NAME
