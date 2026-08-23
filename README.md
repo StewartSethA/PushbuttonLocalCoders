@@ -1,4 +1,4 @@
-# PushbuttonLocalCoders
+# Pushbutton Local Coders
 
 > **Pushbutton bootstrap for a powerful local AI coding assistant.**
 > One `curl` command installs Ollama, Claude Code, and the best local coder model
