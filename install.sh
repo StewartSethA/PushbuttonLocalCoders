@@ -40,7 +40,7 @@ fi
 # When run via curl pipe the script is downloaded to a tmp file without the lib/
 # directory next to it, so we clone the repo first.
 bootstrap_repo() {
-    if [[ -d "$SCRIPT_DIR/lib" ]]; then
+    if [[ -n "$SCRIPT_DIR" ]] && [[ -d "$SCRIPT_DIR/lib" ]]; then
         LIB_DIR="$SCRIPT_DIR/lib"
         AGENTS_DIR="$SCRIPT_DIR/agents"
         return 0
