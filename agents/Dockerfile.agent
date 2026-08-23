@@ -1,0 +1,32 @@
+# Dockerfile.agent — Sandboxed coding agent container.
+# Uses a minimal Debian base with Python, Node, git and the Ollama client.
+
+FROM debian:bookworm-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV DANGEROUSLY_SKIP_PERMISSIONS=true
+
+# ── System packages ─────────────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-pip python3-venv \
+        nodejs npm \
+        git curl wget jq \
+        ca-certificates \
+        bash \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Python tooling ───────────────────────────────────────────────────────────
+RUN pip3 install --no-cache-dir anthropic requests 2>/dev/null || true
+
+# ── Claude CLI ───────────────────────────────────────────────────────────────
+RUN npm install -g @anthropic-ai/claude-cli 2>/dev/null || true
+
+# ── Agent entrypoint script ──────────────────────────────────────────────────
+COPY agent_entrypoint.sh /usr/local/bin/agent_entrypoint.sh
+RUN chmod +x /usr/local/bin/agent_entrypoint.sh
+
+WORKDIR /workspace
+
+ENTRYPOINT ["/usr/local/bin/agent_entrypoint.sh"]

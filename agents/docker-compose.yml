@@ -1,0 +1,65 @@
+version: "3.9"
+
+# PushbuttonLocalCoders — Multi-agent Docker Compose setup
+# Usage:
+#   WORKSPACE=/path/to/project TASK="Fix all bugs" docker compose up --build
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: pushbutton-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    # GPU support (NVIDIA) — remove if not available
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    container_name: pushbutton-orchestrator
+    restart: on-failure
+    depends_on:
+      - ollama
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      MODEL_TAG: ${ORCHESTRATOR_MODEL:-qwen2.5:7b-instruct-q4_K_M}
+      TASK: |
+        You are the orchestrator. Your objective: ${TASK:-Improve this codebase}.
+        Decompose the task into subtasks and coordinate with developer agents.
+        Files are in /workspace.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      DANGEROUSLY_SKIP_PERMISSIONS: "true"
+    volumes:
+      - ${WORKSPACE:-.}:/workspace
+
+  developer:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    container_name: pushbutton-developer
+    restart: on-failure
+    depends_on:
+      - ollama
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      MODEL_TAG: ${DEVELOPER_MODEL:-qwen2.5-coder:7b-instruct-q4_K_M}
+      TASK: |
+        You are a developer agent. Your objective: ${TASK:-Implement features and fix bugs}.
+        Write clean, well-tested code. Files are in /workspace.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      DANGEROUSLY_SKIP_PERMISSIONS: "true"
+    volumes:
+      - ${WORKSPACE:-.}:/workspace
+
+volumes:
+  ollama_data:
