@@ -55,6 +55,9 @@ bash install.sh --monitor
 # Benchmark the current Ollama runtime (GPU by default)
 bash install.sh --benchmark
 
+# Force the post-setup benchmark in quick mode
+bash install.sh --quick --run-benchmark
+
 # Benchmark Ollama in CPU-only mode
 bash install.sh --benchmark --framework ollama-cpu
 

@@ -95,7 +95,7 @@ Modes:
   --monitor            Live GPU/CPU/node monitor
   --build-llamacpp     Build llama.cpp with GPU/CPU optimisations
   --benchmark          Run an Ollama speed benchmark and save the runtime profile
-  --nodes              Network node monitor (add/list/live)
+  --nodes              Network node monitor (add/list/scan/live)
   --orchestrator       Start local orchestrator + developer agents
   --help               Show this help
 
@@ -106,6 +106,7 @@ Options:
   --interval <s>       Monitor refresh interval in seconds (default: 2)
   --model    <tag>     Override model tag (Ollama format)
   --framework <name>   Benchmark framework: ollama or ollama-cpu
+  --run-benchmark      Force the post-setup benchmark in quick mode
   --skip-benchmark     Skip the post-setup benchmark prompt
   --context-sweep      Run the longer context sweep after the quick benchmark
 
@@ -126,13 +127,7 @@ while [[ $# -gt 0 ]]; do
         --team)            MODE="team"           ; MODE_EXPLICIT=true ; shift ;;
         --monitor)         MODE="monitor"        ; MODE_EXPLICIT=true ; shift ;;
         --build-llamacpp)  MODE="llamacpp"       ; MODE_EXPLICIT=true ; shift ;;
-        --benchmark)       if [[ "$MODE_EXPLICIT" == false ]]; then
-                               MODE="benchmark"
-                               MODE_EXPLICIT=true
-                           else
-                               RUN_BENCHMARK="yes"
-                           fi
-                           shift ;;
+        --benchmark)       MODE="benchmark"       ; MODE_EXPLICIT=true ; shift ;;
         --nodes)           MODE="nodes"          ; shift
                            MODE_EXPLICIT=true
                            # Capture optional subcommand (add/rm/list/live)
@@ -152,6 +147,7 @@ while [[ $# -gt 0 ]]; do
         --interval)        MONITOR_INTERVAL="$2" ; shift 2 ;;
         --model)           SELECTED_MODEL="$2"   ; shift 2 ;;
         --framework)       BENCHMARK_FRAMEWORK="$2" ; shift 2 ;;
+        --run-benchmark)   RUN_BENCHMARK="yes"      ; shift ;;
         --skip-benchmark)  RUN_BENCHMARK="no"       ; shift ;;
         --context-sweep)   BENCHMARK_CONTEXT_SWEEP="yes" ; shift ;;
         *)                 tui_warn "Unknown option: $1" ; shift ;;

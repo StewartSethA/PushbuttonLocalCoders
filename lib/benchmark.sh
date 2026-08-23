@@ -95,7 +95,7 @@ estimate_ollama_speeds() {
             tg = base_tg * scale * quant * family * hw
             if (pp < 20) pp = 20
             if (tg < 1) tg = 1
-            printf "GUESSED_PP=%.1f\nGUESSED_TG=%.1f\n", pp, tg
+            printf "%.1f\t%.1f\n", pp, tg
         }'
 }
 
@@ -200,7 +200,7 @@ run_ollama_benchmark_once() {
     local curl_pid start_ms now_ms elapsed_ms est_pp_ms est_tg_ms phase_elapsed
     local num_gpu="-1"
 
-    eval "$(estimate_ollama_speeds "$model" "$framework")"
+    IFS=$'\t' read -r GUESSED_PP GUESSED_TG < <(estimate_ollama_speeds "$model" "$framework")
     guessed_total=$(awk -v pp="$GUESSED_PP" -v tg="$GUESSED_TG" 'BEGIN { printf "%.1f", (pp + tg) / 2.0 }')
 
     prompt=$(benchmark_prompt "$prompt_tokens")
@@ -274,7 +274,7 @@ PY
         wait "$curl_pid"
     fi
 
-    eval "$(python3 - "$result_file" <<'PY'
+    IFS=$'\t' read -r ACTUAL_PP ACTUAL_TG ACTUAL_TOTAL PROMPT_EVAL_COUNT EVAL_COUNT < <(python3 - "$result_file" <<'PY'
 import json
 import sys
 
@@ -296,13 +296,9 @@ eval_count = payload.get("eval_count", 0) or 0
 total_duration = (payload.get("prompt_eval_duration", 0) or 0) + (payload.get("eval_duration", 0) or 0)
 total_tps = 0.0 if total_duration <= 0 else (prompt_count + eval_count) / (total_duration / 1_000_000_000)
 
-print(f"ACTUAL_PP={prompt_tps:.1f}")
-print(f"ACTUAL_TG={gen_tps:.1f}")
-print(f"ACTUAL_TOTAL={total_tps:.1f}")
-print(f"PROMPT_EVAL_COUNT={prompt_count}")
-print(f"EVAL_COUNT={eval_count}")
+print(f"{prompt_tps:.1f}\t{gen_tps:.1f}\t{total_tps:.1f}\t{prompt_count}\t{eval_count}")
 PY
-)"
+)
 
     if [[ "$render" == "full" ]]; then
         print_speed_comparison "PP tok/s" "${ACTUAL_PP:-0}" "${GUESSED_PP:-0}" "tok/s"
@@ -345,8 +341,14 @@ run_ollama_context_sweep() {
         return 0
     fi
 
+    local accepted_budget_s=0
+    for ctx_val in "${contexts[@]}"; do
+        accepted_budget_s=$(awk -v a="$accepted_budget_s" -v ctx="$ctx_val" -v total="${initial_total:-1}" \
+            'BEGIN { if (total <= 0) total = 1; printf "%.2f", a + ((ctx + 64) / total) }')
+    done
+
     tui_header "Context Sweep"
-    tui_info "Projected runtime from initial speed: ${total_budget_s}s"
+    tui_info "Projected runtime from initial speed: ${accepted_budget_s}s"
 
     local best_pp=1
     local best_tg=1
@@ -384,7 +386,7 @@ maybe_run_post_setup_benchmark() {
     local prompt_tokens=128
     local gen_tokens guessed_total
 
-    eval "$(estimate_ollama_speeds "$model" "$framework")"
+    IFS=$'\t' read -r GUESSED_PP GUESSED_TG < <(estimate_ollama_speeds "$model" "$framework")
     guessed_total=$(awk -v pp="$GUESSED_PP" -v tg="$GUESSED_TG" 'BEGIN { printf "%.1f", (pp + tg) / 2.0 }')
     gen_tokens=$(calc_quick_gen_tokens "$prompt_tokens" "$guessed_total")
 
