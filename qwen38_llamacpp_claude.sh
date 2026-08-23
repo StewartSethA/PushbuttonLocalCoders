@@ -1029,7 +1029,7 @@ _prefetch_best_quant_bg() {
   fi
   say "Pre-fetching best quant candidate while llama.cpp compiles: $q (~${size} MiB)"
   info "Download is non-blocking — build and prefetch run in parallel"
-  local prefetch_log="$LOG_DIR/prefetch-${file}.log"
+  local prefetch_log="$LOG_DIR/prefetch-$(basename "$file").log"
   # Run download in a subshell; redirect all output to the log so it doesn't
   # interleave with cmake/ninja build output.
   (
@@ -1051,9 +1051,9 @@ install_all() {
 
   build_llama
 
-  # If the background prefetch is still running, wait for it now before model
-  # selection (which will find the file cached if the prefetch succeeded).
-  if [ -n "$PREFETCH_PID" ] && kill -0 "$PREFETCH_PID" 2>/dev/null; then
+  # Wait for the background prefetch (unconditionally — wait is safe even if the
+  # process has already exited, and avoids a race between kill -0 and wait).
+  if [ -n "$PREFETCH_PID" ]; then
     say "Waiting for background prefetch of $PREFETCH_FILE to complete"
     local pf_rc=0
     wait "$PREFETCH_PID" || pf_rc=$?
@@ -1092,8 +1092,9 @@ explore() {
   info "Strategy: start with the highest-quality 4-bit quant that fits VRAM+context, bench it,"
   info "then offer to try a step up or down the quality/speed curve."
 
-  # Find the best 4-bit candidate within the VRAM budget (UD-Q4_K_M is the canonical
-  # sweet spot; fall back to IQ4_XS if VRAM is tighter, then Q5 if room allows).
+  # Find the best 4-bit candidate within the VRAM budget. The candidate list is
+  # ordered best-quality-first, so the first Q4/IQ4 entry is the highest-quality
+  # 4-bit quant that fits. If no 4-bit quant fits, fall back to the best available.
   local kv="$KV_CHOSEN"
   local rows candidate_4bit row q file size
   rows="$(prefilter_quant_list "$kv")"
@@ -1137,7 +1138,8 @@ explore() {
   bench
 
   # Offer to compare with adjacent quants (higher quality, then lower/faster).
-  # Build an ordered list of all passing candidates so we know neighbors.
+  # Both neighbors are computed relative to the original 4-bit pick so the two
+  # prompts are independent — accepting the upgrade does not shift "next_entry".
   local all_passing
   mapfile -t all_passing < <(printf '%s\n' "$rows")
   local n_cands=${#all_passing[@]}
