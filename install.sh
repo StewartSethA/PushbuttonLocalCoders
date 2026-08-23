@@ -28,7 +28,7 @@ SCRIPT_DIR=""
 
 if [[ ${BASH_SOURCE[0]+set} ]]; then
     SCRIPT_PATH="${BASH_SOURCE[0]}"
-elif [[ -n "${0:-}" ]] && [[ "$0" != "bash" ]]; then
+elif [[ -n "${0:-}" ]] && [[ -f "$0" ]]; then
     SCRIPT_PATH="$0"
 fi
 
