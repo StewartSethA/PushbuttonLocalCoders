@@ -428,20 +428,45 @@ ensure_chat_template() {
   info "template SHA256=${sha:-unavailable}"
 }
 
+free_disk_mib() {
+  # Return free disk space in MiB for the directory (or MODEL_DIR if omitted).
+  df -BM "${1:-$MODEL_DIR}" 2>/dev/null | awk 'NR==2{gsub("M",""); print $4+0}'
+}
+
+# Return codes: 0=ok, 1=transient download failure, 2=disk full / insufficient space
 download_file() {
-  local rel="$1" dest="$2"
+  local rel="$1" dest="$2" expected_mib="${3:-0}"
   if [ -s "$dest" ]; then
     info "cached: $(basename "$dest") ($(du -h "$dest" | awk '{print $1}'))"
     return 0
   fi
   mkdir -p "$(dirname "$dest")" || return 1
+
+  # Refuse to attempt a download we clearly can't store (10% headroom).
+  if [ "${expected_mib:-0}" -gt 0 ]; then
+    local free_now needed
+    free_now="$(free_disk_mib "$(dirname "$dest")")"
+    needed=$(( expected_mib * 11 / 10 ))
+    if [ "${free_now:-0}" -lt "$needed" ]; then
+      warn "not enough disk for $(basename "$dest"): need ~${needed} MiB, have ${free_now:-0} MiB free"
+      return 2
+    fi
+  fi
+
   say "Downloading $(basename "$dest") into script-local cache"
   info "$MODEL_REPO/$rel"
   local part="${dest}.partial"
   curl -L --fail --retry 8 --retry-delay 3 --connect-timeout 30 -C - \
     -o "$part" "$MODEL_BASE_URL/$rel?download=true"
-  if [ $? -ne 0 ]; then
+  local curl_rc=$?
+  if [ "$curl_rc" -eq 23 ]; then
+    # curl exit 23 = write error, almost always disk full mid-transfer
+    warn "download failed (write error / disk full): $rel"
+    rm -f "$part"
+    return 2
+  elif [ "$curl_rc" -ne 0 ]; then
     warn "download failed: $rel"
+    rm -f "$part"
     return 1
   fi
   mv -f "$part" "$dest" || return 1
@@ -613,7 +638,12 @@ select_download_and_validate() {
     MODEL_FILE="$file"
     MODEL_PATH="$MODEL_DIR/$file"
     info "candidate #$attempt: $q (~${size} MiB file)"
-    download_file "$file" "$MODEL_PATH" || continue
+    local dl_rc=0
+    download_file "$file" "$MODEL_PATH" "$size" || dl_rc=$?
+    if [ "$dl_rc" -eq 2 ]; then
+      die "disk full: cannot store $file (~${size} MiB). Free disk space and retry."
+    fi
+    [ "$dl_rc" -eq 0 ] || continue
 
     local fitlog="$LOG_DIR/fit-${INSTANCE_SAFE}-${q}.log"
     say "Proving VRAM fit: $q + $NATIVE_CTX context + $KV_CHOSEN KV"
@@ -969,9 +999,71 @@ plan() {
   info "final choice is NOT trusted until a real $NATIVE_CTX-token --fit off GPU load succeeds"
 }
 
+# Background variables for parallel prefetch during build
+PREFETCH_PID=""
+PREFETCH_FILE=""
+
+# Start downloading the most likely quant candidate in the background so that the
+# llama.cpp build and model download can overlap. The caller is responsible for
+# waiting on PREFETCH_PID before running select_download_and_validate.
+# Requires: detect_gpu already called (GPU_FREE_MIB set), MODEL_DIR writable.
+_prefetch_best_quant_bg() {
+  local kv rows first_row q file size dest free_now needed
+  kv="$(choose_kv_type)"
+  choose_batch_profile
+  rows="$(prefilter_quant_list "$kv" 2>/dev/null)" || true
+  [ -n "$rows" ] || return 0
+  first_row="$(printf '%s\n' "$rows" | head -n1)"
+  IFS='|' read -r q file size <<< "$first_row"
+  [ -n "$file" ] || return 0
+  dest="$MODEL_DIR/$file"
+  if [ -s "$dest" ]; then
+    info "best quant already cached: $file"
+    return 0
+  fi
+  free_now="$(free_disk_mib "$MODEL_DIR")"
+  needed=$(( size * 11 / 10 ))
+  if [ "${free_now:-0}" -lt "$needed" ]; then
+    warn "not enough disk space to prefetch $file: need ~${needed} MiB, have ${free_now:-0} MiB free"
+    return 0
+  fi
+  say "Pre-fetching best quant candidate while llama.cpp compiles: $q (~${size} MiB)"
+  info "Download is non-blocking — build and prefetch run in parallel"
+  local prefetch_log="$LOG_DIR/prefetch-${file}.log"
+  # Run download in a subshell; redirect all output to the log so it doesn't
+  # interleave with cmake/ninja build output.
+  (
+    download_file "$file" "$dest" "$size" >"$prefetch_log" 2>&1
+    exit $?
+  ) &
+  PREFETCH_PID=$!
+  PREFETCH_FILE="$file"
+}
+
 install_all() {
   print_header
+  # Detect GPU and kick off the best-fit model download in the background BEFORE
+  # starting the potentially lengthy llama.cpp CUDA compilation, so both can
+  # proceed concurrently.
+  install_basic_deps
+  detect_gpu
+  _prefetch_best_quant_bg
+
   build_llama
+
+  # If the background prefetch is still running, wait for it now before model
+  # selection (which will find the file cached if the prefetch succeeded).
+  if [ -n "$PREFETCH_PID" ] && kill -0 "$PREFETCH_PID" 2>/dev/null; then
+    say "Waiting for background prefetch of $PREFETCH_FILE to complete"
+    local pf_rc=0
+    wait "$PREFETCH_PID" || pf_rc=$?
+    if [ "$pf_rc" -eq 2 ]; then
+      die "disk full during background prefetch of $PREFETCH_FILE. Free disk space and retry."
+    elif [ "$pf_rc" -ne 0 ]; then
+      warn "background prefetch of $PREFETCH_FILE did not complete; will retry in model selection"
+    fi
+  fi
+
   select_download_and_validate
   bench || die "benchmark stage failed"
   start_server
@@ -986,12 +1078,147 @@ install_all() {
   printf '\nINSTALL=PASS\n'
 }
 
+# explore — download the representative 4-bit quant, bench it, then offer to try
+# adjacent quants on the quality/speed Pareto curve if the user wants a comparison.
+explore() {
+  print_header
+  load_existing_build
+  ensure_chat_template
+  detect_gpu
+  KV_CHOSEN="$(choose_kv_type)"
+  choose_batch_profile
+
+  say "Explore mode: representative 4-bit quant"
+  info "Strategy: start with the highest-quality 4-bit quant that fits VRAM+context, bench it,"
+  info "then offer to try a step up or down the quality/speed curve."
+
+  # Find the best 4-bit candidate within the VRAM budget (UD-Q4_K_M is the canonical
+  # sweet spot; fall back to IQ4_XS if VRAM is tighter, then Q5 if room allows).
+  local kv="$KV_CHOSEN"
+  local rows candidate_4bit row q file size
+  rows="$(prefilter_quant_list "$kv")"
+
+  # Walk the candidate list and take the first Q4/IQ4 entry (highest quality first).
+  candidate_4bit=""
+  while IFS='|' read -r q file size; do
+    [[ "$q" =~ Q4|IQ4 ]] || continue
+    candidate_4bit="$q|$file|$size"
+    break
+  done <<< "$rows"
+
+  if [ -z "$candidate_4bit" ]; then
+    warn "no 4-bit quant passes the VRAM pre-filter; falling back to best available candidate"
+    candidate_4bit="$(printf '%s\n' "$rows" | head -n1)"
+  fi
+
+  IFS='|' read -r q file size <<< "$candidate_4bit"
+  QUANT_CHOSEN="$q"
+  MODEL_FILE="$file"
+  MODEL_PATH="$MODEL_DIR/$file"
+
+  say "Selected representative: $q (~${size} MiB)"
+  local dl_rc=0
+  download_file "$file" "$MODEL_PATH" "$size" || dl_rc=$?
+  if [ "$dl_rc" -eq 2 ]; then
+    die "disk full: cannot store $file (~${size} MiB). Free disk space and retry."
+  elif [ "$dl_rc" -ne 0 ]; then
+    die "download failed for $file. Check network and retry."
+  fi
+
+  local fitlog="$LOG_DIR/fit-${INSTANCE_SAFE}-${q}.log"
+  say "Proving VRAM fit: $q + $NATIVE_CTX context + $kv KV"
+  if ! try_full_context_load "$fitlog"; then
+    die "$q failed full-context load at $NATIVE_CTX tokens. Free VRAM or use explore with a smaller model."
+  fi
+  info "PASS: $q fits with full $NATIVE_CTX-token context"
+  save_profile
+
+  say "Running benchmark for $q"
+  bench
+
+  # Offer to compare with adjacent quants (higher quality, then lower/faster).
+  # Build an ordered list of all passing candidates so we know neighbors.
+  local all_passing
+  mapfile -t all_passing < <(printf '%s\n' "$rows")
+  local n_cands=${#all_passing[@]}
+  local my_idx=-1
+  for (( i=0; i<n_cands; i++ )); do
+    local entry="${all_passing[$i]}"
+    if [[ "$entry" == "$q|"* ]]; then
+      my_idx=$i
+      break
+    fi
+  done
+
+  local prev_entry="" next_entry=""
+  [ "$my_idx" -gt 0 ] && prev_entry="${all_passing[$((my_idx-1))]}"
+  [ "$my_idx" -lt $((n_cands-1)) ] && next_entry="${all_passing[$((my_idx+1))]}"
+
+  if [ -n "$prev_entry" ]; then
+    IFS='|' read -r pq pf ps <<< "$prev_entry"
+    printf '\n'
+    read -r -p "==> Try a larger/higher-quality quant ($pq, ~${ps} MiB)? [y/N] " yn </dev/tty
+    if [[ "${yn,,}" == y* ]]; then
+      say "Switching to $pq"
+      QUANT_CHOSEN="$pq"; MODEL_FILE="$pf"; MODEL_PATH="$MODEL_DIR/$pf"
+      dl_rc=0
+      download_file "$pf" "$MODEL_PATH" "$ps" || dl_rc=$?
+      if [ "$dl_rc" -eq 2 ]; then
+        warn "disk full; staying with $q"
+      elif [ "$dl_rc" -ne 0 ]; then
+        warn "download failed; staying with $q"
+      else
+        fitlog="$LOG_DIR/fit-${INSTANCE_SAFE}-${pq}.log"
+        if try_full_context_load "$fitlog"; then
+          info "PASS: $pq fits"
+          save_profile
+          bench
+        else
+          warn "$pq failed VRAM fit; reverting to $q"
+          QUANT_CHOSEN="$q"; MODEL_FILE="$file"; MODEL_PATH="$MODEL_DIR/$file"
+          save_profile
+        fi
+      fi
+    fi
+  fi
+
+  if [ -n "$next_entry" ]; then
+    IFS='|' read -r nq nf ns <<< "$next_entry"
+    printf '\n'
+    read -r -p "==> Try a smaller/faster quant ($nq, ~${ns} MiB)? [y/N] " yn </dev/tty
+    if [[ "${yn,,}" == y* ]]; then
+      say "Switching to $nq"
+      QUANT_CHOSEN="$nq"; MODEL_FILE="$nf"; MODEL_PATH="$MODEL_DIR/$nf"
+      dl_rc=0
+      download_file "$nf" "$MODEL_PATH" "$ns" || dl_rc=$?
+      if [ "$dl_rc" -eq 2 ]; then
+        warn "disk full; staying with current selection"
+      elif [ "$dl_rc" -ne 0 ]; then
+        warn "download failed; staying with current selection"
+      else
+        fitlog="$LOG_DIR/fit-${INSTANCE_SAFE}-${nq}.log"
+        if try_full_context_load "$fitlog"; then
+          info "PASS: $nq fits"
+          save_profile
+          bench
+        else
+          warn "$nq failed VRAM fit"
+        fi
+      fi
+    fi
+  fi
+
+  say "Explore complete. Deployed quant: $QUANT_CHOSEN"
+  info "Run '$0 start' to launch the server, or '$0 claude' to start coding."
+}
+
 usage() {
   cat <<HELP
 Usage: $(basename "$0") COMMAND [claude args...]
 
 Commands:
   install       deps + detect + build + quant select/download + full-ctx fit proof + bench + deploy + smokes
+  explore       interactive: download representative 4-bit quant, bench, optionally compare adjacent quants
   plan          show detected GPU, build profile, VRAM budget, candidate quants; download nothing
   build         build fresh llama.cpp CUDA targets for selected GPU architecture
   model         choose/download quant and prove full native-context VRAM fit
@@ -1018,6 +1245,7 @@ cmd="${1:-install}"
 if [ $# -gt 0 ]; then shift; fi
 case "$cmd" in
   install) install_all "$@" ;;
+  explore) explore "$@" ;;
   plan) plan "$@" ;;
   build) print_header; build_llama "$@" ;;
   model|download) print_header; select_download_and_validate "$@" ;;
