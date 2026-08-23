@@ -42,7 +42,7 @@ build_agent_image() {
 run_agent_sandbox() {
     local project_dir="${1:?project_dir required}"
     local task="${2:-Improve this codebase}"
-    local model_tag="${3:-${SELECTED_MODEL:-qwen2.5-coder:7b-instruct-q4_K_M}}"
+    local model_tag="${3:-${SELECTED_MODEL:-qwen3.8:27b-q4_K_M}}"
 
     project_dir="$(realpath "$project_dir")"
 
@@ -82,8 +82,8 @@ start_agent_team() {
     tui_step "Starting multi-agent team via Docker Compose…"
     WORKSPACE="$(realpath "$project_dir")" \
     TASK="$task" \
-    ORCHESTRATOR_MODEL="${ORCHESTRATOR_MODEL:-qwen2.5:7b-instruct-q4_K_M}" \
-    DEVELOPER_MODEL="${DEVELOPER_MODEL:-qwen2.5-coder:7b-instruct-q4_K_M}" \
+    ORCHESTRATOR_MODEL="${ORCHESTRATOR_MODEL:-nemotron-3.5-lightning-q4_K_M}" \
+    DEVELOPER_MODEL="${DEVELOPER_MODEL:-qwen3.8:27b-q4_K_M}" \
     ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}" \
     docker compose -f "$COMPOSE_FILE" up --build -d
 

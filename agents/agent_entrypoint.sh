@@ -10,7 +10,7 @@
 set -euo pipefail
 
 OLLAMA_HOST="${OLLAMA_HOST:-http://localhost:11434}"
-MODEL_TAG="${MODEL_TAG:-qwen2.5-coder:7b-instruct-q4_K_M}"
+MODEL_TAG="${MODEL_TAG:-qwen3.8:27b-q4_K_M}"
 TASK="${TASK:-Describe yourself and list files in /workspace}"
 
 echo "═══════════════════════════════════════════════════"

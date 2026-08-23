@@ -146,12 +146,14 @@ pull_model() {
 
 # ── Entrypoint ─────────────────────────────────────────────────────────────────
 setup_ollama() {
-    local model_tag="${1:-}"
+    local model_tags=("$@")
     ensure_ollama_installed
     start_ollama_service
-    if [[ -n "$model_tag" ]]; then
+    local model_tag
+    for model_tag in "${model_tags[@]}"; do
+        [[ -z "$model_tag" ]] && continue
         pull_model "$model_tag"
-    fi
+    done
 }
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then

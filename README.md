@@ -27,14 +27,15 @@ bash install.sh          # "just get me running" mode
 
 | Flag | Description |
 |------|-------------|
-| *(default)* `--quick` | Install Ollama + Claude CLI, auto-select and pull the best coder model for your hardware |
-| `--explore` | Run rapid model/quant ablations to find the optimal setup for this machine |
+| *(default)* `--quick` | Install Ollama + Claude CLI after an interactive modern-model plan review |
+| `--explore` | Run PP/TG benchmarks for the modern model/quant combinations that fit this machine |
 | `--agent` | Wrap a project directory in a sandboxed Docker agent (dangerously-skip-permissions enabled) |
 | `--team` | Launch a full orchestrator + developer agent team via Docker Compose |
 | `--monitor` | Live TUI showing GPU, CPU, VRAM and RAM utilisation |
 | `--nodes` | Monitor networked boxes (GPU/CPU/VRAM/RAM over SSH) |
 | `--build-llamacpp` | Build llama.cpp with GPU acceleration (CUDA / Metal / ROCm) and CPU fallback |
 | `--orchestrator` | Start a local multi-agent orchestrator + developer processes |
+| `--submit-benchmarks` | Prepare a system benchmark contribution file (and optionally a PR) with true PP/TG data |
 
 ### Examples
 
@@ -96,23 +97,33 @@ configs/                    ← User config files (nodes.txt, claude.env, etc.)
 
 ## Model Selection Logic
 
-`select_model.sh` maintains a catalogue of coder models ranked by quality score.
-Given the detected inference memory (VRAM → MCDRAM → system RAM − 4 GB headroom),
-it picks the highest-quality model whose minimum VRAM requirement fits.
+`select_model.sh` now keeps the catalogue intentionally modern:
 
-Default preference order (descending quality):
+| Model | Purpose | Native Context | Notes |
+|-------|---------|----------------|-------|
+| Qwen 3.6 35B-A3B | Primary coder | 262,144 | Highest-quality default when it fits |
+| Qwen 3.8 27B | Primary coder / fallback | 262,144 | Better fit for smaller single-GPU boxes |
+| Nemotron 3.5 Lightning 30B-A3B | Orchestrator / alternate coder | 262,144 | Fast modern option for routing and coding |
 
-| Model | Min VRAM | Quality |
-|-------|----------|---------|
-| Qwen2.5-Coder 32B Q8 | 34 GB | 98 |
-| Qwen2.5-Coder 32B Q4 | 20 GB | 94 |
-| Qwen2.5-Coder 14B Q8 | 16 GB | 90 |
-| Qwen2.5-Coder 7B Q8 | 9 GB | 82 |
-| Qwen2.5-Coder 7B Q4 | 5 GB | 78 |
-| Qwen2.5-Coder 3B Q4 | 3 GB | 62 |
-| TinyLlama 1.1B Q4 | 1 GB | 30 |
+Before any model pull, the installer now:
+
+- prompts for confirmation
+- shows estimated disk pull and active runtime memory
+- shows effective max context for the proposed quant + KV quant
+- lets you choose model quant, KV quant, primary coder, and additional coders from terminal dropdowns
+- records estimated prompt-processing (PP) and text-generation (TG) tok/s, then compares them with measured values after the benchmark run
 
 Override at any time with `--model <tag>` or the `DEVELOPER_MODEL` env var.
+
+### Benchmark contribution flow
+
+Benchmarks are recorded under `~/.config/pushbutton/benchmarks/` and can be staged for contribution back to this repository:
+
+```bash
+bash install.sh --submit-benchmarks
+```
+
+That command writes a PR-ready report under `benchmarks/system/` and, when `gh` is installed, can optionally create a benchmark contribution PR automatically.
 
 ---
 
