@@ -224,7 +224,7 @@ mode_quick() {
     # 4. Install Claude CLI
     setup_claude
 
-    # 4. Offer a quick speed benchmark and persist the runtime profile
+    # 5. Offer a quick speed benchmark and persist the runtime profile
     maybe_run_post_setup_benchmark "$SELECTED_MODEL" "$BENCHMARK_FRAMEWORK" "$RUN_BENCHMARK" "$BENCHMARK_CONTEXT_SWEEP"
 
     tui_header "Setup Complete"

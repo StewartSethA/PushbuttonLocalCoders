@@ -21,6 +21,12 @@ EOF
     fi
 }
 
+ensure_benchmark_host_metadata() {
+    if [[ -z "${OS:-}" || -z "${GPU_VENDOR:-}" || -z "${GPU_MODEL:-}" || -z "${CPU_MODEL:-}" || -z "${MEMORY_TYPE:-}" || -z "${INFERENCE_GB:-}" ]]; then
+        eval "$(detect_all)"
+    fi
+}
+
 json_escape() {
     local value="${1:-}"
     value=${value//\\/\\\\}
@@ -174,7 +180,7 @@ record_benchmark_result() {
     local result_file="$9"
 
     ensure_history_file
-    eval "$(detect_all)"
+    ensure_benchmark_host_metadata
     local pp_delta tg_delta
     pp_delta="$(pct_delta "$estimated_pp" "$actual_pp")"
     tg_delta="$(pct_delta "$estimated_tg" "$actual_tg")"
@@ -197,6 +203,7 @@ run_ablation() {
     local models=("$@")
     local total=${#models[@]}
     eval "$(detect_inference_memory)"
+    ensure_benchmark_host_metadata
     local quant="${MODEL_QUANT:-$(recommend_model_quant "$INFERENCE_GB")}"
     local kv_quant="${KV_CACHE_QUANT:-q6_K}"
     local target_context="${TARGET_CONTEXT_LENGTH:-16384}"
@@ -262,6 +269,7 @@ run_hardware_ablation() {
 
 benchmark_selected_models() {
     local tags=("$@")
+    ensure_benchmark_host_metadata
     local tag
     for tag in "${tags[@]}"; do
         [[ -z "$tag" ]] && continue
