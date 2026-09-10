@@ -6,6 +6,7 @@ on:
       - "claude-local"
       - "install-claude-local.sh"
       - "lib/claude_local_*.py"
+      - "lib/claude_local_*.sh"
       - "tests/test_claude_local.py"
       - "tests/test_claude_local_scheduler.py"
       - ".github/workflows/claude-local-tests.yml"
@@ -16,6 +17,7 @@ on:
       - "claude-local"
       - "install-claude-local.sh"
       - "lib/claude_local_*.py"
+      - "lib/claude_local_*.sh"
       - "tests/test_claude_local.py"
       - "tests/test_claude_local_scheduler.py"
       - ".github/workflows/claude-local-tests.yml"
@@ -29,7 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Bash syntax
-        run: bash -n ./claude-local ./install-claude-local.sh
+        run: bash -n ./claude-local ./install-claude-local.sh ./lib/claude_local_hostcc.sh
       - name: Python syntax
         run: python3 -m py_compile lib/claude_local_plan.py lib/claude_local_gateway.py tests/test_claude_local.py tests/test_claude_local_scheduler.py
       - name: Unit tests
