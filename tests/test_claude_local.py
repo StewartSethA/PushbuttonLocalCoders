@@ -15,8 +15,6 @@ def load(name, path):
     return mod
 
 
-# The scheduler wrapper imports the preserved catalogue/inventory module by name.
-load("claude_local_plan_legacy", ROOT / "lib" / "claude_local_plan_legacy.py")
 planmod = load("claude_local_plan", ROOT / "lib" / "claude_local_plan.py")
 gwmod = load("claude_local_gateway", ROOT / "lib" / "claude_local_gateway.py")
 
@@ -30,7 +28,7 @@ class PlannerTests(unittest.TestCase):
             ["nemotron-3.5-lightning", "qwen3.6:35b", "qwen3.8:27b", "glm-5.3-flash"],
         )
 
-    def test_heterogeneous_greedy_placement(self):
+    def test_heterogeneous_joint_placement(self):
         gpus = [
             planmod.GPU(0, "Tesla V100-SXM2-32GB", 32768, 32400, "7.0", "", 3, 16),
             planmod.GPU(1, "RTX 4060 Ti", 16380, 16000, "8.9", "", 2, 8),
