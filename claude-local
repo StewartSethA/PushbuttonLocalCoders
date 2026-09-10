@@ -301,9 +301,10 @@ trap cleanup EXIT INT TERM
 server_rows() {
 python3 - "$PLAN_FILE" <<'PY'
 import json,sys
+sep='\x1f'
 for s in json.load(open(sys.argv[1]))['servers']:
  x=s['profile']; env=';'.join(f'{k}={v}' for k,v in x.get('extra_env',{}).items())
- print('\t'.join(map(str,[s['id'],x['hf_spec'],s['cuda_visible_devices'],int(s['multi_gpu']),x['kv_k'],x['kv_v'],x['batch'],x['ubatch'],x['flash_attn'],x['template'],env,x.get('note','')])))
+ print(sep.join(map(str,[s['id'],x['hf_spec'],s['cuda_visible_devices'],int(s['multi_gpu']),x['kv_k'],x['kv_v'],x['batch'],x['ubatch'],x['flash_attn'],x['template'],env,x.get('note','')])))
 PY
 }
 
@@ -318,7 +319,7 @@ PY
 start_backends() {
     mkdir -p "$STATE_DIR/logs" "$CACHE_DIR"; export LLAMA_CACHE="$CACHE_DIR" GGML_CUDA_ENABLE_UNIFIED_MEMORY="$ALLOW_OFFLOAD" CUDA_SCALE_LAUNCH_QUEUES=4x
     local next=$((PORT_BASE+1)); BACKENDS_TSV="$STATE_DIR/backends.$$"; : > "$BACKENDS_TSV"
-    while IFS=$'\t' read -r id hf gpus multi kvk kvv batch ubatch fa template envpairs note; do
+    while IFS=$'\x1f' read -r id hf gpus multi kvk kvv batch ubatch fa template envpairs note; do
         local port log pid failed=0; port="$(free_port "$next")"; next=$((port+1)); log="$STATE_DIR/logs/${id}.log"
         local -a cmd=("$LLAMA_SERVER" -hf "$hf" --alias "$id" --no-mmproj -ngl 999 -c "$CTX" -np 1 --cache-type-k "$kvk" --cache-type-v "$kvv" -b "$batch" -ub "$ubatch" -fa "$fa" --jinja --no-context-shift --host 127.0.0.1 --port "$port")
         [[ "$multi" == 1 ]] && cmd+=(--split-mode layer)
