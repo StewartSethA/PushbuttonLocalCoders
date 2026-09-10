@@ -4,16 +4,18 @@ on:
   pull_request:
     paths:
       - "claude-local"
+      - "install-claude-local.sh"
       - "lib/claude_local_*.py"
-      - "tests/test_claude_local*.py"
+      - "tests/test_claude_local.py"
       - ".github/workflows/claude-local-tests.yml"
   push:
     branches:
       - "feature/claude-local-harness"
     paths:
       - "claude-local"
+      - "install-claude-local.sh"
       - "lib/claude_local_*.py"
-      - "tests/test_claude_local*.py"
+      - "tests/test_claude_local.py"
       - ".github/workflows/claude-local-tests.yml"
 
 permissions:
@@ -22,13 +24,11 @@ permissions:
 jobs:
   static-tests:
     runs-on: ubuntu-latest
-    env:
-      PYTHONPATH: ${{ github.workspace }}/lib
     steps:
       - uses: actions/checkout@v4
       - name: Bash syntax
-        run: bash -n ./claude-local
+        run: bash -n ./claude-local ./install-claude-local.sh
       - name: Python syntax
-        run: python3 -m py_compile lib/claude_local_plan.py lib/claude_local_plan_legacy.py lib/claude_local_gateway.py tests/test_claude_local.py tests/test_claude_local_scheduler.py
+        run: python3 -m py_compile lib/claude_local_catalogue.py lib/claude_local_plan.py lib/claude_local_gateway.py tests/test_claude_local.py tests/test_claude_local_scheduler.py
       - name: Unit tests
         run: python3 -m unittest -v tests/test_claude_local.py tests/test_claude_local_scheduler.py
