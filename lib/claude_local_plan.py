@@ -3,9 +3,10 @@
 
 No third-party Python dependencies. The planner treats VRAM as a hard resource:
 concurrently served unique models receive disjoint GPU sets. A single model is
-placed on the freest viable GPU set, with PCIe link speed as the next placement
-tie-breaker. Multiple requested models are planned jointly before any server is
-started so an early assignment cannot strand a later model.
+placed on the freest viable GPU set, with system-aware maximum PCIe link
+capability as the next placement tie-breaker. Multiple requested models are
+planned jointly before any server is started so an early assignment cannot
+strand a later model.
 """
 from __future__ import annotations
 
@@ -31,8 +32,13 @@ class GPU:
     free_mib: int
     compute_cap: str = ""
     pci_bus: str = ""
+    # pcie_gen/width are the maximum possible link for this GPU in this system,
+    # not the instantaneous idle link state. NVML documents max generation as
+    # system-aware (e.g. a Gen2 GPU in a Gen1 slot reports Gen1).
     pcie_gen: int = 0
     pcie_width: int = 0
+    pcie_current_gen: int = 0
+    pcie_current_width: int = 0
 
     @property
     def free_gib(self) -> float:
@@ -167,6 +173,16 @@ def _query_nvidia(fields: str) -> list[str]:
     return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
 
 
+def _parse_link(line: str) -> tuple[int, int]:
+    parts = [x.strip() for x in line.split(",")]
+    if len(parts) < 2:
+        return 0, 0
+    return (
+        int(re.sub(r"\D", "", parts[0]) or 0),
+        int(re.sub(r"\D", "", parts[1]) or 0),
+    )
+
+
 def inventory() -> list[GPU]:
     base = _query_nvidia("index,name,memory.total,memory.free,compute_cap,pci.bus_id")
     if not base:
@@ -175,7 +191,14 @@ def inventory() -> list[GPU]:
         has_cc = False
     else:
         has_cc = True
-    links = _query_nvidia("pcie.link.gen.current,pcie.link.width.current")
+
+    current_links = _query_nvidia("pcie.link.gen.current,pcie.link.width.current")
+    max_links = _query_nvidia("pcie.link.gen.max,pcie.link.width.max")
+    # Some old drivers do not expose max fields. In that case retain previous
+    # behavior rather than dropping all PCIe information.
+    if not max_links:
+        max_links = current_links
+
     out: list[GPU] = []
     for i, line in enumerate(base):
         parts = [x.strip() for x in line.split(",")]
@@ -192,12 +215,15 @@ def inventory() -> list[GPU]:
                 elif "3090" in low: cc = "8.6"
                 elif any(x in low for x in ("4090", "4080", "4070", "4060")): cc = "8.9"
                 else: cc = ""
-            gen = width = 0
-            if i < len(links):
-                lp = [x.strip() for x in links[i].split(",")]
-                gen = int(re.sub(r"\D", "", lp[0]) or 0)
-                width = int(re.sub(r"\D", "", lp[1]) or 0)
-            out.append(GPU(int(idx), name, int(float(total)), int(float(free)), cc, bus, gen, width))
+
+            max_gen, max_width = _parse_link(max_links[i]) if i < len(max_links) else (0, 0)
+            cur_gen, cur_width = _parse_link(current_links[i]) if i < len(current_links) else (0, 0)
+            out.append(
+                GPU(
+                    int(idx), name, int(float(total)), int(float(free)), cc, bus,
+                    max_gen, max_width, cur_gen, cur_width,
+                )
+            )
         except (ValueError, IndexError):
             continue
     return out
@@ -304,7 +330,7 @@ def placement_candidates(model: str, gpus: list[GPU], context: int) -> list[Cand
 def single_model_choice(
     model: str, gpus: list[GPU], context: int
 ) -> Candidate | None:
-    """Pick the freest viable remaining GPU set; link speed breaks ties."""
+    """Pick the freest viable remaining GPU set; max link speed breaks ties."""
     candidates = placement_candidates(model, gpus, context)
     if not candidates:
         return None
@@ -313,7 +339,7 @@ def single_model_choice(
         key=lambda c: (
             c.card_count,             # do not split unless necessary
             -c.free_mib,              # most free remaining first
-            -c.link_score,            # then highest negotiated PCIe link
+            -c.link_score,            # then max system-aware PCIe capability
             -c.profile.quality,       # then best quant on that placement
             -c.speed_score,           # late tie: local memory bandwidth
             tuple(gpus[p].index for p in c.gpu_positions),
