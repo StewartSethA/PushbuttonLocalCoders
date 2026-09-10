@@ -68,20 +68,52 @@ require_files() {
     [[ -f "$GATEWAY_PY" ]] || die "missing $GATEWAY_PY"
 }
 
+base_deps_missing() {
+    local -a missing=()
+    local c
+    for c in git cmake ninja python3 curl tar cc c++ lspci flock; do
+        have_cmd "$c" || missing+=("$c")
+    done
+    if ! have_cmd pkg-config; then
+        missing+=("pkg-config")
+    elif ! pkg-config --exists openssl 2>/dev/null; then
+        missing+=("OpenSSL-development-files")
+    fi
+    if ((${#missing[@]})); then
+        printf '%s\n' "${missing[@]}"
+    fi
+    return 0
+}
+
+apt_update_best_effort() {
+    if ! sudo apt-get update; then
+        warn "apt-get update reported errors (often an unrelated third-party repository); continuing with usable/cached package indexes."
+    fi
+    return 0
+}
+
 install_base_deps() {
-    local missing=0 c
-    for c in git cmake ninja python3 curl tar cc c++ lspci flock; do have_cmd "$c" || missing=1; done
-    have_cmd pkg-config && pkg-config --exists openssl 2>/dev/null || missing=1
-    [[ $missing -eq 0 ]] && return 0
+    local before after
+    before="$(base_deps_missing)"
+    [[ -z "$before" ]] && return 0
+
+    say "Installing missing build/runtime dependencies..."
     if have_cmd apt-get; then
-        say "Installing build/runtime dependencies..."
-        sudo apt-get update -y
-        sudo apt-get install -y build-essential cmake ninja-build git curl ca-certificates libssl-dev python3 python3-venv bzip2 xz-utils pkg-config pciutils util-linux
+        apt_update_best_effort
+        if ! sudo apt-get install -y build-essential cmake ninja-build git curl ca-certificates libssl-dev python3 python3-venv bzip2 xz-utils pkg-config pciutils util-linux; then
+            warn "apt-get install reported an error; verifying the dependencies claude-local actually needs before deciding whether to stop."
+        fi
     elif have_cmd dnf; then
-        say "Installing build/runtime dependencies..."
-        sudo dnf install -y gcc gcc-c++ cmake ninja-build git curl openssl-devel python3 bzip2 xz pkgconf-pkg-config pciutils util-linux
+        if ! sudo dnf install -y gcc gcc-c++ cmake ninja-build git curl openssl-devel python3 bzip2 xz pkgconf-pkg-config pciutils util-linux; then
+            warn "dnf reported an error; verifying the dependencies claude-local actually needs before deciding whether to stop."
+        fi
     else
-        die "automatic dependency installation currently supports apt or dnf hosts"
+        die "required dependencies are missing and automatic installation currently supports apt or dnf hosts"
+    fi
+
+    after="$(base_deps_missing)"
+    if [[ -n "$after" ]]; then
+        die "required dependencies are still missing after the package-manager attempt: $(printf '%s' "$after" | tr '\n' ' '). Unrelated repository errors are ignored; install only these missing prerequisites and rerun."
     fi
 }
 
@@ -90,10 +122,15 @@ ensure_nvidia_driver() {
     have_cmd lspci && lspci -nn 2>/dev/null | grep -qi NVIDIA || die "no working NVIDIA GPU/driver detected"
     if have_cmd apt-get && grep -qi '^ID=ubuntu' /etc/os-release 2>/dev/null; then
         say "Installing Ubuntu's recommended NVIDIA driver..."
-        sudo apt-get update -y
-        sudo apt-get install -y ubuntu-drivers-common
-        sudo ubuntu-drivers install
-        nvidia-smi >/dev/null 2>&1 || die "driver installed but not active; reboot once and rerun the same command"
+        apt_update_best_effort
+        if ! sudo apt-get install -y ubuntu-drivers-common; then
+            warn "apt-get could not cleanly install ubuntu-drivers-common; checking whether the required command is nevertheless available."
+        fi
+        have_cmd ubuntu-drivers || die "ubuntu-drivers is unavailable after the package-manager attempt"
+        if ! sudo ubuntu-drivers install; then
+            warn "ubuntu-drivers reported an error; checking whether an NVIDIA driver became usable anyway."
+        fi
+        nvidia-smi >/dev/null 2>&1 || die "NVIDIA driver is not active; if it was just installed, reboot once and rerun the same command"
         return 0
     fi
     die "NVIDIA hardware exists but nvidia-smi is unavailable; install/load the NVIDIA driver and rerun"
