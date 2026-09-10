@@ -7,6 +7,7 @@ on:
       - "install-claude-local.sh"
       - "lib/claude_local_*.py"
       - "tests/test_claude_local.py"
+      - "tests/test_claude_local_scheduler.py"
       - ".github/workflows/claude-local-tests.yml"
   push:
     branches:
@@ -16,6 +17,7 @@ on:
       - "install-claude-local.sh"
       - "lib/claude_local_*.py"
       - "tests/test_claude_local.py"
+      - "tests/test_claude_local_scheduler.py"
       - ".github/workflows/claude-local-tests.yml"
 
 permissions:
@@ -29,6 +31,6 @@ jobs:
       - name: Bash syntax
         run: bash -n ./claude-local ./install-claude-local.sh
       - name: Python syntax
-        run: python3 -m py_compile lib/claude_local_catalogue.py lib/claude_local_plan.py lib/claude_local_gateway.py tests/test_claude_local.py tests/test_claude_local_scheduler.py
+        run: python3 -m py_compile lib/claude_local_plan_legacy.py lib/claude_local_plan.py lib/claude_local_gateway.py tests/test_claude_local.py tests/test_claude_local_scheduler.py
       - name: Unit tests
         run: python3 -m unittest -v tests/test_claude_local.py tests/test_claude_local_scheduler.py
