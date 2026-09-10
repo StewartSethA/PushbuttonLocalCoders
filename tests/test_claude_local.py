@@ -15,6 +15,8 @@ def load(name, path):
     return mod
 
 
+# The scheduler wrapper imports the preserved catalogue/inventory module by name.
+load("claude_local_plan_legacy", ROOT / "lib" / "claude_local_plan_legacy.py")
 planmod = load("claude_local_plan", ROOT / "lib" / "claude_local_plan.py")
 gwmod = load("claude_local_gateway", ROOT / "lib" / "claude_local_gateway.py")
 
