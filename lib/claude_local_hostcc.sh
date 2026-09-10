@@ -19,7 +19,7 @@ claude_local_bootstrap_micromamba() {
     esac
     mkdir -p "$state/bin"
     echo "[claude-local] Bootstrapping micromamba for a CUDA-compatible host compiler..." >&2
-    curl -fsSL "https://micro.mamba.pm/api/micromamba/$platform/latest" \
+    curl -fL --show-error "https://micro.mamba.pm/api/micromamba/$platform/latest" \
       | tar -xj -C "$state/bin" --strip-components=1 bin/micromamba
     chmod +x "$mm"
     printf '%s\n' "$mm"
