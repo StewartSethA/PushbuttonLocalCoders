@@ -15,8 +15,6 @@ def load(name, path):
     return mod
 
 
-# The wrapper imports the preserved catalogue module by name, so load it first.
-load("claude_local_plan_legacy", ROOT / "lib" / "claude_local_plan_legacy.py")
 planmod = load("claude_local_plan", ROOT / "lib" / "claude_local_plan.py")
 
 
@@ -38,10 +36,7 @@ class SchedulerPolicyTests(unittest.TestCase):
         p = planmod.plan(["q38"], gpus, 262144)
         self.assertEqual(p["servers"][0]["cuda_visible_devices"], "1")
 
-    def test_multi_model_plan_is_global_not_first_fit(self):
-        # Qwen3.8 can live on the 16 GB card. Qwen3.6 gets the 32 GB card and
-        # therefore keeps its Q5 profile; a naive first-fit q38->V100 choice
-        # would strand/degrade q36.
+    def test_joint_plan_preserves_large_gpu_for_large_model(self):
         gpus = [
             planmod.GPU(0, "Tesla V100-SXM2-32GB", 32768, 32400, "7.0", "", 3, 16),
             planmod.GPU(1, "RTX 4060 Ti", 16380, 16000, "8.9", "", 4, 8),
@@ -49,9 +44,10 @@ class SchedulerPolicyTests(unittest.TestCase):
         p = planmod.plan(["q38", "q36"], gpus, 262144)
         by_model = {s["model"]: s for s in p["servers"]}
         self.assertEqual(p["placement_policy"], "joint-global-plan")
-        self.assertEqual(by_model["qwen3.8:27b"]["cuda_visible_devices"], "1")
         self.assertEqual(by_model["qwen3.6:35b"]["cuda_visible_devices"], "0")
         self.assertEqual(by_model["qwen3.6:35b"]["profile"]["quant"], "UD-Q5_K_M")
+        self.assertEqual(by_model["qwen3.8:27b"]["cuda_visible_devices"], "1")
+        self.assertEqual(by_model["qwen3.8:27b"]["profile"]["quant"], "IQ3_XXS")
 
 
 if __name__ == "__main__":
