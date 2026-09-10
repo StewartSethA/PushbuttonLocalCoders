@@ -326,7 +326,9 @@ PY
 
 start_log_follower() {
     local log="$1"
-    tail -n +1 -s 0.2 -F "$log" &
+    # stderr is intentionally not captured by the command substitution used by
+    # callers, so the follower remains asynchronous and writes to the terminal.
+    tail -n +1 -s 0.2 -F "$log" >&2 &
     printf '%s\n' "$!"
 }
 
