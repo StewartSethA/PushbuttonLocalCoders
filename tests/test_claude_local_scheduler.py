@@ -3,6 +3,7 @@ import importlib.util
 import pathlib
 import sys
 import unittest
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -35,6 +36,18 @@ class SchedulerPolicyTests(unittest.TestCase):
         ]
         p = planmod.plan(["q38"], gpus, 262144)
         self.assertEqual(p["servers"][0]["cuda_visible_devices"], "1")
+
+    def test_inventory_uses_system_max_link_not_idle_current_link(self):
+        responses = [
+            ["0, NVIDIA GeForce RTX 4060 Ti, 16380, 16000, 8.9, 00000000:01:00.0"],
+            ["1, 8"],  # idle/downshifted current state
+            ["4, 8"],  # maximum possible for this GPU in this system path
+        ]
+        with mock.patch.object(planmod, "_query_nvidia", side_effect=responses):
+            gpu = planmod.inventory()[0]
+        self.assertEqual((gpu.pcie_gen, gpu.pcie_width), (4, 8))
+        self.assertEqual((gpu.pcie_current_gen, gpu.pcie_current_width), (1, 8))
+        self.assertEqual(gpu.link_score, 32)
 
     def test_joint_plan_preserves_large_gpu_for_large_model(self):
         gpus = [
