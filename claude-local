@@ -8,6 +8,7 @@ ROOT="$(cd "$(dirname "$SELF")" && pwd)"
 LIB="$ROOT/lib"
 PLAN_PY="$LIB/claude_local_plan.py"
 GATEWAY_PY="$LIB/claude_local_gateway.py"
+HOSTCC_SH="$LIB/claude_local_hostcc.sh"
 
 STATE_DIR="${CLAUDE_LOCAL_STATE:-$HOME/.local/share/pushbutton/claude-local}"
 CACHE_DIR="${CLAUDE_LOCAL_CACHE:-$HOME/.cache/pushbutton/llama}"
@@ -71,7 +72,7 @@ require_files() {
 base_deps_missing() {
     local -a missing=()
     local c
-    for c in git cmake ninja python3 curl tar cc c++ lspci flock; do
+    for c in git cmake ninja python3 curl tar cc c++ lspci flock tail; do
         have_cmd "$c" || missing+=("$c")
     done
     if ! have_cmd pkg-config; then
@@ -100,11 +101,11 @@ install_base_deps() {
     say "Installing missing build/runtime dependencies..."
     if have_cmd apt-get; then
         apt_update_best_effort
-        if ! sudo apt-get install -y build-essential cmake ninja-build git curl ca-certificates libssl-dev python3 python3-venv bzip2 xz-utils pkg-config pciutils util-linux; then
+        if ! sudo apt-get install -y build-essential cmake ninja-build git curl ca-certificates libssl-dev python3 python3-venv bzip2 xz-utils pkg-config pciutils util-linux coreutils; then
             warn "apt-get install reported an error; verifying the dependencies claude-local actually needs before deciding whether to stop."
         fi
     elif have_cmd dnf; then
-        if ! sudo dnf install -y gcc gcc-c++ cmake ninja-build git curl openssl-devel python3 bzip2 xz pkgconf-pkg-config pciutils util-linux; then
+        if ! sudo dnf install -y gcc gcc-c++ cmake ninja-build git curl openssl-devel python3 bzip2 xz pkgconf-pkg-config pciutils util-linux coreutils; then
             warn "dnf reported an error; verifying the dependencies claude-local actually needs before deciding whether to stop."
         fi
     else
@@ -139,7 +140,7 @@ ensure_nvidia_driver() {
 install_claude_code() {
     have_cmd claude && return 0
     say "Claude Code not found; installing it..."
-    if curl -fsSL https://claude.ai/install.sh | bash; then export PATH="$HOME/.local/bin:$PATH"; fi
+    if curl -fL --show-error https://claude.ai/install.sh | bash; then export PATH="$HOME/.local/bin:$PATH"; fi
     have_cmd claude && return 0
     if ! have_cmd npm; then
         have_cmd apt-get && sudo apt-get install -y nodejs npm || true
@@ -220,8 +221,15 @@ bootstrap_micromamba() {
     if [[ -x "$mm" ]]; then printf '%s\n' "$mm"; return; fi
     mkdir -p "$STATE_DIR/bin"
     say "Bootstrapping micromamba..." >&2
-    curl -fsSL https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xj -C "$STATE_DIR/bin" --strip-components=1 bin/micromamba
+    curl -fL --show-error https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xj -C "$STATE_DIR/bin" --strip-components=1 bin/micromamba
     chmod +x "$mm"; printf '%s\n' "$mm"
+}
+
+prepare_host_compiler() {
+    [[ -f "$HOSTCC_SH" ]] || return 0
+    # shellcheck source=/dev/null
+    source "$HOSTCC_SH"
+    claude_local_prepare_hostcc
 }
 
 activate_cuda() {
@@ -285,7 +293,7 @@ fetch_qwen_template() {
     QWEN_TEMPLATE="$STATE_DIR/templates/qwen-fixed.jinja"; mkdir -p "$(dirname "$QWEN_TEMPLATE")"
     if [[ ! -s "$QWEN_TEMPLATE" || "${CLAUDE_LOCAL_REFRESH_TEMPLATE:-0}" == 1 ]]; then
         say "Downloading fixed Qwen agent/tool template..."
-        curl -fsSL https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates/resolve/main/chat_template.jinja -o "$QWEN_TEMPLATE.new"
+        curl -fL --show-error https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates/resolve/main/chat_template.jinja -o "$QWEN_TEMPLATE.new"
         mv "$QWEN_TEMPLATE.new" "$QWEN_TEMPLATE"
     fi
 }
@@ -316,11 +324,25 @@ for r in ('haiku','sonnet','opus','fable'): print(r+'\t'+p['role_ids'][r])
 PY
 }
 
+start_log_follower() {
+    local log="$1"
+    tail -n +1 -s 0.2 -F "$log" &
+    printf '%s\n' "$!"
+}
+
+stop_log_follower() {
+    local follower="${1:-}"
+    [[ -n "$follower" ]] || return 0
+    kill "$follower" 2>/dev/null || true
+    wait "$follower" 2>/dev/null || true
+}
+
 start_backends() {
     mkdir -p "$STATE_DIR/logs" "$CACHE_DIR"; export LLAMA_CACHE="$CACHE_DIR" GGML_CUDA_ENABLE_UNIFIED_MEMORY="$ALLOW_OFFLOAD" CUDA_SCALE_LAUNCH_QUEUES=4x
     local next=$((PORT_BASE+1)); BACKENDS_TSV="$STATE_DIR/backends.$$"; : > "$BACKENDS_TSV"
     while IFS=$'\x1f' read -r id hf gpus multi kvk kvv batch ubatch fa template envpairs note; do
-        local port log pid failed=0; port="$(free_port "$next")"; next=$((port+1)); log="$STATE_DIR/logs/${id}.log"
+        local port log pid follower failed=0 waited=0
+        port="$(free_port "$next")"; next=$((port+1)); log="$STATE_DIR/logs/${id}.log"; : > "$log"
         local -a cmd=("$LLAMA_SERVER" -hf "$hf" --alias "$id" --no-mmproj -ngl 999 -c "$CTX" -np 1 --cache-type-k "$kvk" --cache-type-v "$kvv" -b "$batch" -ub "$ubatch" -fa "$fa" --jinja --no-context-shift --host 127.0.0.1 --port "$port")
         [[ "$multi" == 1 ]] && cmd+=(--split-mode layer)
         [[ "$template" == qwen-fixed ]] && cmd+=(--chat-template-file "$QWEN_TEMPLATE")
@@ -328,10 +350,22 @@ start_backends() {
         if [[ -n "$envpairs" ]]; then local -a pairs; IFS=';' read -ra pairs <<< "$envpairs"; local pair; for pair in "${pairs[@]}"; do envcmd+=("$pair"); done; fi
         say "Starting $id on GPU(s) [$gpus], $hf, ctx=$CTX${note:+ — $note}"
         "${envcmd[@]}" "${cmd[@]}" >"$log" 2>&1 & pid=$!; PIDS+=("$pid")
-        while ! curl -fsS "http://127.0.0.1:$port/health" >/dev/null 2>&1; do kill -0 "$pid" 2>/dev/null || { failed=1; break; }; sleep 2; done
-        [[ $failed -eq 0 ]] || { tail -80 "$log" >&2 || true; die "failed to start $id"; }
+        follower="$(start_log_follower "$log")"
+        while ! curl -fsS "http://127.0.0.1:$port/health" >/dev/null 2>&1; do
+            kill -0 "$pid" 2>/dev/null || { failed=1; break; }
+            sleep 1; waited=$((waited+1))
+            (( waited % 30 == 0 )) && say "Still waiting for $id to become ready (${waited}s); live llama.cpp output is shown above."
+        done
+        stop_log_follower "$follower"
+        if [[ $failed -ne 0 ]]; then
+            warn "$id exited before becoming ready. Full log: $log"
+            tail -80 "$log" >&2 || true
+            die "failed to start $id"
+        fi
+        say "Backend ready: $id on http://127.0.0.1:$port"
         printf '%s\t%s\t%s\n' "$id" "$port" "$hf" >> "$BACKENDS_TSV"
     done < <(server_rows)
+    say "All model backends ready."
 }
 
 write_gateway_config() {
@@ -347,9 +381,25 @@ PY
 }
 
 start_gateway() {
-    GATEWAY_PORT="$(free_port "$PORT_BASE")"; local log="$STATE_DIR/logs/gateway.log" pid; local -a extra=(); [[ $VERBOSE -eq 1 ]] && extra+=(--verbose)
+    GATEWAY_PORT="$(free_port "$PORT_BASE")"
+    local log="$STATE_DIR/logs/gateway.log" pid follower failed=0 waited=0
+    local -a extra=(); [[ $VERBOSE -eq 1 ]] && extra+=(--verbose)
+    : > "$log"
+    say "Starting local Anthropic gateway on http://127.0.0.1:$GATEWAY_PORT"
     python3 "$GATEWAY_PY" --config "$GATEWAY_CONFIG" --port "$GATEWAY_PORT" "${extra[@]}" >"$log" 2>&1 & pid=$!; PIDS+=("$pid")
-    while ! curl -fsS "http://127.0.0.1:$GATEWAY_PORT/health" >/dev/null 2>&1; do kill -0 "$pid" 2>/dev/null || { tail -80 "$log" >&2 || true; die "local gateway failed"; }; sleep 1; done
+    follower="$(start_log_follower "$log")"
+    while ! curl -fsS "http://127.0.0.1:$GATEWAY_PORT/health" >/dev/null 2>&1; do
+        kill -0 "$pid" 2>/dev/null || { failed=1; break; }
+        sleep 1; waited=$((waited+1))
+        (( waited % 15 == 0 )) && say "Still waiting for local gateway (${waited}s)."
+    done
+    stop_log_follower "$follower"
+    if [[ $failed -ne 0 ]]; then
+        warn "Local gateway exited before becoming ready. Full log: $log"
+        tail -80 "$log" >&2 || true
+        die "local gateway failed"
+    fi
+    say "Gateway ready: http://127.0.0.1:$GATEWAY_PORT"
 }
 
 contains_claude_flag() { local w="$1" x; for x in "${CLAUDE_ARGS[@]:-}"; do [[ "$x" == "$w" || "$x" == "$w="* ]] && return 0; done; return 1; }
@@ -379,8 +429,22 @@ for s in p['servers']:
 PY
 }
 
+show_runtime_errors() {
+    local log found=0
+    warn "Claude Code exited with an error. Recent local runtime errors, if any:"
+    for log in "$STATE_DIR"/logs/*.log; do
+        [[ -f "$log" ]] || continue
+        if grep -Eiq '(^|[^a-z])(error|failed|failure|fatal|exception|panic|oom)([^a-z]|$)|out of memory|cuda.*error' "$log"; then
+            printf '\n--- %s ---\n' "$log" >&2
+            grep -Ei '(^|[^a-z])(error|failed|failure|fatal|exception|panic|oom)([^a-z]|$)|out of memory|cuda.*error' "$log" | tail -40 >&2 || true
+            found=1
+        fi
+    done
+    [[ $found -eq 1 ]] || warn "No matching backend/gateway error lines found; full logs are under $STATE_DIR/logs/."
+}
+
 run_claude() {
-    local key="claude-local-$RANDOM-$$" role id sonnet_id
+    local key="claude-local-$RANDOM-$$" role id sonnet_id rc
     export ANTHROPIC_BASE_URL="http://127.0.0.1:$GATEWAY_PORT" ANTHROPIC_AUTH_TOKEN="$key" ANTHROPIC_API_KEY="$key" CLAUDE_CODE_MAX_CONTEXT_TOKENS="$CLIENT_CTX"
     unset CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY ANTHROPIC_BEDROCK_BASE_URL ANTHROPIC_VERTEX_BASE_URL || true
     while IFS=$'\t' read -r role id; do
@@ -400,8 +464,18 @@ PY
     local -a args=("${CLAUDE_ARGS[@]}")
     contains_claude_flag --model || args=(--model "$sonnet_id" "${args[@]}")
     contains_claude_flag --agents || args=(--agents "$(agents_json)" "${args[@]}")
+    say "All local services ready. Launching Claude Code from $PWD"
     say "Claude Code -> local gateway http://127.0.0.1:$GATEWAY_PORT (no cloud fallback)"
-    claude "${args[@]}"
+    if claude "${args[@]}"; then
+        return 0
+    else
+        rc=$?
+    fi
+    if [[ $rc -ne 130 && $rc -ne 143 ]]; then
+        warn "Claude Code exited with status $rc"
+        show_runtime_errors
+    fi
+    return "$rc"
 }
 
 doctor() {
@@ -447,7 +521,7 @@ mkdir -p "$STATE_DIR" "$CACHE_DIR"; PLAN_FILE="$STATE_DIR/plan.$$.json"
 plan_args=(plan --context "$CTX"); if ((${#MODELS[@]})); then plan_args+=("${MODELS[@]}"); else plan_args+=(--smart); fi
 python3 "$PLAN_PY" "${plan_args[@]}" > "$PLAN_FILE" || exit $?
 print_plan; [[ $DRY_RUN -eq 1 ]] && exit 0
-install_claude_code; activate_cuda; ensure_llamacpp
+install_claude_code; prepare_host_compiler; activate_cuda; ensure_llamacpp
 grep -q '"template": "qwen-fixed"' "$PLAN_FILE" && fetch_qwen_template || true
 start_backends; write_gateway_config; start_gateway
 release_startup_lock
