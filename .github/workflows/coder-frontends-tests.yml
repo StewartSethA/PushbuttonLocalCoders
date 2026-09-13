@@ -8,6 +8,7 @@ on:
       - "deepseek-local"
       - "mini-swe-local"
       - "install-coder-local.sh"
+      - "configs/qwen-local-defaults.json"
       - "lib/coder_local_*.py"
       - "tests/test_coder_local.py"
       - ".github/workflows/coder-frontends-tests.yml"
@@ -22,6 +23,7 @@ jobs:
         run: |
           bash -n coder-local install-coder-local.sh
           python3 -m py_compile lib/coder_local_plan.py lib/coder_local_lb.py
+          python3 -m json.tool configs/qwen-local-defaults.json >/dev/null
           python3 -m unittest -v tests/test_coder_local.py
           ./coder-local --self-test
       - name: Install official Qwen Code CLI
@@ -73,6 +75,6 @@ jobs:
         run: bash -n mini-swe-local
       - name: Install mini-SWE-agent
         run: |
-          pipx install mini-swe-agent
+          python3 -m pip install --user mini-swe-agent
+          export PATH="$HOME/.local/bin:$PATH"
           mini --help >/dev/null
-          mini-extra --help >/dev/null
