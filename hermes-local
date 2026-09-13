@@ -1,0 +1,470 @@
+#!/usr/bin/env bash
+# hermes-local — Pushbutton local-model frontend for Hermes Desktop Bot Mode.
+set -euo pipefail
+
+SELF="${BASH_SOURCE[0]}"
+command -v readlink >/dev/null 2>&1 && SELF="$(readlink -f "$SELF" 2>/dev/null || printf '%s' "$SELF")"
+ROOT="$(cd "$(dirname "$SELF")" && pwd)"
+PLAN_PY="$ROOT/lib/claude_local_plan.py"
+HOSTCC_SH="$ROOT/lib/claude_local_hostcc.sh"
+
+STATE_DIR="${CLAUDE_LOCAL_STATE:-$HOME/.local/share/pushbutton/claude-local}"
+CACHE_DIR="${CLAUDE_LOCAL_CACHE:-$HOME/.cache/pushbutton/llama}"
+LOCK_FILE="${CLAUDE_LOCAL_LOCK_FILE:-$HOME/.local/share/pushbutton/claude-local/startup.lock}"
+CTX="${CLAUDE_LOCAL_CONTEXT:-262144}"
+CLIENT_CTX="${CLAUDE_LOCAL_CLIENT_CONTEXT:-200000}"
+PORT_BASE="${HERMES_LOCAL_PORT_BASE:-19180}"
+BOT_PREFIX="${HERMES_LOCAL_BOT_PREFIX:-pushbutton}"
+UI=desktop
+RESUME=0
+KEEP_SERVERS=0
+MODELS=()
+PIDS=()
+STARTUP_LOCK_FD=""
+
+say() { printf '\033[1;35m[hermes-local]\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m[hermes-local]\033[0m %s\n' "$*" >&2; }
+die() { printf '\033[1;31m[hermes-local]\033[0m %s\n' "$*" >&2; exit 1; }
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+usage() {
+cat <<'EOF'
+Usage:
+  hermes-local [MODEL [MODEL [MODEL [MODEL]]]] [options]
+
+Models use the same positional mapping as claude-local:
+  1 model : Haiku = Sonnet = Opus = Fable
+  2 models: Haiku = #1, Sonnet/Opus/Fable = #2
+  3 models: Haiku = #1, Sonnet = #2, Opus/Fable = #3
+  4 models: Haiku, Sonnet, Opus, Fable respectively
+
+Built-ins:
+  qwen3.6:35b qwen3.8:27b nemotron-3.5-lightning glm-5.3-flash
+
+Hermes frontends:
+  --desktop              Hermes Desktop + Bot Mode (default)
+  --tui                  Hermes TUI using the manager profile
+  --cli                  Hermes classic CLI using the manager profile
+  --resume               Resume latest manager session for TUI/CLI
+
+Harness options:
+  --local-cache DIR
+  --local-context N
+  --local-client-context N
+  --local-port-base N
+  --bot-prefix NAME      Profile prefix (default: pushbutton)
+  --local-keep-servers   Keep llama.cpp servers after Hermes exits
+  -h, --help
+
+Creates/updates these durable Hermes profiles:
+  <prefix>-manager   project-manager/orchestrator (Sonnet-role model)
+  <prefix>-fast      reconnaissance/triage (Haiku-role model)
+  <prefix>-coder     implementation (Sonnet-role model)
+  <prefix>-reviewer  correctness/review (Opus-role model)
+  <prefix>-deep      architecture/debugging (Fable-role model)
+EOF
+}
+
+base_deps_missing() {
+    local -a missing=() c
+    for c in git cmake ninja python3 curl tar cc c++ lspci flock tail; do
+        have_cmd "$c" || missing+=("$c")
+    done
+    if ! have_cmd pkg-config; then
+        missing+=("pkg-config")
+    elif ! pkg-config --exists openssl 2>/dev/null; then
+        missing+=("OpenSSL-development-files")
+    fi
+    ((${#missing[@]})) && printf '%s\n' "${missing[@]}"
+    return 0
+}
+
+apt_update_best_effort() {
+    if ! sudo apt-get update; then
+        warn "apt-get update reported unrelated repository errors; continuing with usable/cached indexes."
+    fi
+}
+
+install_base_deps() {
+    local before after
+    before="$(base_deps_missing)"
+    [[ -z "$before" ]] && return 0
+    say "Installing missing build/runtime dependencies..."
+    if have_cmd apt-get; then
+        apt_update_best_effort
+        sudo apt-get install -y build-essential cmake ninja-build git curl ca-certificates libssl-dev python3 python3-venv bzip2 xz-utils pkg-config pciutils util-linux coreutils || true
+    elif have_cmd dnf; then
+        sudo dnf install -y gcc gcc-c++ cmake ninja-build git curl openssl-devel python3 bzip2 xz pkgconf-pkg-config pciutils util-linux coreutils || true
+    else
+        die "automatic dependency installation currently supports apt or dnf hosts"
+    fi
+    after="$(base_deps_missing)"
+    [[ -z "$after" ]] || die "required dependencies remain missing: $(printf '%s' "$after" | tr '\n' ' ')"
+}
+
+ensure_nvidia_driver() {
+    have_cmd nvidia-smi && nvidia-smi >/dev/null 2>&1 && return 0
+    die "a working NVIDIA driver (nvidia-smi) is required"
+}
+
+ensure_hermes() {
+    if have_cmd hermes; then return 0; fi
+    say "Hermes Agent not found; installing the official CLI..."
+    curl -fL --show-error https://hermes-agent.nousresearch.com/install.sh | bash
+    export PATH="$HOME/.local/bin:$PATH"
+    have_cmd hermes || die "Hermes installer completed but 'hermes' is not in PATH"
+}
+
+prepare_host_compiler() {
+    [[ -f "$HOSTCC_SH" ]] || die "missing $HOSTCC_SH"
+    # shellcheck source=/dev/null
+    source "$HOSTCC_SH"
+    claude_local_prepare_hostcc
+}
+
+free_port() {
+python3 - "$1" <<'PY'
+import socket,sys
+for p in range(int(sys.argv[1]), min(65535, int(sys.argv[1])+200)):
+    s=socket.socket()
+    try:
+        s.bind(('127.0.0.1',p)); print(p); raise SystemExit
+    except OSError:
+        pass
+    finally:
+        s.close()
+raise SystemExit(1)
+PY
+}
+
+acquire_startup_lock() {
+    mkdir -p "$(dirname "$LOCK_FILE")"
+    exec {STARTUP_LOCK_FD}>"$LOCK_FILE"
+    if ! flock -n "$STARTUP_LOCK_FD"; then
+        say "Another Pushbutton launcher is allocating GPUs/ports; waiting for startup lock..."
+        flock "$STARTUP_LOCK_FD"
+    fi
+}
+
+release_startup_lock() {
+    [[ -n "${STARTUP_LOCK_FD:-}" ]] || return 0
+    flock -u "$STARTUP_LOCK_FD" 2>/dev/null || true
+    exec {STARTUP_LOCK_FD}>&- 2>/dev/null || true
+    STARTUP_LOCK_FD=""
+}
+
+cleanup() {
+    release_startup_lock
+    [[ $KEEP_SERVERS -eq 1 ]] && return 0
+    local p
+    for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done
+}
+trap cleanup EXIT INT TERM
+
+needs_legacy_cuda() {
+python3 - "$PLAN_FILE" <<'PY'
+import json,sys
+for s in json.load(open(sys.argv[1]))['servers']:
+    for g in s['gpus']:
+        try:
+            if float(g.get('compute_cap') or 99) < 7.5:
+                raise SystemExit(0)
+        except ValueError:
+            pass
+raise SystemExit(1)
+PY
+}
+
+bootstrap_micromamba() {
+    local mm="$STATE_DIR/bin/micromamba"
+    if [[ -x "$mm" ]]; then printf '%s\n' "$mm"; return; fi
+    mkdir -p "$STATE_DIR/bin"
+    say "Bootstrapping micromamba..." >&2
+    curl -fL --show-error https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xj -C "$STATE_DIR/bin" --strip-components=1 bin/micromamba
+    chmod +x "$mm"
+    printf '%s\n' "$mm"
+}
+
+activate_cuda() {
+    local desired=12.9.2 legacy=0 system_ok=0 nvcc_ver="" prefix mm
+    if needs_legacy_cuda; then desired=12.8.2; legacy=1; fi
+    if have_cmd nvcc; then
+        nvcc_ver="$(nvcc --version | sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | tail -1)"
+        [[ $legacy -eq 1 && "$nvcc_ver" == 12.8* ]] && system_ok=1
+        [[ $legacy -eq 0 && ( "$nvcc_ver" == 12.* || "$nvcc_ver" == 13.* ) ]] && system_ok=1
+    fi
+    if [[ $system_ok -eq 1 ]]; then
+        say "Using existing nvcc CUDA $nvcc_ver"
+        export CUDACXX="$(command -v nvcc)"
+        return
+    fi
+    prefix="$STATE_DIR/cuda-$desired"
+    mm="$(bootstrap_micromamba)"
+    if [[ ! -x "$prefix/bin/nvcc" ]]; then
+        say "Installing private CUDA Toolkit $desired (driver untouched)..."
+        MAMBA_ROOT_PREFIX="$STATE_DIR/micromamba-root" "$mm" create -y -p "$prefix" -c nvidia -c conda-forge "cuda-minimal-build=$desired" libcublas-dev
+    fi
+    export CUDA_HOME="$prefix" CUDA_PATH="$prefix" CUDA_ROOT="$prefix" CUDACXX="$prefix/bin/nvcc"
+    export PATH="$prefix/bin:$PATH"
+    export LD_LIBRARY_PATH="$prefix/lib:$prefix/lib64:${LD_LIBRARY_PATH:-}"
+    export LIBRARY_PATH="$prefix/lib:$prefix/lib64:${LIBRARY_PATH:-}"
+    export CPATH="$prefix/include:${CPATH:-}"
+}
+
+inventory_arches() {
+python3 - "$PLAN_FILE" <<'PY'
+import json,sys
+p=json.load(open(sys.argv[1])); a=[]
+for s in p['servers']:
+    for g in s['gpus']:
+        cc=g.get('compute_cap','').replace('.','')
+        if cc and cc not in a: a.append(cc)
+print(';'.join(sorted(a,key=int)))
+PY
+}
+
+build_kind() {
+python3 - "$PLAN_FILE" <<'PY'
+import json,sys
+print('glm53' if any(s['profile']['build']=='glm53' for s in json.load(open(sys.argv[1]))['servers']) else 'upstream')
+PY
+}
+
+ensure_llamacpp() {
+    local kind arches src build repo ref
+    kind="$(build_kind)"; arches="$(inventory_arches)"; [[ -n "$arches" ]] || arches=native
+    if [[ "$kind" == glm53 ]]; then
+        src="$STATE_DIR/llama.cpp-glm53"; repo=https://github.com/unslothai/llama.cpp.git; ref=glm5next/upstream
+    else
+        src="$STATE_DIR/llama.cpp"; repo=https://github.com/ggml-org/llama.cpp.git; ref=master
+    fi
+    build="$src/build-cuda-${arches//;/_}"
+    LLAMA_SERVER="$build/bin/llama-server"
+    if [[ -x "$LLAMA_SERVER" && "${CLAUDE_LOCAL_REBUILD:-0}" != 1 ]]; then
+        say "Using existing CUDA llama.cpp: $LLAMA_SERVER"
+        return
+    fi
+    if [[ -d "$src/.git" ]]; then
+        say "Updating llama.cpp ($kind)..."
+        git -C "$src" fetch --depth=1 origin "$ref:refs/remotes/origin/$ref"
+        git -C "$src" checkout -q "$ref" 2>/dev/null || git -C "$src" checkout -q -B "$ref" "origin/$ref"
+        git -C "$src" reset --hard "origin/$ref"
+    else
+        say "Cloning llama.cpp ($kind)..."
+        git clone --depth=1 --branch "$ref" "$repo" "$src"
+    fi
+    local -a cmake_args=(-DGGML_CUDA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON -DGGML_CUDA_PEER_MAX_BATCH_SIZE=8192 -DLLAMA_OPENSSL=ON -DCMAKE_BUILD_TYPE=Release "-DCMAKE_CUDA_ARCHITECTURES=$arches")
+    [[ -n "${CUDA_ROOT:-}" ]] && cmake_args+=("-DCMAKE_CUDA_COMPILER=$CUDA_ROOT/bin/nvcc" "-DCUDAToolkit_ROOT=$CUDA_ROOT")
+    say "Building CUDA llama.cpp for SM: $arches"
+    cmake -S "$src" -B "$build" -G Ninja "${cmake_args[@]}"
+    cmake --build "$build" --target llama-server -j"$(nproc)"
+    [[ -x "$LLAMA_SERVER" ]] || die "CUDA llama-server build failed"
+}
+
+fetch_qwen_template() {
+    QWEN_TEMPLATE="$STATE_DIR/templates/qwen-fixed.jinja"
+    mkdir -p "$(dirname "$QWEN_TEMPLATE")"
+    if [[ ! -s "$QWEN_TEMPLATE" || "${CLAUDE_LOCAL_REFRESH_TEMPLATE:-0}" == 1 ]]; then
+        say "Downloading fixed Qwen agent/tool template..."
+        curl -fL --show-error https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates/resolve/main/chat_template.jinja -o "$QWEN_TEMPLATE.new"
+        mv "$QWEN_TEMPLATE.new" "$QWEN_TEMPLATE"
+    fi
+}
+
+server_rows() {
+python3 - "$PLAN_FILE" <<'PY'
+import json,sys
+sep='\x1f'
+for s in json.load(open(sys.argv[1]))['servers']:
+    x=s['profile']; env=';'.join(f'{k}={v}' for k,v in x.get('extra_env',{}).items())
+    print(sep.join(map(str,[s['id'],x['hf_spec'],s['cuda_visible_devices'],int(s['multi_gpu']),x['kv_k'],x['kv_v'],x['batch'],x['ubatch'],x['flash_attn'],x['template'],env,x.get('note','')])))
+PY
+}
+
+print_plan() {
+python3 - "$PLAN_FILE" <<'PY'
+import json,sys
+p=json.load(open(sys.argv[1])); print(f"Physical context: {p['context']:,}\nHermes role models:")
+for r in ('haiku','sonnet','opus','fable'): print(f"  {r:6} -> {p['roles'][r]} ({p['role_ids'][r]})")
+print('Servers:')
+for s in p['servers']:
+    x=s['profile']; gs=', '.join(f"GPU{g['index']} {g['name']} ({g['free_mib']/1024:.1f} GiB free, PCIe Gen{g['pcie_gen']} x{g['pcie_width']})" for g in s['gpus'])
+    print(f"  {s['id']}: {x['hf_spec']}\n    {gs}\n    KV={x['kv_k']}/{x['kv_v']} batch={x['batch']}/{x['ubatch']} FA={x['flash_attn']} quality-tier={x['quality']}")
+PY
+}
+
+start_backends() {
+    mkdir -p "$STATE_DIR/logs" "$CACHE_DIR"
+    export LLAMA_CACHE="$CACHE_DIR" GGML_CUDA_ENABLE_UNIFIED_MEMORY=0 CUDA_SCALE_LAUNCH_QUEUES=4x
+    local next=$((PORT_BASE+1))
+    BACKENDS_TSV="$STATE_DIR/hermes-backends.$$"; : > "$BACKENDS_TSV"
+    while IFS=$'\x1f' read -r id hf gpus multi kvk kvv batch ubatch fa template envpairs note; do
+        local port log pid failed=0 waited=0
+        port="$(free_port "$next")"; next=$((port+1)); log="$STATE_DIR/logs/hermes-${id}.log"; : > "$log"
+        local -a cmd=("$LLAMA_SERVER" -hf "$hf" --alias "$id" --no-mmproj -ngl 999 -c "$CTX" -np 1 --cache-type-k "$kvk" --cache-type-v "$kvv" -b "$batch" -ub "$ubatch" -fa "$fa" --jinja --no-context-shift --host 127.0.0.1 --port "$port")
+        [[ "$multi" == 1 ]] && cmd+=(--split-mode layer)
+        [[ "$template" == qwen-fixed ]] && cmd+=(--chat-template-file "$QWEN_TEMPLATE")
+        local -a envcmd=(env "CUDA_VISIBLE_DEVICES=$gpus" "LLAMA_CACHE=$CACHE_DIR" "GGML_CUDA_ENABLE_UNIFIED_MEMORY=0" "CUDA_SCALE_LAUNCH_QUEUES=4x")
+        if [[ -n "$envpairs" ]]; then
+            local -a pairs; IFS=';' read -ra pairs <<< "$envpairs"; local pair
+            for pair in "${pairs[@]}"; do envcmd+=("$pair"); done
+        fi
+        say "Starting $id on GPU(s) [$gpus], $hf, ctx=$CTX${note:+ — $note}"
+        "${envcmd[@]}" "${cmd[@]}" > >(tee -a "$log" >&2) 2>&1 & pid=$!; PIDS+=("$pid")
+        while ! curl -fsS "http://127.0.0.1:$port/health" >/dev/null 2>&1; do
+            kill -0 "$pid" 2>/dev/null || { failed=1; break; }
+            sleep 1; waited=$((waited+1))
+            (( waited % 30 == 0 )) && say "Still waiting for $id (${waited}s); llama.cpp output remains live above."
+        done
+        if [[ $failed -ne 0 ]]; then
+            warn "$id exited before becoming ready. Full log: $log"
+            tail -80 "$log" >&2 || true
+            die "failed to start $id"
+        fi
+        say "Backend ready: $id on http://127.0.0.1:$port/v1"
+        printf '%s\t%s\t%s\n' "$id" "$port" "$hf" >> "$BACKENDS_TSV"
+    done < <(server_rows)
+}
+
+role_id() {
+    python3 - "$PLAN_FILE" "$1" <<'PY'
+import json,sys
+print(json.load(open(sys.argv[1]))['role_ids'][sys.argv[2]])
+PY
+}
+
+backend_url() {
+    local model_id="$1" port
+    port="$(awk -F '\t' -v m="$model_id" '$1==m {print $2; exit}' "$BACKENDS_TSV")"
+    [[ -n "$port" ]] || die "no backend port found for $model_id"
+    printf 'http://127.0.0.1:%s/v1\n' "$port"
+}
+
+profile_exists() {
+    [[ -d "$HOME/.hermes/profiles/$1" ]]
+}
+
+ensure_profile() {
+    local name="$1" desc="$2"
+    if ! profile_exists "$name"; then
+        say "Creating Hermes Bot profile: $name"
+        hermes profile create "$name" --description "$desc" --no-alias
+    else
+        hermes profile describe "$name" --text "$desc" >/dev/null
+    fi
+}
+
+configure_profile() {
+    local name="$1" model_id="$2" url="$3"
+    hermes -p "$name" config set model.provider custom >/dev/null
+    hermes -p "$name" config set model.default "$model_id" >/dev/null
+    hermes -p "$name" config set model.base_url "$url" >/dev/null
+    hermes -p "$name" config set model.api_mode chat_completions >/dev/null
+    hermes -p "$name" config set model.context_length "$CLIENT_CTX" >/dev/null
+    hermes -p "$name" config set terminal.cwd . >/dev/null
+    # Local llama-server ignores auth; setting a profile-local placeholder avoids
+    # clients that insist on a non-empty Authorization token.
+    hermes -p "$name" config set OPENAI_API_KEY pushbutton-local >/dev/null
+}
+
+write_soul_if_missing() {
+    local name="$1" text="$2" file="$HOME/.hermes/profiles/$name/SOUL.md"
+    [[ -s "$file" ]] && return 0
+    printf '%s\n' "$text" > "$file"
+}
+
+configure_bots() {
+    local manager="$BOT_PREFIX-manager" fast="$BOT_PREFIX-fast" coder="$BOT_PREFIX-coder" reviewer="$BOT_PREFIX-reviewer" deep="$BOT_PREFIX-deep"
+    local haiku sonnet opus fable
+    haiku="$(role_id haiku)"; sonnet="$(role_id sonnet)"; opus="$(role_id opus)"; fable="$(role_id fable)"
+
+    ensure_profile "$manager" "Project manager and orchestrator. Decomposes goals, routes work to specialist profiles, tracks dependencies, and integrates results."
+    ensure_profile "$fast" "Fast reconnaissance, search, triage, inventory, and bounded fact-finding."
+    ensure_profile "$coder" "Implementation specialist for coding, testing, automation, and concrete repository changes."
+    ensure_profile "$reviewer" "Independent reviewer for correctness, regressions, security, edge cases, and missing tests."
+    ensure_profile "$deep" "Deep architecture, difficult debugging, root-cause analysis, and second-solution specialist."
+
+    configure_profile "$manager" "$sonnet" "$(backend_url "$sonnet")"
+    configure_profile "$fast" "$haiku" "$(backend_url "$haiku")"
+    configure_profile "$coder" "$sonnet" "$(backend_url "$sonnet")"
+    configure_profile "$reviewer" "$opus" "$(backend_url "$opus")"
+    configure_profile "$deep" "$fable" "$(backend_url "$fable")"
+
+    write_soul_if_missing "$manager" "You are the Pushbutton project manager. Prefer decomposition, delegation, explicit dependencies, and integration over doing every task yourself. Use the named specialist Bots when collaboration improves speed or correctness. Preserve human control over consequential actions."
+    write_soul_if_missing "$fast" "You are the Pushbutton fast reconnaissance specialist. Gather facts quickly, inspect relevant state, and return concise actionable findings."
+    write_soul_if_missing "$coder" "You are the Pushbutton implementation specialist. Make coherent minimal changes, test them, and report concrete results and remaining risks."
+    write_soul_if_missing "$reviewer" "You are the Pushbutton independent reviewer. Look for correctness bugs, regressions, security and concurrency hazards, compatibility problems, and missing tests."
+    write_soul_if_missing "$deep" "You are the Pushbutton deep-analysis specialist. Solve difficult architecture and debugging problems from first principles, test assumptions, and compare alternatives."
+
+    # Configure durable Kanban routing in the manager profile. Hermes' built-in
+    # decomposer uses profile descriptions to select workers.
+    hermes -p "$manager" config set kanban.orchestrator_profile "$manager" >/dev/null || true
+    hermes -p "$manager" config set kanban.default_assignee "$coder" >/dev/null || true
+    hermes -p "$manager" config set kanban.auto_decompose true >/dev/null || true
+    hermes -p "$manager" config set delegation.max_concurrent_children 4 >/dev/null || true
+    hermes -p "$manager" config set delegation.max_spawn_depth 2 >/dev/null || true
+    hermes -p "$manager" config set delegation.orchestrator_enabled true >/dev/null || true
+
+    MANAGER_PROFILE="$manager"
+    say "Hermes Bot roster ready: $manager, $fast, $coder, $reviewer, $deep"
+}
+
+launch_hermes() {
+    case "$UI" in
+        desktop)
+            say "Launching Hermes Desktop Bot Mode with profile $MANAGER_PROFILE"
+            hermes -p "$MANAGER_PROFILE" desktop
+            ;;
+        tui)
+            say "Launching Hermes TUI with profile $MANAGER_PROFILE"
+            if [[ $RESUME -eq 1 ]]; then hermes -p "$MANAGER_PROFILE" --tui --resume latest; else hermes -p "$MANAGER_PROFILE" --tui; fi
+            ;;
+        cli)
+            say "Launching Hermes CLI with profile $MANAGER_PROFILE"
+            if [[ $RESUME -eq 1 ]]; then hermes -p "$MANAGER_PROFILE" --resume latest; else hermes -p "$MANAGER_PROFILE"; fi
+            ;;
+        *) die "unknown UI mode: $UI" ;;
+    esac
+}
+
+[[ -f "$PLAN_PY" ]] || die "missing $PLAN_PY"
+while (($#)); do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --desktop) UI=desktop; shift ;;
+        --tui) UI=tui; shift ;;
+        --cli) UI=cli; shift ;;
+        --resume) RESUME=1; shift ;;
+        --local-cache) [[ $# -ge 2 ]] || die "--local-cache needs a directory"; CACHE_DIR="$2"; shift 2 ;;
+        --local-context) [[ $# -ge 2 ]] || die "--local-context needs a value"; CTX="$2"; shift 2 ;;
+        --local-client-context) [[ $# -ge 2 ]] || die "--local-client-context needs a value"; CLIENT_CTX="$2"; shift 2 ;;
+        --local-port-base) [[ $# -ge 2 ]] || die "--local-port-base needs a value"; PORT_BASE="$2"; shift 2 ;;
+        --bot-prefix) [[ $# -ge 2 ]] || die "--bot-prefix needs a name"; BOT_PREFIX="$2"; shift 2 ;;
+        --local-keep-servers) KEEP_SERVERS=1; shift ;;
+        -*) die "unknown option: $1" ;;
+        *) MODELS+=("$1"); shift ;;
+    esac
+done
+
+[[ "$CTX" =~ ^[0-9]+$ && "$CLIENT_CTX" =~ ^[0-9]+$ ]] || die "context values must be integers"
+(( CLIENT_CTX <= CTX )) || die "client context ($CLIENT_CTX) exceeds physical context ($CTX)"
+((${#MODELS[@]} <= 4)) || die "at most four model selectors may be supplied"
+
+install_base_deps
+ensure_nvidia_driver
+ensure_hermes
+mkdir -p "$STATE_DIR" "$CACHE_DIR"
+PLAN_FILE="$STATE_DIR/hermes-plan.$$.json"
+acquire_startup_lock
+plan_args=(plan --context "$CTX")
+if ((${#MODELS[@]})); then plan_args+=("${MODELS[@]}"); else plan_args+=(--smart); fi
+python3 "$PLAN_PY" "${plan_args[@]}" > "$PLAN_FILE"
+print_plan
+prepare_host_compiler
+activate_cuda
+ensure_llamacpp
+grep -q '"template": "qwen-fixed"' "$PLAN_FILE" && fetch_qwen_template || true
+start_backends
+configure_bots
+release_startup_lock
+launch_hermes
