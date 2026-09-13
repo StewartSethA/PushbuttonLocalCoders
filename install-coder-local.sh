@@ -5,17 +5,47 @@ REF="${PUSHBUTTON_REF:-main}"
 ROOT="${PUSHBUTTON_DIR:-$HOME/.local/share/pushbutton}"
 DEST="$ROOT/PushbuttonLocalCoders"
 SYSTEM=0
-[[ "${1:-}" == --system ]]&&{ SYSTEM=1;shift; }
-command -v git >/dev/null||{ echo "git is required" >&2;exit 1; }
+[[ "${1:-}" == --system ]] && { SYSTEM=1; shift; }
+command -v git >/dev/null || { echo "git is required" >&2; exit 1; }
 mkdir -p "$ROOT"
-if [[ -d "$DEST/.git" ]];then git -C "$DEST" fetch --depth=1 origin "$REF";git -C "$DEST" checkout -q --detach FETCH_HEAD;else git clone --depth=1 --branch "$REF" "$REPO_URL" "$DEST";fi
-chmod +x "$DEST/coder-local"
-write_one(){ local p="$1" f="$2"; local tmp="$ROOT/.coder-shim.$$";cat >"$tmp" <<EOF
-#!/usr/bin/env bash
-exec $(printf '%q' "$DEST/coder-local") --frontend $(printf '%q' "$f") "\$@"
-EOF
-chmod +x "$tmp";if [[ "$p" == /usr/local/bin/* ]];then sudo install -m755 "$tmp" "$p";else mkdir -p "$(dirname "$p")";mv "$tmp" "$p";fi;rm -f "$tmp" 2>/dev/null||true; }
-write_one "$HOME/.local/bin/qwen-local" qwen
-((SYSTEM))&&write_one /usr/local/bin/qwen-local qwen
-if (($#));then exec "$DEST/coder-local" --frontend qwen "$@";fi
+if [[ -d "$DEST/.git" ]]; then
+  git -C "$DEST" fetch --depth=1 origin "$REF"
+  git -C "$DEST" checkout -q --detach FETCH_HEAD
+else
+  git clone --depth=1 --branch "$REF" "$REPO_URL" "$DEST"
+fi
+chmod +x "$DEST/coder-local" "$DEST/opencode-local" "$DEST/deepseek-local" "$DEST/mini-swe-local"
+
+install_wrapper(){
+  local target="$1" body="$2" tmp="$ROOT/.coder-shim.$$"
+  printf '#!/usr/bin/env bash\nexec %s "$@"\n' "$body" >"$tmp"
+  chmod +x "$tmp"
+  if [[ "$target" == /usr/local/bin/* ]]; then
+    sudo install -m755 "$tmp" "$target"
+  else
+    mkdir -p "$(dirname "$target")"
+    mv "$tmp" "$target"
+  fi
+  rm -f "$tmp" 2>/dev/null || true
+}
+
+qwen_body="$(printf '%q' "$DEST/coder-local") --frontend qwen"
+opencode_body="$(printf '%q' "$DEST/opencode-local")"
+deepseek_body="$(printf '%q' "$DEST/deepseek-local")"
+mini_body="$(printf '%q' "$DEST/mini-swe-local")"
+
+install_wrapper "$HOME/.local/bin/qwen-local" "$qwen_body"
+install_wrapper "$HOME/.local/bin/opencode-local" "$opencode_body"
+install_wrapper "$HOME/.local/bin/deepseek-local" "$deepseek_body"
+install_wrapper "$HOME/.local/bin/mini-swe-local" "$mini_body"
+
+if ((SYSTEM)); then
+  install_wrapper /usr/local/bin/qwen-local "$qwen_body"
+  install_wrapper /usr/local/bin/opencode-local "$opencode_body"
+  install_wrapper /usr/local/bin/deepseek-local "$deepseek_body"
+  install_wrapper /usr/local/bin/mini-swe-local "$mini_body"
+fi
+
+printf '[pushbutton] Installed replica-aware coder frontends: qwen-local, opencode-local, deepseek-local, mini-swe-local\n'
+if (($#)); then exec "$DEST/coder-local" --frontend qwen "$@"; fi
 exec "$DEST/coder-local" --frontend qwen --help
