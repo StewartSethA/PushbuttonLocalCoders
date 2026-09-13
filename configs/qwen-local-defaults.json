@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "pushbutton-web": {
+      "httpUrl": "https://mcp.exa.ai/mcp",
+      "timeout": 60000,
+      "trust": true,
+      "description": "Pushbutton web search and page fetch via Exa MCP",
+      "includeTools": ["web_search_exa", "web_fetch_exa"]
+    }
+  },
+  "mcp": {
+    "toolIdleTimeoutMs": 600000
+  }
+}
