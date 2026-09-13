@@ -1,0 +1,42 @@
+name: claude-local tests
+
+on:
+  pull_request:
+    paths:
+      - "claude-local"
+      - "install-claude-local.sh"
+      - "lib/claude_local_*.py"
+      - "lib/claude_local_*.sh"
+      - "tests/test_claude_local.py"
+      - "tests/test_claude_local_scheduler.py"
+      - "tests/test_backend_row_protocol.sh"
+      - ".github/workflows/claude-local-tests.yml"
+  push:
+    branches:
+      - "feature/claude-local-harness"
+    paths:
+      - "claude-local"
+      - "install-claude-local.sh"
+      - "lib/claude_local_*.py"
+      - "lib/claude_local_*.sh"
+      - "tests/test_claude_local.py"
+      - "tests/test_claude_local_scheduler.py"
+      - "tests/test_backend_row_protocol.sh"
+      - ".github/workflows/claude-local-tests.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  static-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bash syntax
+        run: bash -n ./claude-local ./install-claude-local.sh ./lib/claude_local_hostcc.sh ./tests/test_backend_row_protocol.sh
+      - name: Python syntax
+        run: python3 -m py_compile lib/claude_local_plan.py lib/claude_local_gateway.py tests/test_claude_local.py tests/test_claude_local_scheduler.py
+      - name: Backend row protocol
+        run: bash ./tests/test_backend_row_protocol.sh
+      - name: Unit tests
+        run: python3 -m unittest -v tests/test_claude_local.py tests/test_claude_local_scheduler.py

@@ -1,13 +1,110 @@
 # Pushbutton Local Coders
 
-> **Pushbutton bootstrap for a powerful local AI coding assistant.**
-> One `curl` command installs Ollama, Claude Code, and the best local coder model
-> your hardware can run — with GPU-optimised llama.cpp builds, a multi-agent
-> Docker sandbox, hardware ablation, a quick speed benchmark, and a live TUI monitor.
+> **Pick local models. Pushbutton handles the hardware.**
+> `claude-local` turns one or more local models into a hardware-aware Claude Code
+> team: it selects GPUs, quants, context/cache settings and ports, provisions
+> CUDA/nvcc and llama.cpp when needed, and keeps the session local.
 
 ---
 
-## Quick Start
+## 🚀 Recommended: `claude-local`
+
+### Test this PR now
+
+Until PR #9 is merged, this one-liner installs/updates the PR branch and launches
+Qwen3.6-35B-A3B using the best fitting local profile for the machine:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/StewartSethA/PushbuttonLocalCoders/refs/heads/feature/claude-local-harness/install-claude-local.sh \
+  | PUSHBUTTON_REF=feature/claude-local-harness bash -s -- qwen3.6:35b
+```
+
+To inspect the hardware/model plan without downloading or starting a model:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/StewartSethA/PushbuttonLocalCoders/refs/heads/feature/claude-local-harness/install-claude-local.sh \
+  | PUSHBUTTON_REF=feature/claude-local-harness bash -s -- \
+    qwen3.6:35b qwen3.8:27b --local-dry-run
+```
+
+### After merge
+
+Install the command once:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/StewartSethA/PushbuttonLocalCoders/main/install-claude-local.sh | bash
+```
+
+Then use it from any project directory:
+
+```bash
+# Let Pushbutton choose a fast local default
+claude-local
+
+# One model for all Claude roles
+claude-local qwen3.6:35b
+
+# Keep normal Claude Code flags
+claude-local qwen3.6:35b --resume
+
+# Four explicitly selected local role models:
+# Haiku, Sonnet (daily driver), Opus, Fable
+claude-local \
+  nemotron-3.5-lightning \
+  qwen3.6:35b \
+  qwen3.8:27b \
+  glm-5.3-flash \
+  --resume
+```
+
+Model order is positional:
+
+| Models supplied | Claude role mapping |
+|---|---|
+| 1 | Haiku = Sonnet = Opus = Fable |
+| 2 | Haiku = #1; Sonnet/Opus/Fable = #2 |
+| 3 | Haiku = #1; Sonnet = #2; Opus/Fable = #3 |
+| 4 | Haiku, Sonnet, Opus, Fable respectively |
+
+Current built-in model families are `qwen3.6:35b`, `qwen3.8:27b`,
+`nemotron-3.5-lightning`, and `glm-5.3-flash`. Users choose model families;
+Pushbutton chooses the concrete GGUF quant and placement.
+
+### What `claude-local` automates
+
+- inventories each NVIDIA GPU independently, including **currently free VRAM**, compute capability and negotiated PCIe generation/width
+- for one model, prefers the **freest viable GPU**, breaking ties by PCIe link speed
+- for several models, **plans the complete disjoint GPU assignment before launching anything**, avoiding greedy placements that strand a later model
+- prefers one-GPU residency and preserves spare GPUs for parallel agents; uses llama.cpp layer splitting only when needed
+- selects curated model quants, Q4/Q4 KV where appropriate, and a **262,144-token physical context** by default
+- gives Claude Code a conservative 200,000-token client budget so auto-compaction occurs before the physical backend ceiling
+- installs build dependencies, Claude Code and a private compatible CUDA toolkit/nvcc when the host lacks a suitable one
+- builds CUDA llama.cpp for the actual compute capabilities in the selected GPU plan (for example SM70 V100 + SM89 Ada)
+- downloads/caches the selected GGUF automatically
+- applies the fixed Qwen agent/tool Jinja template for Qwen3.6/3.8
+- auto-selects free backend and gateway ports so multiple running instances can coexist
+- exposes local Anthropic-compatible routing for Claude Code and injects `local-fast`, `local-coder`, `local-reviewer`, and `local-deep` subagents
+- has **no cloud fallback** in the `claude-local` path; CUDA unified-memory spill is disabled unless explicitly requested
+
+Useful commands:
+
+```bash
+claude-local doctor
+claude-local models
+claude-local qwen3.6:35b qwen3.8:27b --local-dry-run
+claude-local install            # ~/.local/bin/claude-local
+claude-local install --system   # /usr/local/bin/claude-local
+```
+
+The new hardware-aware `claude-local` path is currently NVIDIA/Linux-first.
+The existing installer below retains the repository's Ollama, Apple Silicon,
+ROCm, CPU, Docker, benchmarking and network-node workflows.
+
+---
+
+## General installer / existing workflows
+
+The original all-in-one installer remains available:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/StewartSethA/PushbuttonLocalCoders/main/install.sh | bash
@@ -93,10 +190,14 @@ bash install.sh --build-llamacpp
 ## Architecture
 
 ```
-install.sh                  ← Single entry point (curl-installable)
+install.sh                  ← Existing all-in-one entry point
+install-claude-local.sh     ← Curl-safe claude-local bootstrap
+claude-local                ← Hardware-aware local Claude Code launcher
 lib/
+  claude_local_plan.py      ← GPU/model/quant/context placement scheduler
+  claude_local_gateway.py   ← Local Anthropic-wire role router
   detect_hardware.sh        ← GPU/CPU/VRAM/RAM detection (Linux, Mac, Windows)
-  select_model.sh           ← Model + quant selection based on inference memory
+  select_model.sh           ← Legacy/general model + quant selection
   install_ollama.sh         ← Ollama install + service management + model pull
   install_claude.sh         ← Claude Code install + LiteLLM/Ollama bridge setup
   install_llamacpp.sh       ← llama.cpp build (CUDA / Metal / ROCm / CPU)
@@ -117,7 +218,7 @@ configs/                    ← User config files (nodes.txt, claude.env, etc.)
 
 ## Model Selection Logic
 
-`select_model.sh` now keeps the catalogue intentionally modern:
+The general installer's `select_model.sh` keeps its catalogue intentionally modern:
 
 | Model | Purpose | Native Context | Notes |
 |-------|---------|----------------|-------|
@@ -125,13 +226,13 @@ configs/                    ← User config files (nodes.txt, claude.env, etc.)
 | Qwen 3.8 27B | Primary coder / fallback | 262,144 | Better fit for smaller single-GPU boxes |
 | Nemotron 3.5 Lightning 30B-A3B | Orchestrator / alternate coder | 262,144 | Fast modern option for routing and coding |
 
-Before any model pull, the installer now:
+Before any model pull, the general installer:
 
 - prompts for confirmation
 - shows estimated disk pull and active runtime memory
 - shows effective max context for the proposed quant + KV quant
 - lets you choose model quant, KV quant, primary coder, and additional coders from terminal dropdowns
-- records estimated prompt-processing (PP) and text-generation (TG) tok/s, then compares them with measured values after the benchmark run
+- records estimated prompt-processing (PP) and token-generation (TG) tok/s, then compares them with measured values after the benchmark run
 
 Override at any time with `--model <tag>` or the `DEVELOPER_MODEL` env var.
 
@@ -202,6 +303,14 @@ Requires passwordless SSH to the remote hosts as `$USER` (or set `SSH_USER`).
 ---
 
 ## Requirements
+
+For `claude-local`:
+
+- Linux with an NVIDIA GPU and working NVIDIA driver
+- `bash`, `curl`, and `git` (the bootstrap installs missing supported dependencies where practical)
+- CUDA toolkit/nvcc do **not** need to be preinstalled; the launcher provisions a compatible private toolkit when needed
+
+For the repository's other workflows:
 
 - **bash** ≥ 4.0
 - **curl** or **wget**
