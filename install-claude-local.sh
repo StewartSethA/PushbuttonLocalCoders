@@ -38,15 +38,7 @@ write_shim() {
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT=$(printf '%q' "$DEST")
-need_hostcc=1
-for arg in "\$@"; do
-    case "\$arg" in --local-dry-run|doctor|models|help|-h|--help|install) need_hostcc=0 ;; esac
-done
-if (( need_hostcc )); then
-    source "\$ROOT/lib/claude_local_hostcc.sh"
-    claude_local_prepare_hostcc
-fi
-exec "\$ROOT/claude-local" "\$@"
+exec "\$ROOT/lib/claude_local_entry.sh" "\$@"
 EOF
     chmod +x "$tmp"
     if [[ "$target" == /usr/local/bin/* ]]; then
@@ -60,7 +52,7 @@ EOF
 
 install_command_shims() {
     # Always keep the per-user command available. --system additionally places
-    # the same compatibility-aware wrapper in /usr/local/bin.
+    # the same wrapper in /usr/local/bin.
     write_shim "$HOME/.local/bin/claude-local"
     if (( SYSTEM_INSTALL )); then
         write_shim /usr/local/bin/claude-local
@@ -68,18 +60,6 @@ install_command_shims() {
     else
         say "Installed user command: $HOME/.local/bin/claude-local"
     fi
-}
-
-prepare_hostcc_if_needed() {
-    local need=1 arg
-    for arg in "$@"; do
-        case "$arg" in --local-dry-run|doctor|models|help|-h|--help|install) need=0 ;; esac
-    done
-    (( need )) || return 0
-    [[ -f "$DEST/lib/claude_local_hostcc.sh" ]] || die "missing CUDA host-compiler bootstrap helper"
-    # shellcheck source=/dev/null
-    source "$DEST/lib/claude_local_hostcc.sh"
-    claude_local_prepare_hostcc
 }
 
 ensure_git
@@ -99,14 +79,14 @@ else
 fi
 
 [[ -x "$DEST/claude-local" ]] || chmod +x "$DEST/claude-local"
+[[ -x "$DEST/lib/claude_local_entry.sh" ]] || chmod +x "$DEST/lib/claude_local_entry.sh"
 install_command_shims
 
 # With no remaining arguments, install/update the command and print help. With
-# arguments, prepare any host-compiler compatibility needed by CUDA and run the
-# harness immediately, so the curl one-liner doubles as a fresh-machine test.
+# arguments, run the hardened entry wrapper immediately so the curl one-liner
+# doubles as a fresh-machine test.
 if [[ $# -eq 0 ]]; then
-    exec "$DEST/claude-local" --help
+    exec "$DEST/lib/claude_local_entry.sh" --help
 fi
 
-prepare_hostcc_if_needed "$@"
-exec "$DEST/claude-local" "$@"
+exec "$DEST/lib/claude_local_entry.sh" "$@"

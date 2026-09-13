@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# mini-swe-local — replica-aware mini-SWE-agent frontend over coder-local.
+set -euo pipefail
+SELF="${BASH_SOURCE[0]}"; command -v readlink >/dev/null 2>&1 && SELF="$(readlink -f "$SELF" 2>/dev/null || printf '%s' "$SELF")"
+ROOT="$(cd "$(dirname "$SELF")" && pwd)"
+STATE_DIR="${CLAUDE_LOCAL_STATE:-$HOME/.local/share/pushbutton/claude-local}"
+SWARM_TASK=""
+PASS=()
+while (($#)); do
+  case "$1" in
+    --swarm) [[ $# -ge 2 ]] || { echo "--swarm needs a task" >&2; exit 2; }; SWARM_TASK="$2"; shift 2 ;;
+    *) PASS+=("$1"); shift ;;
+  esac
+done
+if ! command -v mini >/dev/null 2>&1; then
+  if command -v uv >/dev/null 2>&1; then
+    echo "[mini-swe-local] Installing mini-SWE-agent with uv..."
+    uv tool install mini-swe-agent
+    export PATH="$HOME/.local/bin:$PATH"
+  else
+    echo "mini-swe-local requires uv (preferred) or an existing mini-SWE-agent install" >&2
+    exit 1
+  fi
+fi
+command -v mini >/dev/null 2>&1 || { echo "mini-SWE-agent install failed" >&2; exit 1; }
+shim="$STATE_DIR/frontends/mini-swe/shim"; mkdir -p "$shim"
+cat >"$shim/qwen" <<'INNER'
+#!/usr/bin/env bash
+set -euo pipefail
+state="${CLAUDE_LOCAL_STATE:-$HOME/.local/share/pushbutton/claude-local}"
+root="$state/frontends/mini-swe"; mkdir -p "$root/configs" "$root/runs"
+mapfile -t rows < <(python3 - "$QWEN_HOME/settings.json" <<'PY'
+import json,sys
+q=json.load(open(sys.argv[1]))
+for i,m in enumerate(q['modelProviders']['openai'],1):
+ print(i, m['id'], m['baseUrl'])
+PY
+)
+[[ ${#rows[@]} -gt 0 ]] || { echo "no Pushbutton workers available" >&2; exit 1; }
+make_cfg(){
+  local i="$1" mid="$2" url="$3" cfg="$root/configs/worker-$i.yaml"
+  cat >"$cfg" <<CFG
+model:
+  model_name: "openai/$mid"
+  cost_tracking: "ignore_errors"
+  model_kwargs:
+    custom_llm_provider: "openai"
+    api_base: "$url"
+    api_key: "pushbutton-local"
+CFG
+  printf '%s\n' "$cfg"
+}
+swarm="${MINI_SWE_SWARM_TASK:-}"
+if [[ -n "$swarm" ]]; then
+  pids=(); i=0
+  for row in "${rows[@]}"; do
+    read -r n mid url <<<"$row"; cfg="$(make_cfg "$n" "$mid" "$url")"; log="$root/runs/worker-$n.log"
+    echo "[mini-swe-local] worker $n -> $mid ($url); log=$log"
+    mini -c "$cfg" -t "$swarm" -y > >(tee "$log") 2>&1 & pids+=("$!"); i=$((i+1))
+  done
+  rc=0; for p in "${pids[@]}"; do wait "$p" || rc=1; done
+  exit "$rc"
+fi
+read -r n mid url <<<"${rows[0]}"; cfg="$(make_cfg "$n" "$mid" "$url")"
+if ((${#rows[@]} > 1)); then
+  echo "[mini-swe-local] interactive mini uses worker 1; use --swarm TASK to run all ${#rows[@]} workers concurrently." >&2
+fi
+exec mini -c "$cfg" "$@"
+INNER
+chmod +x "$shim/qwen"
+export PATH="$shim:$PATH"
+if [[ -n "$SWARM_TASK" ]]; then export MINI_SWE_SWARM_TASK="$SWARM_TASK"; fi
+exec "$ROOT/coder-local" --frontend qwen "${PASS[@]}"

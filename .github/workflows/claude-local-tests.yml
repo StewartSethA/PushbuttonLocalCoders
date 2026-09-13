@@ -33,7 +33,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Bash syntax
-        run: bash -n ./claude-local ./install-claude-local.sh ./lib/claude_local_hostcc.sh ./tests/test_backend_row_protocol.sh
+        run: bash -n ./claude-local ./install-claude-local.sh ./lib/claude_local_hostcc.sh ./lib/claude_local_entry.sh ./tests/test_backend_row_protocol.sh
       - name: Python syntax
         run: python3 -m py_compile lib/claude_local_plan.py lib/claude_local_gateway.py tests/test_claude_local.py tests/test_claude_local_scheduler.py
       - name: Backend row protocol

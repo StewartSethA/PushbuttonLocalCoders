@@ -1,0 +1,255 @@
+#!/usr/bin/env bash
+# coder-local — hardware-aware local model launcher for coding-agent CLIs.
+set -euo pipefail
+SELF="${BASH_SOURCE[0]}"
+command -v readlink >/dev/null 2>&1 && SELF="$(readlink -f "$SELF" 2>/dev/null || printf '%s' "$SELF")"
+ROOT="$(cd "$(dirname "$SELF")" && pwd)"
+PLAN_PY="$ROOT/lib/coder_local_plan.py"
+HOSTCC_SH="$ROOT/lib/claude_local_hostcc.sh"
+STATE_DIR="${CLAUDE_LOCAL_STATE:-$HOME/.local/share/pushbutton/claude-local}"
+CACHE_DIR="${CLAUDE_LOCAL_CACHE:-$HOME/.cache/pushbutton/llama}"
+LOCK_FILE="${CLAUDE_LOCAL_LOCK_FILE:-$STATE_DIR/startup.lock}"
+CTX="${CLAUDE_LOCAL_CONTEXT:-262144}"
+CLIENT_CTX="${CLAUDE_LOCAL_CLIENT_CONTEXT:-200000}"
+PORT_BASE="${CODER_LOCAL_PORT_BASE:-20180}"
+FRONTEND="${CODER_LOCAL_FRONTEND:-}"
+AGENTS=""
+RESUME=0
+MODELS=()
+FRONTEND_ARGS=()
+PIDS=()
+STARTUP_LOCK_FD=""
+case "$(basename "$0")" in qwen-local) FRONTEND=qwen;; opencode-local) FRONTEND=opencode;; deepseek-local) FRONTEND=deepseek;; esac
+[[ -n "$FRONTEND" ]] || FRONTEND=qwen
+say(){ printf '\033[1;36m[coder-local]\033[0m %s\n' "$*"; }
+warn(){ printf '\033[1;33m[coder-local]\033[0m %s\n' "$*" >&2; }
+die(){ printf '\033[1;31m[coder-local]\033[0m %s\n' "$*" >&2; exit 1; }
+have(){ command -v "$1" >/dev/null 2>&1; }
+usage(){ cat <<'EOF'
+Usage:
+  qwen-local MODEL [MODEL ...] [--agents 1..4] [--resume] [-- QWEN_ARGS...]
+  coder-local --frontend qwen MODEL [MODEL ...] [options]
+
+Worker semantics:
+  one model + --agents N  -> N independent replicas of that model
+  N models                -> one independent worker/backend per model
+  N models + --agents N   -> explicit N-worker heterogeneous team
+
+Examples on 8x V100 32GB:
+  qwen-local qwen3.8-flash-next --agents 2
+    -> 2 independent Flash-Next coders, 4 GPUs each
+
+  qwen-local qwen3.8-flash-next qwen3.8:27b qwen3.6:35b nemotron-3.5-lightning --agents 4
+    -> 4+1+1+1 GPUs, one V100 intentionally left free
+
+Options:
+  --frontend qwen
+  --agents N
+  --resume
+  --local-context N
+  --local-client-context N
+  --local-cache DIR
+  --local-port-base N
+  --self-test
+  -h, --help
+EOF
+}
+cleanup(){
+  [[ -z "${STARTUP_LOCK_FD:-}" ]] || { flock -u "$STARTUP_LOCK_FD" 2>/dev/null || true; eval "exec ${STARTUP_LOCK_FD}>&-" 2>/dev/null || true; }
+  local p; for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done
+}
+trap cleanup EXIT INT TERM
+free_port(){ python3 - "$1" <<'PY'
+import socket,sys
+for p in range(int(sys.argv[1]), min(65535,int(sys.argv[1])+300)):
+ s=socket.socket()
+ try: s.bind(('127.0.0.1',p)); print(p); raise SystemExit
+ except OSError: pass
+ finally: s.close()
+raise SystemExit(1)
+PY
+}
+needs_legacy_cuda(){ python3 - "$PLAN_FILE" <<'PY'
+import json,sys
+for w in json.load(open(sys.argv[1]))['workers']:
+ for g in w['gpus']:
+  try:
+   if float(g.get('compute_cap') or 99)<7.5: raise SystemExit(0)
+  except ValueError: pass
+raise SystemExit(1)
+PY
+}
+bootstrap_micromamba(){
+ local mm="$STATE_DIR/bin/micromamba"
+ [[ -x "$mm" ]] && { printf '%s\n' "$mm"; return; }
+ mkdir -p "$STATE_DIR/bin"
+ curl -fL --show-error https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xj -C "$STATE_DIR/bin" --strip-components=1 bin/micromamba
+ chmod +x "$mm"; printf '%s\n' "$mm"
+}
+activate_cuda(){
+ local desired=12.9.2 legacy=0 system_ok=0 nvcc_ver="" prefix mm
+ needs_legacy_cuda && { desired=12.8.2; legacy=1; }
+ if have nvcc; then
+   nvcc_ver="$(nvcc --version | sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | tail -1)"
+   [[ $legacy -eq 1 && "$nvcc_ver" == 12.8* ]] && system_ok=1
+   [[ $legacy -eq 0 && ( "$nvcc_ver" == 12.* || "$nvcc_ver" == 13.* ) ]] && system_ok=1
+ fi
+ if ((system_ok)); then export CUDACXX="$(command -v nvcc)"; return; fi
+ prefix="$STATE_DIR/cuda-$desired"; mm="$(bootstrap_micromamba)"
+ if [[ ! -x "$prefix/bin/nvcc" ]]; then
+   say "Installing private CUDA Toolkit $desired (system driver untouched)..."
+   MAMBA_ROOT_PREFIX="$STATE_DIR/micromamba-root" "$mm" create -y -p "$prefix" -c nvidia -c conda-forge "cuda-minimal-build=$desired" libcublas-dev
+ fi
+ export CUDA_HOME="$prefix" CUDA_PATH="$prefix" CUDA_ROOT="$prefix" CUDACXX="$prefix/bin/nvcc"
+ export PATH="$prefix/bin:$PATH" LD_LIBRARY_PATH="$prefix/lib:$prefix/lib64:${LD_LIBRARY_PATH:-}"
+}
+inventory_arches(){ python3 - "$PLAN_FILE" <<'PY'
+import json,sys
+p=json.load(open(sys.argv[1])); a=[]
+for w in p['workers']:
+ for g in w['gpus']:
+  x=g.get('compute_cap','').replace('.','')
+  if x and x not in a:a.append(x)
+print(';'.join(sorted(a,key=int)))
+PY
+}
+ensure_llamacpp(){
+ local arches src build
+ arches="$(inventory_arches)"; [[ -n "$arches" ]] || arches=native
+ src="$STATE_DIR/llama.cpp"; build="$src/build-cuda-${arches//;/_}"; LLAMA_SERVER="$build/bin/llama-server"
+ if [[ -x "$LLAMA_SERVER" && "${CLAUDE_LOCAL_REBUILD:-0}" != 1 ]]; then say "Using existing CUDA llama.cpp: $LLAMA_SERVER"; return; fi
+ if [[ -d "$src/.git" ]]; then
+   say "Updating llama.cpp..."; git -C "$src" fetch --depth=1 origin master; git -C "$src" reset --hard origin/master
+ else
+   say "Cloning llama.cpp..."; git clone --depth=1 https://github.com/ggml-org/llama.cpp.git "$src"
+ fi
+ local -a ca=(-DGGML_CUDA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON -DGGML_CUDA_PEER_MAX_BATCH_SIZE=8192 -DLLAMA_OPENSSL=ON -DCMAKE_BUILD_TYPE=Release "-DCMAKE_CUDA_ARCHITECTURES=$arches")
+ [[ -n "${CUDA_ROOT:-}" ]] && ca+=("-DCMAKE_CUDA_COMPILER=$CUDA_ROOT/bin/nvcc" "-DCUDAToolkit_ROOT=$CUDA_ROOT")
+ cmake -S "$src" -B "$build" -G Ninja "${ca[@]}"; cmake --build "$build" --target llama-server -j"$(nproc)"
+}
+fetch_qwen_template(){
+ QWEN_TEMPLATE="$STATE_DIR/templates/qwen-fixed.jinja"; mkdir -p "$(dirname "$QWEN_TEMPLATE")"
+ if [[ ! -s "$QWEN_TEMPLATE" ]]; then
+   say "Downloading fixed Qwen tool template..."
+   curl -fL --show-error https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates/resolve/main/chat_template.jinja -o "$QWEN_TEMPLATE.new"
+   mv "$QWEN_TEMPLATE.new" "$QWEN_TEMPLATE"
+ fi
+}
+worker_rows(){ python3 - "$PLAN_FILE" <<'PY'
+import json,sys
+sep='\x1f'
+for w in json.load(open(sys.argv[1]))['workers']:
+ x=w['profile']; env=';'.join(f'{k}={v}' for k,v in x.get('extra_env',{}).items())
+ print(sep.join(map(str,[w['worker'],w['id'],x['hf_spec'],w['cuda_visible_devices'],int(w['multi_gpu']),x['kv_k'],x['kv_v'],x['batch'],x['ubatch'],x['flash_attn'],x['template'],env,x.get('note','')])))
+PY
+}
+print_plan(){ python3 - "$PLAN_FILE" <<'PY'
+import json,sys
+p=json.load(open(sys.argv[1])); print(f"Coding agents: {p['agents']}  physical context: {p['context']:,}")
+for w in p['workers']:
+ x=w['profile']; gs=','.join(str(g['index']) for g in w['gpus'])
+ print(f"  agent {w['worker']}: {w['model']} / {x['quant']} -> GPU[{gs}] ({len(w['gpus'])} GPU{'s' if len(w['gpus'])!=1 else ''})")
+print(f"  spare GPUs: {[g['index'] for g in p['unused_gpus']]}")
+PY
+}
+start_backends(){
+ mkdir -p "$STATE_DIR/logs" "$CACHE_DIR"; BACKENDS="$STATE_DIR/coder-backends.$$.tsv"; : >"$BACKENDS"
+ export LLAMA_CACHE="$CACHE_DIR" GGML_CUDA_ENABLE_UNIFIED_MEMORY=0 CUDA_SCALE_LAUNCH_QUEUES=4x
+ local next=$((PORT_BASE+1))
+ while IFS=$'\x1f' read -r worker id hf gpus multi kvk kvv batch ubatch fa template envpairs note; do
+   local port log pid waited=0 failed=0
+   port="$(free_port "$next")"; next=$((port+1)); log="$STATE_DIR/logs/coder-$id.log"; : >"$log"
+   local -a cmd=("$LLAMA_SERVER" -hf "$hf" --alias "$id" --no-mmproj -ngl 999 -c "$CTX" -np 1 --cache-type-k "$kvk" --cache-type-v "$kvv" -b "$batch" -ub "$ubatch" -fa "$fa" --jinja --no-context-shift --host 127.0.0.1 --port "$port")
+   [[ "$multi" == 1 ]] && cmd+=(--split-mode layer)
+   [[ "$template" == qwen-fixed ]] && cmd+=(--chat-template-file "$QWEN_TEMPLATE")
+   local -a envcmd=(env "CUDA_VISIBLE_DEVICES=$gpus" "LLAMA_CACHE=$CACHE_DIR" "GGML_CUDA_ENABLE_UNIFIED_MEMORY=0")
+   if [[ -n "$envpairs" ]]; then local -a pairs; IFS=';' read -ra pairs<<<"$envpairs"; local pair; for pair in "${pairs[@]}";do envcmd+=("$pair");done;fi
+   say "Starting agent $worker: $hf on GPU(s) [$gpus]${note:+ — $note}"
+   "${envcmd[@]}" "${cmd[@]}" > >(tee -a "$log" >&2) 2>&1 & pid=$!; PIDS+=("$pid")
+   until curl -fsS "http://127.0.0.1:$port/health" >/dev/null 2>&1; do
+     kill -0 "$pid" 2>/dev/null || { failed=1;break;}; sleep 1; waited=$((waited+1)); ((waited%30==0))&&say "Still loading agent $worker (${waited}s)..."
+   done
+   ((failed==0)) || { tail -80 "$log" >&2 || true; die "agent $worker backend failed"; }
+   say "Agent $worker backend ready: http://127.0.0.1:$port/v1"
+   printf '%s\t%s\t%s\t%s\n' "$worker" "$id" "$port" "$hf" >>"$BACKENDS"
+ done < <(worker_rows)
+}
+ensure_qwen(){
+ if have qwen; then return; fi
+ say "Installing official Qwen Code standalone CLI..."
+ curl -fsSL https://qwen-code-assets.oss-cn-hangzhou.aliyuncs.com/installation/install-qwen-standalone.sh | bash
+ export PATH="$HOME/.local/bin:$PATH"
+ have qwen || die "Qwen Code install completed but qwen is not in PATH"
+}
+configure_qwen(){
+ local qhome="$STATE_DIR/frontends/qwen" runtime="$STATE_DIR/frontends/qwen-runtime"
+ mkdir -p "$qhome/agents" "$runtime"; export QWEN_HOME="$qhome" QWEN_RUNTIME_DIR="$runtime"
+ export PUSHBUTTON_LOCAL_API_KEY=pushbutton-local QWEN_CODE_ENABLE_AGENT_TEAM=1 QWEN_USAGE_STATISTICS_ENABLED=0 QWEN_TELEMETRY_ENABLED=0
+ python3 - "$BACKENDS" "$qhome/settings.json" "$CLIENT_CTX" <<'PY'
+import json,sys
+rows=[]
+for line in open(sys.argv[1]):
+ w,mid,port,hf=line.rstrip('\n').split('\t'); rows.append((int(w),mid,int(port),hf))
+models=[]
+for w,mid,port,hf in rows:
+ models.append({"id":mid,"name":f"Pushbutton agent {w}: {hf}","envKey":"PUSHBUTTON_LOCAL_API_KEY","baseUrl":f"http://127.0.0.1:{port}/v1","streamIdleTimeoutMs":0,"generationConfig":{"contextWindowSize":int(sys.argv[3]),"maxRetries":1}})
+obj={"modelProviders":{"openai":models},"security":{"auth":{"selectedType":"openai"}},"model":{"name":rows[0][1]},"experimental":{"agentTeam":True},"privacy":{"usageStatisticsEnabled":False},"telemetry":{"enabled":False}}
+open(sys.argv[2],'w').write(json.dumps(obj,indent=2)+'\n')
+PY
+ local n; n="$(wc -l <"$BACKENDS")"
+ local i
+ for ((i=2;i<=n;i++)); do
+   local id; id="$(awk -F '\t' -v i="$i" '$1==i{print $2}' "$BACKENDS")"
+   cat >"$qhome/agents/pushbutton-worker-$i.md" <<EOF
+---
+name: pushbutton-worker-$i
+description: Independent Pushbutton coding worker $i. Delegate implementation, testing, debugging, review, or bounded research here when parallel work helps.
+model: openai:$id
+---
+Work independently on the assigned coding task. Inspect the repository, use tools, make coherent changes when asked, run relevant tests, and return concise concrete results to the leader. Do not duplicate another worker's assigned work.
+EOF
+ done
+ say "Qwen Code team configured: 1 leader + $((n-1)) named worker(s); Agent Team enabled."
+}
+launch_qwen(){
+ ensure_qwen; configure_qwen
+ local primary; primary="$(awk -F '\t' '$1==1{print $2}' "$BACKENDS")"
+ local -a a=(--auth-type openai --model "$primary")
+ ((RESUME)) && a+=(--resume)
+ a+=("${FRONTEND_ARGS[@]}")
+ say "Launching Qwen Code from $PWD"
+ set +e
+ qwen "${a[@]}"
+ local rc=$?
+ set -e
+ return "$rc"
+}
+self_test(){ python3 "$PLAN_PY" --self-test; bash -n "$0"; echo "coder-local shell self-test: PASS"; }
+while (($#));do
+ case "$1" in
+  -h|--help) usage;exit 0;;
+  --frontend) [[ $# -ge 2 ]]||die "--frontend needs a value";FRONTEND="$2";shift 2;;
+  --agents) [[ $# -ge 2 ]]||die "--agents needs a value";AGENTS="$2";shift 2;;
+  --resume) RESUME=1;shift;;
+  --local-context) CTX="$2";shift 2;; --local-client-context) CLIENT_CTX="$2";shift 2;;
+  --local-cache) CACHE_DIR="$2";shift 2;; --local-port-base) PORT_BASE="$2";shift 2;;
+  --self-test) self_test;exit 0;;
+  --) shift;FRONTEND_ARGS+=("$@");break;;
+  -*) die "unknown coder-local option '$1'; put frontend-specific args after --";;
+  *) MODELS+=("$1");shift;;
+ esac
+done
+[[ "$FRONTEND" == qwen ]] || die "frontend '$FRONTEND' is not installed in this revision"
+((${#MODELS[@]}>=1))||die "supply at least one model"
+[[ -z "$AGENTS" ]]||[[ "$AGENTS" =~ ^[1-4]$ ]]||die "--agents must be 1..4"
+[[ "$CTX" =~ ^[0-9]+$ && "$CLIENT_CTX" =~ ^[0-9]+$ ]]||die "context values must be integers"
+((CLIENT_CTX<=CTX))||die "client context exceeds physical context"
+for c in git cmake ninja python3 curl tar flock nvidia-smi;do have "$c"||die "$c is required";done
+mkdir -p "$STATE_DIR" "$CACHE_DIR" "$(dirname "$LOCK_FILE")"
+exec {STARTUP_LOCK_FD}>"$LOCK_FILE"; flock "$STARTUP_LOCK_FD"
+PLAN_FILE="$STATE_DIR/coder-plan.$$.json"
+pa=(--context "$CTX"); [[ -n "$AGENTS" ]]&&pa+=(--agents "$AGENTS"); pa+=("${MODELS[@]}")
+python3 "$PLAN_PY" "${pa[@]}" >"$PLAN_FILE"; print_plan
+source "$HOSTCC_SH"; claude_local_prepare_hostcc; activate_cuda; ensure_llamacpp; grep -q '"template": "qwen-fixed"' "$PLAN_FILE" && fetch_qwen_template || true; start_backends
+flock -u "$STARTUP_LOCK_FD"; eval "exec ${STARTUP_LOCK_FD}>&-"; STARTUP_LOCK_FD=""
+launch_qwen

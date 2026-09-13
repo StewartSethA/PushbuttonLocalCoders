@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# opencode-local — replica-aware OpenCode frontend over coder-local backends.
+set -euo pipefail
+SELF="${BASH_SOURCE[0]}"; command -v readlink >/dev/null 2>&1 && SELF="$(readlink -f "$SELF" 2>/dev/null || printf '%s' "$SELF")"
+ROOT="$(cd "$(dirname "$SELF")" && pwd)"
+STATE_DIR="${CLAUDE_LOCAL_STATE:-$HOME/.local/share/pushbutton/claude-local}"
+have(){ command -v "$1" >/dev/null 2>&1; }
+if ! have opencode; then
+  printf '[opencode-local] Installing OpenCode...\n'
+  curl -fsSL https://opencode.ai/install | bash
+  export PATH="$HOME/.opencode/bin:$HOME/.local/bin:$PATH"
+fi
+have opencode || { echo "opencode install completed but binary not found" >&2; exit 1; }
+shim="$STATE_DIR/frontends/opencode/shim"; mkdir -p "$shim"
+cat >"$shim/qwen" <<'INNER'
+#!/usr/bin/env bash
+set -euo pipefail
+state="${CLAUDE_LOCAL_STATE:-$HOME/.local/share/pushbutton/claude-local}"
+config="$state/frontends/opencode/opencode.json"
+mkdir -p "$(dirname "$config")"
+python3 - "$QWEN_HOME/settings.json" "$config" <<'PY'
+import json,sys
+q=json.load(open(sys.argv[1])); models=q['modelProviders']['openai']; ctx=200000
+providers={}; agents={}
+for i,m in enumerate(models,1):
+ pid=f"pushbutton{i}"; mid=m['id']; ctx=m.get('generationConfig',{}).get('contextWindowSize',ctx)
+ providers[pid]={"npm":"@ai-sdk/openai-compatible","name":f"Pushbutton worker {i}","options":{"baseURL":m['baseUrl'],"apiKey":"pushbutton-local"},"models":{mid:{"name":m['name'],"limit":{"context":ctx,"output":32768},"capabilities":{"tools":True,"input":["text"],"output":["text"]}}}}
+ if i==1:
+  agents['pushbutton-orchestrator']={"mode":"primary","model":f"{pid}/{mid}","description":"Primary coding orchestrator. Delegate independent work to Pushbutton workers when parallelism helps.","permission":{"task":{"*":"allow"}}}
+ else:
+  agents[f'pushbutton-worker-{i}']={"mode":"subagent","model":f"{pid}/{mid}","description":f"Independent coding worker {i} for implementation, testing, debugging, review, or research.","permission":{"edit":"allow","bash":"allow"}}
+obj={"$schema":"https://opencode.ai/config.json","model":f"pushbutton1/{models[0]['id']}","default_agent":"pushbutton-orchestrator","subagent_depth":1,"provider":providers,"agent":agents}
+open(sys.argv[2],'w').write(json.dumps(obj,indent=2)+'\n')
+PY
+export OPENCODE_CONFIG="$config" OPENCODE_DISABLE_AUTOUPDATE=1
+resume=0; pass=()
+while (($#)); do
+  case "$1" in
+    --resume) resume=1; shift;;
+    --auth-type) shift 2;;
+    --model) shift 2;;
+    *) pass+=("$1"); shift;;
+  esac
+done
+args=(--agent pushbutton-orchestrator)
+((resume)) && args+=(--continue)
+exec opencode "${args[@]}" "${pass[@]}"
+INNER
+chmod +x "$shim/qwen"
+export PATH="$shim:$PATH"
+exec "$ROOT/coder-local" --frontend qwen "$@"

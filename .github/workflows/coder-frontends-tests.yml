@@ -1,0 +1,80 @@
+name: coder frontend tests
+on:
+  pull_request:
+    paths:
+      - "coder-local"
+      - "qwen-local"
+      - "opencode-local"
+      - "deepseek-local"
+      - "mini-swe-local"
+      - "install-coder-local.sh"
+      - "configs/qwen-local-defaults.json"
+      - "lib/coder_local_*.py"
+      - "tests/test_coder_local.py"
+      - ".github/workflows/coder-frontends-tests.yml"
+permissions:
+  contents: read
+jobs:
+  qwen-code:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Static and planner tests
+        run: |
+          bash -n coder-local install-coder-local.sh
+          python3 -m py_compile lib/coder_local_plan.py lib/coder_local_lb.py
+          python3 -m json.tool configs/qwen-local-defaults.json >/dev/null
+          python3 -m unittest -v tests/test_coder_local.py
+          ./coder-local --self-test
+      - name: Install official Qwen Code CLI
+        run: |
+          curl -fsSL https://qwen-code-assets.oss-cn-hangzhou.aliyuncs.com/installation/install-qwen-standalone.sh | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Qwen Code smoke test
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          qwen --version
+          qwen --help >/dev/null
+  opencode:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Wrapper syntax
+        run: bash -n opencode-local
+      - name: Install OpenCode
+        run: |
+          curl -fsSL https://opencode.ai/install | bash
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: OpenCode smoke test
+        run: |
+          export PATH="$HOME/.opencode/bin:$HOME/.local/bin:$PATH"
+          opencode --version
+          opencode --help >/dev/null
+  deepseek-harness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Wrapper syntax
+        run: bash -n deepseek-local
+      - name: Install official DeepSeek Harness
+        run: |
+          npm install -g @deepseek-ai/dsh pnpm
+          dsh --version
+          dsh --help >/dev/null
+      - name: Compose TUI profile
+        run: |
+          export DSH_HOME="$RUNNER_TEMP/dsh"
+          dsh plugin --profile tui add @dsh-tui/dsh-tui
+          dsh --profile tui --dump-config >/dev/null
+  mini-swe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Wrapper syntax
+        run: bash -n mini-swe-local
+      - name: Install mini-SWE-agent
+        run: |
+          python3 -m pip install --user mini-swe-agent
+          export PATH="$HOME/.local/bin:$PATH"
+          mini --help >/dev/null
