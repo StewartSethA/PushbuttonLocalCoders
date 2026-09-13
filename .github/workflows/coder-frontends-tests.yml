@@ -65,3 +65,14 @@ jobs:
           export DSH_HOME="$RUNNER_TEMP/dsh"
           dsh plugin --profile tui add @dsh-tui/dsh-tui
           dsh --profile tui --dump-config >/dev/null
+  mini-swe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Wrapper syntax
+        run: bash -n mini-swe-local
+      - name: Install mini-SWE-agent
+        run: |
+          pipx install mini-swe-agent
+          mini --help >/dev/null
+          mini-extra --help >/dev/null
