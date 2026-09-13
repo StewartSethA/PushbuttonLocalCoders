@@ -15,6 +15,8 @@ CTX="${CLAUDE_LOCAL_CONTEXT:-262144}"
 CLIENT_CTX="${CLAUDE_LOCAL_CLIENT_CONTEXT:-200000}"
 PORT_BASE="${HERMES_LOCAL_PORT_BASE:-19180}"
 BOT_PREFIX="${HERMES_LOCAL_BOT_PREFIX:-pushbutton}"
+WEB_SEARCH_BACKEND="${HERMES_LOCAL_WEB_SEARCH_BACKEND:-exa}"
+WEB_EXTRACT_BACKEND="${HERMES_LOCAL_WEB_EXTRACT_BACKEND:-firecrawl}"
 UI=desktop
 RESUME=0
 KEEP_SERVERS=0
@@ -40,6 +42,7 @@ Models use the same positional mapping as claude-local:
 
 Built-ins:
   qwen3.6:35b qwen3.8:27b nemotron-3.5-lightning glm-5.3-flash
+  deepseek-v4-flash (aliases: deepseek-v4-flash-0731, deepseek, dsv4)
 
 Hermes frontends:
   --desktop              Hermes Desktop + Bot Mode (default)
@@ -53,15 +56,21 @@ Harness options:
   --local-client-context N
   --local-port-base N
   --bot-prefix NAME      Profile prefix (default: pushbutton)
+  --web-search-backend NAME   Hermes web_search backend (default: exa)
+  --web-extract-backend NAME  Hermes web_extract backend (default: firecrawl)
   --local-keep-servers   Keep llama.cpp servers after Hermes exits
   -h, --help
 
 Creates/updates these durable Hermes profiles:
-  <prefix>-manager   project-manager/orchestrator (Sonnet-role model)
-  <prefix>-fast      reconnaissance/triage (Haiku-role model)
-  <prefix>-coder     implementation (Sonnet-role model)
-  <prefix>-reviewer  correctness/review (Opus-role model)
-  <prefix>-deep      architecture/debugging (Fable-role model)
+  <prefix>-manager   project-manager/orchestrator (Sonnet-role model, high effort)
+  <prefix>-fast      reconnaissance/triage (Haiku-role model, low effort)
+  <prefix>-coder     implementation (Sonnet-role model, high effort)
+  <prefix>-reviewer  correctness/review (Opus-role model, max effort)
+  <prefix>-deep      architecture/debugging (Fable-role model, max effort)
+
+Web defaults use Exa for discovery and Firecrawl for extraction. Override with
+HERMES_LOCAL_WEB_SEARCH_BACKEND / HERMES_LOCAL_WEB_EXTRACT_BACKEND or the CLI
+flags above. Set searxng + firecrawl with self-hosted URLs for a private stack.
 EOF
 }
 
@@ -355,13 +364,18 @@ ensure_profile() {
 }
 
 configure_profile() {
-    local name="$1" model_id="$2" url="$3"
+    local name="$1" model_id="$2" url="$3" effort="$4"
     hermes -p "$name" config set model.provider custom >/dev/null
     hermes -p "$name" config set model.default "$model_id" >/dev/null
     hermes -p "$name" config set model.base_url "$url" >/dev/null
     hermes -p "$name" config set model.api_mode chat_completions >/dev/null
     hermes -p "$name" config set model.context_length "$CLIENT_CTX" >/dev/null
     hermes -p "$name" config set terminal.cwd . >/dev/null
+    hermes -p "$name" config set agent.reasoning_effort "$effort" >/dev/null || true
+    hermes -p "$name" config set web.search_backend "$WEB_SEARCH_BACKEND" >/dev/null || true
+    hermes -p "$name" config set web.extract_backend "$WEB_EXTRACT_BACKEND" >/dev/null || true
+    hermes -p "$name" config set web.keyless_fallback true >/dev/null || true
+    hermes -p "$name" config set web.keyless_rescue true >/dev/null || true
     # Local llama-server ignores auth; setting a profile-local placeholder avoids
     # clients that insist on a non-empty Authorization token.
     hermes -p "$name" config set OPENAI_API_KEY pushbutton-local >/dev/null
@@ -384,17 +398,17 @@ configure_bots() {
     ensure_profile "$reviewer" "Independent reviewer for correctness, regressions, security, edge cases, and missing tests."
     ensure_profile "$deep" "Deep architecture, difficult debugging, root-cause analysis, and second-solution specialist."
 
-    configure_profile "$manager" "$sonnet" "$(backend_url "$sonnet")"
-    configure_profile "$fast" "$haiku" "$(backend_url "$haiku")"
-    configure_profile "$coder" "$sonnet" "$(backend_url "$sonnet")"
-    configure_profile "$reviewer" "$opus" "$(backend_url "$opus")"
-    configure_profile "$deep" "$fable" "$(backend_url "$fable")"
+    configure_profile "$manager" "$sonnet" "$(backend_url "$sonnet")" high
+    configure_profile "$fast" "$haiku" "$(backend_url "$haiku")" low
+    configure_profile "$coder" "$sonnet" "$(backend_url "$sonnet")" high
+    configure_profile "$reviewer" "$opus" "$(backend_url "$opus")" max
+    configure_profile "$deep" "$fable" "$(backend_url "$fable")" max
 
-    write_soul_if_missing "$manager" "You are the Pushbutton project manager. Prefer decomposition, delegation, explicit dependencies, and integration over doing every task yourself. Use the named specialist Bots when collaboration improves speed or correctness. Preserve human control over consequential actions."
-    write_soul_if_missing "$fast" "You are the Pushbutton fast reconnaissance specialist. Gather facts quickly, inspect relevant state, and return concise actionable findings."
-    write_soul_if_missing "$coder" "You are the Pushbutton implementation specialist. Make coherent minimal changes, test them, and report concrete results and remaining risks."
-    write_soul_if_missing "$reviewer" "You are the Pushbutton independent reviewer. Look for correctness bugs, regressions, security and concurrency hazards, compatibility problems, and missing tests."
-    write_soul_if_missing "$deep" "You are the Pushbutton deep-analysis specialist. Solve difficult architecture and debugging problems from first principles, test assumptions, and compare alternatives."
+    write_soul_if_missing "$manager" "You are the Pushbutton project manager. Prefer decomposition, delegation, explicit dependencies, and integration over doing every task yourself. Use the named specialist Bots when collaboration improves speed or correctness. Search current primary sources when a decision depends on changing external facts. Preserve human control over consequential actions."
+    write_soul_if_missing "$fast" "You are the Pushbutton fast reconnaissance specialist. Gather facts quickly, inspect relevant state, search current sources when needed, and return concise actionable findings with source URLs."
+    write_soul_if_missing "$coder" "You are the Pushbutton implementation specialist. Make coherent minimal changes, test them, and report concrete results and remaining risks. Search upstream documentation or issues when behavior is version-dependent."
+    write_soul_if_missing "$reviewer" "You are the Pushbutton independent reviewer. Look for correctness bugs, regressions, security and concurrency hazards, compatibility problems, and missing tests. Verify changing external claims against primary sources."
+    write_soul_if_missing "$deep" "You are the Pushbutton deep-analysis specialist. Solve difficult architecture and debugging problems from first principles, test assumptions, compare alternatives, and use primary-source web research when it materially improves the answer."
 
     # Configure durable Kanban routing in the manager profile. Hermes' built-in
     # decomposer uses profile descriptions to select workers.
@@ -407,6 +421,7 @@ configure_bots() {
 
     MANAGER_PROFILE="$manager"
     say "Hermes Bot roster ready: $manager, $fast, $coder, $reviewer, $deep"
+    say "Web tools: search=$WEB_SEARCH_BACKEND extract=$WEB_EXTRACT_BACKEND"
 }
 
 launch_hermes() {
@@ -440,6 +455,8 @@ while (($#)); do
         --local-client-context) [[ $# -ge 2 ]] || die "--local-client-context needs a value"; CLIENT_CTX="$2"; shift 2 ;;
         --local-port-base) [[ $# -ge 2 ]] || die "--local-port-base needs a value"; PORT_BASE="$2"; shift 2 ;;
         --bot-prefix) [[ $# -ge 2 ]] || die "--bot-prefix needs a name"; BOT_PREFIX="$2"; shift 2 ;;
+        --web-search-backend) [[ $# -ge 2 ]] || die "--web-search-backend needs a name"; WEB_SEARCH_BACKEND="$2"; shift 2 ;;
+        --web-extract-backend) [[ $# -ge 2 ]] || die "--web-extract-backend needs a name"; WEB_EXTRACT_BACKEND="$2"; shift 2 ;;
         --local-keep-servers) KEEP_SERVERS=1; shift ;;
         -*) die "unknown option: $1" ;;
         *) MODELS+=("$1"); shift ;;

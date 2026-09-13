@@ -96,12 +96,16 @@ class Profile:
 ALIASES = {
     "qwen3.8:27b": "qwen3.8:27b", "qwen3.8-27b": "qwen3.8:27b", "q38": "qwen3.8:27b",
     "qwen3.8": "qwen3.8:27b", "qwen38": "qwen3.8:27b",
+    "qwen3.8-flash-next": "qwen3.8-flash-next", "qwen3.8:flash-next": "qwen3.8-flash-next",
+    "qwen38-flash-next": "qwen3.8-flash-next", "qwen38next": "qwen3.8-flash-next", "q38next": "qwen3.8-flash-next",
     "qwen3.6:35b": "qwen3.6:35b", "qwen3.6-35b": "qwen3.6:35b", "q36": "qwen3.6:35b",
     "qwen3.6": "qwen3.6:35b", "qwen36": "qwen3.6:35b",
     "nemotron-3.5-lightning": "nemotron-3.5-lightning", "nemotron3.5-lightning": "nemotron-3.5-lightning",
     "nemotron": "nemotron-3.5-lightning", "nemotron-lightning": "nemotron-3.5-lightning",
     "glm-5.3-flash": "glm-5.3-flash", "glm5.3-flash": "glm-5.3-flash", "glm53": "glm-5.3-flash",
     "glm": "glm-5.3-flash",
+    "deepseek-v4-flash": "deepseek-v4-flash", "deepseek-v4-flash-0731": "deepseek-v4-flash",
+    "deepseek-v4": "deepseek-v4-flash", "deepseek": "deepseek-v4-flash", "dsv4": "deepseek-v4-flash",
 }
 
 # required_mib includes model weights, full native context at the listed KV
@@ -116,6 +120,14 @@ PROFILES: dict[str, tuple[Profile, ...]] = {
         Profile("qwen3.8:27b", "Qwen3.8 27B", "ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF", "IQ3_XXS", 15000, 91, template="qwen-fixed", note="full-context 16 GB profile"),
         Profile("qwen3.8:27b", "Qwen3.8 27B", "ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF", "IQ2_S", 14200, 86, template="qwen-fixed", note="lower-bit fallback with extra VRAM margin"),
         Profile("qwen3.8:27b", "Qwen3.8 27B", "ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF", "IQ2_XS", 13500, 80, template="qwen-fixed"),
+    ),
+    "qwen3.8-flash-next": (
+        Profile("qwen3.8-flash-next", "Qwen3.8 Flash Next", "unsloth/Qwen3.8-Flash-Next-GGUF", "UD-Q4_K_XL", 136*1024, 100, batch=256, ubatch=128, note="quality tier for >128 GB practical free VRAM; stock llama.cpp, no MTP"),
+        Profile("qwen3.8-flash-next", "Qwen3.8 Flash Next", "unsloth/Qwen3.8-Flash-Next-GGUF", "UD-IQ4_XS", 116*1024, 97, batch=256, ubatch=128, note="recommended stable 4x32 GB V100 profile at 256K context; MTP disabled"),
+        Profile("qwen3.8-flash-next", "Qwen3.8 Flash Next", "unsloth/Qwen3.8-Flash-Next-GGUF", "UD-Q3_K_XL", 112*1024, 94, batch=256, ubatch=128, note="high-headroom 4x32 GB profile"),
+        Profile("qwen3.8-flash-next", "Qwen3.8 Flash Next", "unsloth/Qwen3.8-Flash-Next-GGUF", "UD-IQ3_XXS", 104*1024, 91, batch=256, ubatch=128, note="balanced fallback"),
+        Profile("qwen3.8-flash-next", "Qwen3.8 Flash Next", "unsloth/Qwen3.8-Flash-Next-GGUF", "UD-Q2_K_XL", 99*1024, 86, batch=256, ubatch=128, note="maximum-headroom 4x32 GB fallback"),
+        Profile("qwen3.8-flash-next", "Qwen3.8 Flash Next", "unsloth/Qwen3.8-Flash-Next-GGUF", "UD-IQ1_M", 94*1024, 80, batch=256, ubatch=128, note="low-bit fallback"),
     ),
     "qwen3.6:35b": (
         Profile("qwen3.6:35b", "Qwen3.6 35B-A3B", "unsloth/Qwen3.6-35B-A3B-GGUF", "UD-Q6_K", 35*1024, 100, template="qwen-fixed"),
@@ -133,6 +145,12 @@ PROFILES: dict[str, tuple[Profile, ...]] = {
     "glm-5.3-flash": (
         Profile("glm-5.3-flash", "GLM-5.3-Flash", "unsloth/GLM-5.3-Flash-GGUF", "UD-IQ2_XXS", 120*1024, 94, flash_attn="off", build="glm53", extra_env=(("NVIDIA_TF32_OVERRIDE", "0"),), note="requires current GLM5Next llama.cpp fork"),
         Profile("glm-5.3-flash", "GLM-5.3-Flash", "unsloth/GLM-5.3-Flash-GGUF", "UD-IQ1_M", 112*1024, 87, flash_attn="off", build="glm53", extra_env=(("NVIDIA_TF32_OVERRIDE", "0"),), note="requires current GLM5Next llama.cpp fork"),
+    ),
+    "deepseek-v4-flash": (
+        Profile("deepseek-v4-flash", "DeepSeek V4 Flash 0731", "unsloth/DeepSeek-V4-Flash-0731-GGUF", "UD-IQ3_XXS", 132*1024, 95, batch=256, ubatch=128, note="quality tier; requires >128 GB practical free VRAM at 256K context"),
+        Profile("deepseek-v4-flash", "DeepSeek V4 Flash 0731", "unsloth/DeepSeek-V4-Flash-0731-GGUF", "UD-IQ2_XXS", 112*1024, 91, batch=256, ubatch=128, note="recommended 4x32 GB V100 baseline at 256K context"),
+        Profile("deepseek-v4-flash", "DeepSeek V4 Flash 0731", "unsloth/DeepSeek-V4-Flash-0731-GGUF", "UD-IQ1_M", 106*1024, 85, batch=256, ubatch=128, note="extra-headroom fallback"),
+        Profile("deepseek-v4-flash", "DeepSeek V4 Flash 0731", "unsloth/DeepSeek-V4-Flash-0731-GGUF", "UD-IQ1_S", 101*1024, 80, batch=256, ubatch=128, note="maximum-headroom fallback"),
     ),
 }
 
