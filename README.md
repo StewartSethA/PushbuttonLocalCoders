@@ -110,7 +110,7 @@ independent mini-SWE trajectory per planned backend.
 
 ## Replica-aware multi-GPU examples
 
-### 8x V100 32 GB: two independent Flash-Next coders
+### 8x V100 32 GB: recommended two-agent high-end layout
 
 ```bash
 qwen-local qwen3.8-flash-next --agents 2
@@ -126,7 +126,7 @@ opencode-local qwen3.8-flash-next --agents 2
 deepseek-local qwen3.8-flash-next --agents 2
 ```
 
-### 8x V100 32 GB: four heterogeneous coders + one spare GPU
+### 8x V100 32 GB: recommended four-agent heterogeneous layout
 
 ```bash
 qwen-local \
@@ -140,6 +140,24 @@ qwen-local \
 Target placement: 4 + 1 + 1 + 1 GPUs, deliberately preserving one V100 for
 other work. The planner treats tiny quant-quality differences as less important
 than preserving a useful spare GPU when quality is otherwise close.
+
+### 8x V100 32 GB: two different large models
+
+DeepSeek + Flash-Next:
+
+```bash
+qwen-local deepseek-v4-flash qwen3.8-flash-next --agents 2
+```
+
+GLM + Flash-Next:
+
+```bash
+qwen-local glm-5.3-flash qwen3.8-flash-next --agents 2
+```
+
+These are large-model alternatives, not additions to the four-agent mixed
+layout: each large model can consume roughly four 32 GB V100s at the selected
+full-context profile.
 
 ---
 
