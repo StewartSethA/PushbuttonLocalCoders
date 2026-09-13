@@ -1,0 +1,30 @@
+name: hermes-local tests
+
+on:
+  pull_request:
+    paths:
+      - hermes-local
+      - install-hermes-local.sh
+      - HERMES_LOCAL.md
+      - lib/claude_local_plan.py
+      - lib/claude_local_hostcc.sh
+      - .github/workflows/hermes-local-tests.yml
+  push:
+    paths:
+      - hermes-local
+      - install-hermes-local.sh
+      - lib/claude_local_plan.py
+      - lib/claude_local_hostcc.sh
+      - .github/workflows/hermes-local-tests.yml
+
+jobs:
+  static-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bash syntax
+        run: bash -n hermes-local install-hermes-local.sh lib/claude_local_hostcc.sh
+      - name: Help path
+        run: bash hermes-local --help >/tmp/hermes-local-help.txt && grep -q 'Hermes Desktop' /tmp/hermes-local-help.txt
+      - name: Python syntax
+        run: python3 -m py_compile lib/claude_local_plan.py
