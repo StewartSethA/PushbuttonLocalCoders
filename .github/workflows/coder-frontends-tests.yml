@@ -49,3 +49,19 @@ jobs:
           export PATH="$HOME/.opencode/bin:$HOME/.local/bin:$PATH"
           opencode --version
           opencode --help >/dev/null
+  deepseek-harness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Wrapper syntax
+        run: bash -n deepseek-local
+      - name: Install official DeepSeek Harness
+        run: |
+          npm install -g @deepseek-ai/dsh pnpm
+          dsh --version
+          dsh --help >/dev/null
+      - name: Compose TUI profile
+        run: |
+          export DSH_HOME="$RUNNER_TEMP/dsh"
+          dsh plugin --profile tui add @dsh-tui/dsh-tui
+          dsh --profile tui --dump-config >/dev/null

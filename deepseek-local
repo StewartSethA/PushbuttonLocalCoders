@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# deepseek-local — replica-aware DeepSeek Harness frontend over coder-local.
+set -euo pipefail
+SELF="${BASH_SOURCE[0]}"; command -v readlink >/dev/null 2>&1 && SELF="$(readlink -f "$SELF" 2>/dev/null || printf '%s' "$SELF")"
+ROOT="$(cd "$(dirname "$SELF")" && pwd)"
+STATE_DIR="${CLAUDE_LOCAL_STATE:-$HOME/.local/share/pushbutton/claude-local}"
+export DSH_HOME="${DSH_HOME:-$STATE_DIR/frontends/deepseek/dsh}"
+have(){ command -v "$1" >/dev/null 2>&1; }
+if ! have npm; then echo "deepseek-local requires Node.js/npm" >&2; exit 1; fi
+if ! have dsh; then
+  echo "[deepseek-local] Installing official DeepSeek Harness CLI..."
+  npm install -g @deepseek-ai/dsh
+fi
+have dsh || { echo "dsh install failed" >&2; exit 1; }
+if ! have pnpm; then
+  if have corepack; then corepack enable pnpm 2>/dev/null || true; fi
+  have pnpm || npm install -g pnpm
+fi
+profile_pkg="$DSH_HOME/profiles/tui/package.json"
+if [[ ! -f "$profile_pkg" ]] || ! grep -q 'dsh-tui' "$profile_pkg"; then
+  echo "[deepseek-local] Installing DeepSeek Harness TUI profile..."
+  dsh plugin --profile tui add @dsh-tui/dsh-tui
+fi
+shim="$STATE_DIR/frontends/deepseek/shim"; mkdir -p "$shim"
+cat >"$shim/qwen" <<INNER
+#!/usr/bin/env bash
+set -euo pipefail
+state="\${CLAUDE_LOCAL_STATE:-\$HOME/.local/share/pushbutton/claude-local}"
+lb_py=$(printf '%q' "$ROOT/lib/coder_local_lb.py")
+mkdir -p "\$state/frontends/deepseek"
+config="\$state/frontends/deepseek/replicas.json"
+python3 - "\$QWEN_HOME/settings.json" "\$config" <<'PY'
+import json,sys
+q=json.load(open(sys.argv[1])); ms=q['modelProviders']['openai']
+obj={'backends':[{'name':f'worker-{i}','url':m['baseUrl'],'alias':m['id'],'model':m['id'],'timeout':3600} for i,m in enumerate(ms,1)]}
+open(sys.argv[2],'w').write(json.dumps(obj,indent=2)+'\n')
+PY
+port="\$(python3 - <<'PY'
+import socket
+for p in range(22180,22380):
+ s=socket.socket()
+ try:s.bind(('127.0.0.1',p));print(p);break
+ except OSError:pass
+ finally:s.close()
+PY
+)"
+python3 "\$lb_py" --config "\$config" --port "\$port" & lbpid=\$!
+trap 'kill "\$lbpid" 2>/dev/null || true' EXIT INT TERM
+for _ in \$(seq 1 50); do curl -fsS "http://127.0.0.1:\$port/health" >/dev/null 2>&1 && break; sleep .1; done
+export DEEPSEEK_BASE_URL="http://127.0.0.1:\$port/v1" DEEPSEEK_API_KEY=pushbutton-local
+resume=0
+while ((\$#)); do case "\$1" in --resume) resume=1;shift;; --auth-type|--model) shift 2;; *) shift;; esac; done
+args=(--profile tui)
+if ((resume)); then echo "[deepseek-local] Use /resume in the TUI to select the persisted session." >&2; fi
+exec dsh "\${args[@]}"
+INNER
+chmod +x "$shim/qwen"
+export PATH="$shim:$PATH"
+exec "$ROOT/coder-local" --frontend qwen "$@"
