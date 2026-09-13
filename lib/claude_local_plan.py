@@ -102,6 +102,8 @@ ALIASES = {
     "nemotron": "nemotron-3.5-lightning", "nemotron-lightning": "nemotron-3.5-lightning",
     "glm-5.3-flash": "glm-5.3-flash", "glm5.3-flash": "glm-5.3-flash", "glm53": "glm-5.3-flash",
     "glm": "glm-5.3-flash",
+    "deepseek-v4-flash": "deepseek-v4-flash", "deepseek-v4-flash-0731": "deepseek-v4-flash",
+    "deepseek-v4": "deepseek-v4-flash", "deepseek": "deepseek-v4-flash", "dsv4": "deepseek-v4-flash",
 }
 
 # required_mib includes model weights, full native context at the listed KV
@@ -133,6 +135,12 @@ PROFILES: dict[str, tuple[Profile, ...]] = {
     "glm-5.3-flash": (
         Profile("glm-5.3-flash", "GLM-5.3-Flash", "unsloth/GLM-5.3-Flash-GGUF", "UD-IQ2_XXS", 120*1024, 94, flash_attn="off", build="glm53", extra_env=(("NVIDIA_TF32_OVERRIDE", "0"),), note="requires current GLM5Next llama.cpp fork"),
         Profile("glm-5.3-flash", "GLM-5.3-Flash", "unsloth/GLM-5.3-Flash-GGUF", "UD-IQ1_M", 112*1024, 87, flash_attn="off", build="glm53", extra_env=(("NVIDIA_TF32_OVERRIDE", "0"),), note="requires current GLM5Next llama.cpp fork"),
+    ),
+    "deepseek-v4-flash": (
+        Profile("deepseek-v4-flash", "DeepSeek V4 Flash 0731", "unsloth/DeepSeek-V4-Flash-0731-GGUF", "UD-IQ3_XXS", 132*1024, 95, batch=256, ubatch=128, note="quality tier; requires >128 GB practical free VRAM at 256K context"),
+        Profile("deepseek-v4-flash", "DeepSeek V4 Flash 0731", "unsloth/DeepSeek-V4-Flash-0731-GGUF", "UD-IQ2_XXS", 112*1024, 91, batch=256, ubatch=128, note="recommended 4x32 GB V100 baseline at 256K context"),
+        Profile("deepseek-v4-flash", "DeepSeek V4 Flash 0731", "unsloth/DeepSeek-V4-Flash-0731-GGUF", "UD-IQ1_M", 106*1024, 85, batch=256, ubatch=128, note="extra-headroom fallback"),
+        Profile("deepseek-v4-flash", "DeepSeek V4 Flash 0731", "unsloth/DeepSeek-V4-Flash-0731-GGUF", "UD-IQ1_S", 101*1024, 80, batch=256, ubatch=128, note="maximum-headroom fallback"),
     ),
 }
 
