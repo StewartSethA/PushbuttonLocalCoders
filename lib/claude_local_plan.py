@@ -96,6 +96,8 @@ class Profile:
 ALIASES = {
     "qwen3.8:27b": "qwen3.8:27b", "qwen3.8-27b": "qwen3.8:27b", "q38": "qwen3.8:27b",
     "qwen3.8": "qwen3.8:27b", "qwen38": "qwen3.8:27b",
+    "qwen3.8-flash-next": "qwen3.8-flash-next", "qwen3.8:flash-next": "qwen3.8-flash-next",
+    "qwen38-flash-next": "qwen3.8-flash-next", "qwen38next": "qwen3.8-flash-next", "q38next": "qwen3.8-flash-next",
     "qwen3.6:35b": "qwen3.6:35b", "qwen3.6-35b": "qwen3.6:35b", "q36": "qwen3.6:35b",
     "qwen3.6": "qwen3.6:35b", "qwen36": "qwen3.6:35b",
     "nemotron-3.5-lightning": "nemotron-3.5-lightning", "nemotron3.5-lightning": "nemotron-3.5-lightning",
@@ -118,6 +120,14 @@ PROFILES: dict[str, tuple[Profile, ...]] = {
         Profile("qwen3.8:27b", "Qwen3.8 27B", "ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF", "IQ3_XXS", 15000, 91, template="qwen-fixed", note="full-context 16 GB profile"),
         Profile("qwen3.8:27b", "Qwen3.8 27B", "ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF", "IQ2_S", 14200, 86, template="qwen-fixed", note="lower-bit fallback with extra VRAM margin"),
         Profile("qwen3.8:27b", "Qwen3.8 27B", "ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF", "IQ2_XS", 13500, 80, template="qwen-fixed"),
+    ),
+    "qwen3.8-flash-next": (
+        Profile("qwen3.8-flash-next", "Qwen3.8 Flash Next", "unsloth/Qwen3.8-Flash-Next-GGUF", "UD-Q4_K_XL", 136*1024, 100, batch=256, ubatch=128, note="quality tier for >128 GB practical free VRAM; stock llama.cpp, no MTP"),
+        Profile("qwen3.8-flash-next", "Qwen3.8 Flash Next", "unsloth/Qwen3.8-Flash-Next-GGUF", "UD-IQ4_XS", 116*1024, 97, batch=256, ubatch=128, note="recommended stable 4x32 GB V100 profile at 256K context; MTP disabled"),
+        Profile("qwen3.8-flash-next", "Qwen3.8 Flash Next", "unsloth/Qwen3.8-Flash-Next-GGUF", "UD-Q3_K_XL", 112*1024, 94, batch=256, ubatch=128, note="high-headroom 4x32 GB profile"),
+        Profile("qwen3.8-flash-next", "Qwen3.8 Flash Next", "unsloth/Qwen3.8-Flash-Next-GGUF", "UD-IQ3_XXS", 104*1024, 91, batch=256, ubatch=128, note="balanced fallback"),
+        Profile("qwen3.8-flash-next", "Qwen3.8 Flash Next", "unsloth/Qwen3.8-Flash-Next-GGUF", "UD-Q2_K_XL", 99*1024, 86, batch=256, ubatch=128, note="maximum-headroom 4x32 GB fallback"),
+        Profile("qwen3.8-flash-next", "Qwen3.8 Flash Next", "unsloth/Qwen3.8-Flash-Next-GGUF", "UD-IQ1_M", 94*1024, 80, batch=256, ubatch=128, note="low-bit fallback"),
     ),
     "qwen3.6:35b": (
         Profile("qwen3.6:35b", "Qwen3.6 35B-A3B", "unsloth/Qwen3.6-35B-A3B-GGUF", "UD-Q6_K", 35*1024, 100, template="qwen-fixed"),
