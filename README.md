@@ -1,326 +1,328 @@
 # Pushbutton Local Coders
 
 > **Pick local models. Pushbutton handles the hardware.**
-> `claude-local` turns one or more local models into a hardware-aware Claude Code
-> team: it selects GPUs, quants, context/cache settings and ports, provisions
-> CUDA/nvcc and llama.cpp when needed, and keeps the session local.
+>
+> Run local coding agents through Claude Code, Hermes Bot Mode, Qwen Code,
+> OpenCode, DeepSeek Harness, or mini-SWE-agent without hand-picking GGUF quants,
+> CUDA toolkits, GPU splits, or ports.
 
----
+## Install
 
-## 🚀 Recommended: `claude-local`
-
-### Test this PR now
-
-Until PR #9 is merged, this one-liner installs/updates the PR branch and launches
-Qwen3.6-35B-A3B using the best fitting local profile for the machine:
+Claude Code frontend:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/StewartSethA/PushbuttonLocalCoders/refs/heads/feature/claude-local-harness/install-claude-local.sh \
-  | PUSHBUTTON_REF=feature/claude-local-harness bash -s -- qwen3.6:35b
+curl -fL https://raw.githubusercontent.com/StewartSethA/PushbuttonLocalCoders/main/install-claude-local.sh \
+  | bash -s -- --system
 ```
 
-To inspect the hardware/model plan without downloading or starting a model:
+Hermes Bot Mode frontend:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/StewartSethA/PushbuttonLocalCoders/refs/heads/feature/claude-local-harness/install-claude-local.sh \
-  | PUSHBUTTON_REF=feature/claude-local-harness bash -s -- \
-    qwen3.6:35b qwen3.8:27b --local-dry-run
+curl -fL https://raw.githubusercontent.com/StewartSethA/PushbuttonLocalCoders/main/install-hermes-local.sh \
+  | bash -s -- --system
 ```
 
-### After merge
-
-Install the command once:
+Replica-aware coder frontends (Qwen Code, OpenCode, DeepSeek Harness, mini-SWE):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/StewartSethA/PushbuttonLocalCoders/main/install-claude-local.sh | bash
+curl -fL https://raw.githubusercontent.com/StewartSethA/PushbuttonLocalCoders/main/install-coder-local.sh \
+  | bash -s -- --system
 ```
 
-Then use it from any project directory:
+The model cache, CUDA toolkits, llama.cpp builds, and hardware state are shared
+under the same Pushbutton state/cache directories.
+
+## Models
+
+Current built-in model selectors include:
+
+```text
+qwen3.8-flash-next
+qwen3.8:27b
+qwen3.6:35b
+nemotron-3.5-lightning
+deepseek-v4-flash
+glm-5.3-flash
+```
+
+You choose the model family. Pushbutton chooses the concrete GGUF profile that
+fits the live hardware and free VRAM.
+
+## Same hardware, different frontend
+
+For the replica-aware coding CLIs, change only the command name:
 
 ```bash
-# Let Pushbutton choose a fast local default
-claude-local
+qwen-local     qwen3.8-flash-next --agents 2
+opencode-local qwen3.8-flash-next --agents 2
+deepseek-local qwen3.8-flash-next --agents 2
+```
 
-# One model for all Claude roles
+All three request two independent model replicas. On an otherwise-free 8x V100
+32 GB machine, the planner targets two 4-GPU Flash-Next workers rather than one
+8-GPU server with serialized agents.
+
+mini-SWE-agent is intentionally different because upstream mini-SWE is a single
+autonomous trajectory rather than a nested-subagent frontend. Use parallel swarm
+mode to run one independent trajectory per replica:
+
+```bash
+mini-swe-local qwen3.8-flash-next --agents 2 \
+  --swarm "Fix the failing tests, find the root cause, implement a minimal repair, and verify it."
+```
+
+For an interactive single mini-SWE trajectory:
+
+```bash
+mini-swe-local qwen3.8-flash-next
+```
+
+Extra replicas do not accelerate one interactive mini-SWE trajectory; `--swarm`
+is what makes them concurrent.
+
+## 8x V100 examples
+
+### Two strong independent Flash-Next coders: 4 + 4 GPUs
+
+```bash
+qwen-local qwen3.8-flash-next --agents 2
+```
+
+Equivalent frontend changes:
+
+```bash
+opencode-local qwen3.8-flash-next --agents 2
+deepseek-local qwen3.8-flash-next --agents 2
+mini-swe-local qwen3.8-flash-next --agents 2 --swarm "<task>"
+```
+
+### Four heterogeneous coders: 4 + 1 + 1 + 1 GPUs, one V100 spare
+
+```bash
+qwen-local \
+  qwen3.8-flash-next \
+  qwen3.8:27b \
+  qwen3.6:35b \
+  nemotron-3.5-lightning \
+  --agents 4
+```
+
+The intended topology on 8x V100 32 GB is:
+
+```text
+worker 1: Qwen3.8-Flash-Next   -> 4 GPUs
+worker 2: Qwen3.8 27B          -> 1 GPU
+worker 3: Qwen3.6 35B-A3B      -> 1 GPU
+worker 4: Nemotron 3.5         -> 1 GPU
+spare                           -> 1 GPU
+```
+
+Use the same model list with `opencode-local` or `deepseek-local` to change the
+coding frontend while preserving the hardware plan.
+
+## Frontend behavior
+
+| Command | Frontend | Multi-agent behavior |
+|---|---|---|
+| `claude-local` | Claude Code | Claude subagents / role models |
+| `hermes-local` | Hermes Desktop / CLI | durable Bot profiles + manager/orchestrator |
+| `qwen-local` | Qwen Code | native Agent Team + per-agent local model endpoints |
+| `opencode-local` | OpenCode | primary orchestrator + per-subagent model endpoints |
+| `deepseek-local` | DeepSeek Harness | replica pool behind the DeepSeek TUI |
+| `mini-swe-local` | mini-SWE-agent | independent parallel trajectories in `--swarm` mode |
+
+Qwen Code and OpenCode are the cleanest native matches for heterogeneous local
+subagents because both can bind different workers to different model endpoints.
+DeepSeek Harness currently consumes a replica pool through the local OpenAI
+router. mini-SWE is best treated as a race/ensemble of autonomous trajectories,
+not as a nested-subagent UI.
+
+## Claude Code
+
+One local model for all Claude roles:
+
+```bash
 claude-local qwen3.6:35b
+```
 
-# Keep normal Claude Code flags
+Resume the current project's Claude Code session:
+
+```bash
 claude-local qwen3.6:35b --resume
+```
 
-# Four explicitly selected local role models:
-# Haiku, Sonnet (daily driver), Opus, Fable
+Four positional role models (Haiku, Sonnet, Opus, Fable):
+
+```bash
 claude-local \
   nemotron-3.5-lightning \
   qwen3.6:35b \
   qwen3.8:27b \
-  glm-5.3-flash \
+  qwen3.8-flash-next \
   --resume
 ```
 
-Model order is positional:
+Claude Code receives local `local-fast`, `local-coder`, `local-reviewer`, and
+`local-deep` subagents. `claude-local` has no cloud fallback.
 
-| Models supplied | Claude role mapping |
-|---|---|
-| 1 | Haiku = Sonnet = Opus = Fable |
-| 2 | Haiku = #1; Sonnet/Opus/Fable = #2 |
-| 3 | Haiku = #1; Sonnet = #2; Opus/Fable = #3 |
-| 4 | Haiku, Sonnet, Opus, Fable respectively |
+## Hermes Bot Mode
 
-Current built-in model families are `qwen3.6:35b`, `qwen3.8:27b`,
-`nemotron-3.5-lightning`, and `glm-5.3-flash`. Users choose model families;
-Pushbutton chooses the concrete GGUF quant and placement.
+Launch Hermes Desktop Bot Mode:
 
-### What `claude-local` automates
+```bash
+hermes-local qwen3.6:35b
+```
 
-- inventories each NVIDIA GPU independently, including **currently free VRAM**, compute capability and negotiated PCIe generation/width
-- for one model, prefers the **freest viable GPU**, breaking ties by PCIe link speed
-- for several models, **plans the complete disjoint GPU assignment before launching anything**, avoiding greedy placements that strand a later model
-- prefers one-GPU residency and preserves spare GPUs for parallel agents; uses llama.cpp layer splitting only when needed
-- selects curated model quants, Q4/Q4 KV where appropriate, and a **262,144-token physical context** by default
-- gives Claude Code a conservative 200,000-token client budget so auto-compaction occurs before the physical backend ceiling
-- installs build dependencies, Claude Code and a private compatible CUDA toolkit/nvcc when the host lacks a suitable one
-- builds CUDA llama.cpp for the actual compute capabilities in the selected GPU plan (for example SM70 V100 + SM89 Ada)
-- downloads/caches the selected GGUF automatically
-- applies the fixed Qwen agent/tool Jinja template for Qwen3.6/3.8
-- auto-selects free backend and gateway ports so multiple running instances can coexist
-- exposes local Anthropic-compatible routing for Claude Code and injects `local-fast`, `local-coder`, `local-reviewer`, and `local-deep` subagents
-- has **no cloud fallback** in the `claude-local` path; CUDA unified-memory spill is disabled unless explicitly requested
+Or use the terminal UI:
 
-Useful commands:
+```bash
+hermes-local qwen3.6:35b --tui
+hermes-local qwen3.6:35b --tui --resume
+```
+
+Hermes creates durable profiles such as:
+
+```text
+pushbutton-manager
+pushbutton-fast
+pushbutton-coder
+pushbutton-reviewer
+pushbutton-deep
+```
+
+The manager delegates to the specialist Bots. Their memories/profiles persist;
+Pushbutton updates only the local endpoint/model wiring when the hardware plan
+changes.
+
+## Qwen Code
+
+```bash
+# One coder
+qwen-local qwen3.8:27b
+
+# Two true independent replicas
+qwen-local qwen3.8-flash-next --agents 2
+
+# Four heterogeneous workers
+qwen-local qwen3.8-flash-next qwen3.8:27b qwen3.6:35b nemotron-3.5-lightning --agents 4
+```
+
+Qwen Code Agent Team is enabled and each worker gets its own local endpoint.
+
+## OpenCode
+
+```bash
+opencode-local qwen3.8-flash-next --agents 2
+```
+
+Pushbutton writes a local OpenCode provider/agent configuration with a primary
+orchestrator and separate subagents backed by the allocated local workers.
+
+## DeepSeek Harness
+
+```bash
+deepseek-local deepseek-v4-flash --agents 1
+```
+
+Or put two Flash-Next replicas behind the Harness frontend:
+
+```bash
+deepseek-local qwen3.8-flash-next --agents 2
+```
+
+Pushbutton installs the official `@deepseek-ai/dsh` Harness and its TUI profile,
+then exposes the local replicas through a private OpenAI-compatible router.
+
+## mini-SWE-agent
+
+Interactive:
+
+```bash
+mini-swe-local qwen3.8:27b
+```
+
+Parallel independent repair attempts:
+
+```bash
+mini-swe-local qwen3.8-flash-next --agents 2 --swarm "Fix issue #123 and run the full test suite"
+```
+
+Each swarm worker writes its own run log under the Pushbutton frontend state.
+
+## Replica planner semantics
+
+For the replica-aware coder frontends:
+
+```text
+one model + --agents N  => N independent replicas of that model
+N model names           => one independent worker/backend per model
+N models + --agents N   => explicit heterogeneous N-worker team
+```
+
+Workers receive disjoint GPU sets. The planner minimizes GPU count per worker
+while choosing the best profile that fits its assigned free VRAM. This is what
+allows 8x V100 to become either 2x4-GPU large-model workers or a 4+1+1+1 team.
+
+Each llama.cpp worker currently uses `-np 1`; concurrency comes from independent
+replicas rather than making several agents serialize through one inference slot.
+
+## Web search
+
+Web search is a frontend/tool capability, not part of the model weights.
+Recommended defaults are:
+
+```text
+search/discovery: Exa
+page extraction: Firecrawl
+private search:   SearXNG + self-hosted Firecrawl
+```
+
+Hermes has native web search/extraction. OpenCode also exposes web search/fetch.
+For local-model Claude Code and Qwen Code, use an MCP search provider so web
+research remains independent of the model/API vendor.
+
+See `WEB_SEARCH.md` for details.
+
+## Useful diagnostics
 
 ```bash
 claude-local doctor
 claude-local models
-claude-local qwen3.6:35b qwen3.8:27b --local-dry-run
-claude-local install            # ~/.local/bin/claude-local
-claude-local install --system   # /usr/local/bin/claude-local
+claude-local qwen3.8:27b --local-dry-run
+
+# Replica planner synthetic/self test
+coder-local --self-test
 ```
 
-The new hardware-aware `claude-local` path is currently NVIDIA/Linux-first.
-The existing installer below retains the repository's Ollama, Apple Silicon,
-ROCm, CPU, Docker, benchmarking and network-node workflows.
+All model downloads and llama.cpp startup output are intentionally visible in the
+foreground terminal while services are starting.
 
----
+## Architecture
 
-## General installer / existing workflows
+```text
+claude-local                 Claude Code / Anthropic-wire frontend
+hermes-local                 Hermes Bot Mode frontend
+coder-local                  replica-aware OpenAI-compatible worker launcher
+qwen-local                   Qwen Code frontend
+opencode-local               OpenCode frontend
+deepseek-local               DeepSeek Harness frontend
+mini-swe-local               mini-SWE parallel trajectory frontend
+lib/claude_local_plan.py     role-oriented Claude/Hermes planner
+lib/coder_local_plan.py      replica-aware coding-worker planner
+lib/claude_local_gateway.py  Anthropic-wire local router
+lib/coder_local_lb.py        OpenAI-compatible replica router
+```
 
-The original all-in-one installer remains available:
+The newer hardware-aware launchers are currently NVIDIA/Linux-first. The legacy
+`install.sh` remains available for Ollama, Apple Silicon, ROCm, CPU, Docker,
+benchmarking, and network-node workflows.
+
+## Legacy/general installer
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/StewartSethA/PushbuttonLocalCoders/main/install.sh | bash
 ```
 
-Or clone and run locally:
-
-```bash
-git clone https://github.com/StewartSethA/PushbuttonLocalCoders.git
-cd PushbuttonLocalCoders
-bash install.sh          # "just get me running" mode
-```
-
----
-
-## Modes
-
-| Flag | Description |
-|------|-------------|
-| *(default)* `--quick` | Install Ollama + Claude Code, auto-select and pull the best coder model for your hardware, then drop you into an interactive Claude Code session bridged to that local model |
-| `--explore` | Run rapid model/quant ablations to find the optimal setup for this machine |
-| `--agent` | Wrap a project directory in a sandboxed Docker agent (dangerously-skip-permissions enabled) |
-| `--team` | Launch a full orchestrator + developer agent team via Docker Compose |
-| `--monitor` | Live TUI showing GPU, CPU, VRAM and RAM utilisation |
-| `--benchmark` | Run a short Ollama benchmark, compare actual vs guessed tok/s, and save the runtime profile |
-| `--nodes` | Monitor networked boxes (GPU/CPU/VRAM/RAM over SSH) |
-| `--build-llamacpp` | Build llama.cpp with GPU acceleration (CUDA / Metal / ROCm) and CPU fallback |
-| `--orchestrator` | Start a local multi-agent orchestrator + developer processes |
-| `--submit-benchmarks` | Prepare a system benchmark contribution file (and optionally a PR) with true PP/TG data |
-
-### Examples
-
-```bash
-# Install everything, then jump straight into Claude Code on the local model
-bash install.sh
-
-# Explore optimal model/quant for your hardware
-bash install.sh --explore
-
-# Run a single coding agent on your project
-bash install.sh --agent --project ~/my-project --task "Add unit tests"
-
-# Multi-agent team (orchestrator + 2 developers)
-bash install.sh --team --project ~/my-project --devs 2 --task "Refactor and optimise"
-
-# Live hardware monitor
-bash install.sh --monitor
-
-# Benchmark the current Ollama runtime (GPU by default)
-bash install.sh --benchmark
-
-# Force the post-setup benchmark in quick mode
-bash install.sh --quick --run-benchmark
-
-# Benchmark Ollama in CPU-only mode
-bash install.sh --benchmark --framework ollama-cpu
-
-# Monitor networked GPU boxes
-bash install.sh --nodes
-
-# Scan configured nodes for reachable Ollama instances and their models
-bash install.sh --nodes scan
-
-# Build llama.cpp with GPU support
-bash install.sh --build-llamacpp
-```
-
-### Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `ANTHROPIC_API_KEY` | *(optional)* | Anthropic key for Claude cloud features |
-| `OLLAMA_HOST` | `http://localhost:11434` | Ollama API endpoint |
-| `DEVELOPER_MODEL` | *auto-selected* | Override developer model (Ollama tag) |
-| `ORCHESTRATOR_MODEL` | *auto-selected* | Override orchestrator model |
-| `PUSHBUTTON_CLAUDE_GATEWAY_PORT` | `4000` | LiteLLM bridge port used to connect Claude Code to the local Ollama model |
-| `PUSHBUTTON_PROMPT_FOR_ANTHROPIC_KEY` | `0` | Set to `1` to prompt for an Anthropic API key during setup |
-| `PUSHBUTTON_DIR` | `~/.local/share/pushbutton` | Install directory when run via curl |
-| `RUNTIME_ENV_FILE` | `~/.config/pushbutton/runtime.env` | Saved local runtime profile from the latest benchmark |
-
----
-
-## Architecture
-
-```
-install.sh                  ← Existing all-in-one entry point
-install-claude-local.sh     ← Curl-safe claude-local bootstrap
-claude-local                ← Hardware-aware local Claude Code launcher
-lib/
-  claude_local_plan.py      ← GPU/model/quant/context placement scheduler
-  claude_local_gateway.py   ← Local Anthropic-wire role router
-  detect_hardware.sh        ← GPU/CPU/VRAM/RAM detection (Linux, Mac, Windows)
-  select_model.sh           ← Legacy/general model + quant selection
-  install_ollama.sh         ← Ollama install + service management + model pull
-  install_claude.sh         ← Claude Code install + LiteLLM/Ollama bridge setup
-  install_llamacpp.sh       ← llama.cpp build (CUDA / Metal / ROCm / CPU)
-  ablation.sh               ← Rapid model/quant benchmarking with progress bar
-  benchmark.sh              ← Quick Ollama speed benchmark + runtime persistence
-  tui.sh                    ← TUI helpers: progress bars, spinners, monitor
-  network_nodes.sh          ← SSH-based remote GPU/CPU/RAM monitor + Ollama scan
-  orchestrator.sh           ← Local multi-agent orchestrator
-  docker_agent.sh           ← Docker sandbox wrapper
-agents/
-  Dockerfile.agent          ← Minimal agent container image
-  agent_entrypoint.sh       ← Container entrypoint (task → Ollama)
-  docker-compose.yml        ← Multi-agent Compose file (ollama + orchestrator + developer)
-configs/                    ← User config files (nodes.txt, claude.env, etc.)
-```
-
----
-
-## Model Selection Logic
-
-The general installer's `select_model.sh` keeps its catalogue intentionally modern:
-
-| Model | Purpose | Native Context | Notes |
-|-------|---------|----------------|-------|
-| Qwen 3.6 35B-A3B | Primary coder | 262,144 | Highest-quality default when it fits |
-| Qwen 3.8 27B | Primary coder / fallback | 262,144 | Better fit for smaller single-GPU boxes |
-| Nemotron 3.5 Lightning 30B-A3B | Orchestrator / alternate coder | 262,144 | Fast modern option for routing and coding |
-
-Before any model pull, the general installer:
-
-- prompts for confirmation
-- shows estimated disk pull and active runtime memory
-- shows effective max context for the proposed quant + KV quant
-- lets you choose model quant, KV quant, primary coder, and additional coders from terminal dropdowns
-- records estimated prompt-processing (PP) and token-generation (TG) tok/s, then compares them with measured values after the benchmark run
-
-Override at any time with `--model <tag>` or the `DEVELOPER_MODEL` env var.
-
-### Benchmark contribution flow
-
-Benchmarks are recorded under `~/.config/pushbutton/benchmarks/` and can be staged for contribution back to this repository:
-
-```bash
-bash install.sh --submit-benchmarks
-```
-
-That command writes a PR-ready report under `benchmarks/system/` and, when `gh` is installed, can optionally create a benchmark contribution PR automatically.
-
----
-
-## Quick Benchmark
-
-After `--quick` setup, PushbuttonLocalCoders can immediately prompt to run a short
-benchmark on the selected Ollama runtime. The first pass uses a short 128-token
-prompt and automatically sizes the generation budget from the guessed total speed
-so the run stays under roughly 10 seconds on starter settings.
-
-The benchmark:
-- shows an estimated PP/TG progress bar while it runs
-- compares actual vs guessed prompt-processing and token-generation speeds
-- saves the chosen local runtime profile to `~/.config/pushbutton/runtime.env`
-- can optionally run a longer context sweep capped to a projected runtime below 30 minutes
-
-That saved runtime file is meant to be sourced later by local tooling such as
-Claude Code wrappers or other scripts that need the currently selected local
-model/framework combination.
-
----
-
-## Multi-Agent Docker Sandbox
-
-```bash
-# Single agent with unrestricted file access ("dangerously skip permissions")
-bash install.sh --agent --project ~/my-project --task "Add comprehensive tests"
-
-# Full team: Ollama service + orchestrator + developer in Docker Compose
-ANTHROPIC_API_KEY=sk-... bash install.sh --team --project ~/my-project
-```
-
-The Docker Compose stack:
-- **ollama** — GPU-accelerated inference server (NVIDIA passthrough included)
-- **orchestrator** — plans and delegates tasks (lighter, faster model)
-- **developer** — implements code changes (best-fit coder model)
-
-All containers share the project directory as `/workspace` and
-`DANGEROUSLY_SKIP_PERMISSIONS=true` is set so agents can write freely.
-
----
-
-## Network Node Monitor
-
-Add remote GPU/CPU boxes to `~/.config/pushbutton/nodes.txt` (one IP per line),
-then watch their utilisation in real time or scan them for reachable Ollama models:
-
-```bash
-bash lib/network_nodes.sh add 192.168.1.10
-bash lib/network_nodes.sh scan
-bash lib/network_nodes.sh live
-```
-
-Requires passwordless SSH to the remote hosts as `$USER` (or set `SSH_USER`).
-
----
-
-## Requirements
-
-For `claude-local`:
-
-- Linux with an NVIDIA GPU and working NVIDIA driver
-- `bash`, `curl`, and `git` (the bootstrap installs missing supported dependencies where practical)
-- CUDA toolkit/nvcc do **not** need to be preinstalled; the launcher provisions a compatible private toolkit when needed
-
-For the repository's other workflows:
-
-- **bash** ≥ 4.0
-- **curl** or **wget**
-- **git**
-- Linux, macOS (10.15+), or Windows (WSL2 recommended)
-- For GPU builds: CUDA toolkit (NVIDIA), ROCm (AMD), or Xcode (Apple Silicon)
-- For Docker modes: Docker Engine ≥ 20 / Docker Compose v2
-
----
-
-## Licence
+## License
 
 MIT
