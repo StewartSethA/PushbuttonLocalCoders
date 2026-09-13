@@ -29,7 +29,8 @@ install_wrapper(){
   rm -f "$tmp" 2>/dev/null || true
 }
 
-qwen_body="$(printf '%q' "$DEST/coder-local") --frontend qwen"
+qwen_defaults="$(printf '%q' "$DEST/configs/qwen-local-defaults.json")"
+qwen_body="env QWEN_CODE_SYSTEM_DEFAULTS_PATH=$qwen_defaults $(printf '%q' "$DEST/coder-local") --frontend qwen"
 opencode_body="$(printf '%q' "$DEST/opencode-local")"
 deepseek_body="$(printf '%q' "$DEST/deepseek-local")"
 mini_body="$(printf '%q' "$DEST/mini-swe-local")"
@@ -47,5 +48,10 @@ if ((SYSTEM)); then
 fi
 
 printf '[pushbutton] Installed replica-aware coder frontends: qwen-local, opencode-local, deepseek-local, mini-swe-local\n'
-if (($#)); then exec "$DEST/coder-local" --frontend qwen "$@"; fi
+printf '[pushbutton] Qwen Code web MCP: Exa search + fetch enabled by default\n'
+if (($#)); then
+  export QWEN_CODE_SYSTEM_DEFAULTS_PATH="$DEST/configs/qwen-local-defaults.json"
+  exec "$DEST/coder-local" --frontend qwen "$@"
+fi
+export QWEN_CODE_SYSTEM_DEFAULTS_PATH="$DEST/configs/qwen-local-defaults.json"
 exec "$DEST/coder-local" --frontend qwen --help
