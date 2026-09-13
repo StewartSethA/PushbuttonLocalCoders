@@ -46,7 +46,7 @@ if (( need_hostcc )); then
     source "\$ROOT/lib/claude_local_hostcc.sh"
     claude_local_prepare_hostcc
 fi
-exec "\$ROOT/claude-local" "\$@"
+exec "\$ROOT/lib/claude_local_entry.sh" "\$@"
 EOF
     chmod +x "$tmp"
     if [[ "$target" == /usr/local/bin/* ]]; then
@@ -99,14 +99,15 @@ else
 fi
 
 [[ -x "$DEST/claude-local" ]] || chmod +x "$DEST/claude-local"
+[[ -x "$DEST/lib/claude_local_entry.sh" ]] || chmod +x "$DEST/lib/claude_local_entry.sh"
 install_command_shims
 
 # With no remaining arguments, install/update the command and print help. With
 # arguments, prepare any host-compiler compatibility needed by CUDA and run the
 # harness immediately, so the curl one-liner doubles as a fresh-machine test.
 if [[ $# -eq 0 ]]; then
-    exec "$DEST/claude-local" --help
+    exec "$DEST/lib/claude_local_entry.sh" --help
 fi
 
 prepare_hostcc_if_needed "$@"
-exec "$DEST/claude-local" "$@"
+exec "$DEST/lib/claude_local_entry.sh" "$@"
