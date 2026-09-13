@@ -5,6 +5,11 @@ Claude Code sometimes sends canonical Claude family IDs even when custom model
 aliases are configured. This proxy routes by family (haiku/sonnet/opus/fable)
 and by our explicit local aliases, then forwards the request unchanged except
 for the model field to the matching llama-server `/v1/messages` endpoint.
+
+The proxy deliberately retries only before any downstream response bytes are
+committed. Once an SSE stream has started, replaying the request would duplicate
+partial model output; on a later upstream failure we therefore log and close the
+connection cleanly so Claude Code can apply its own request-level retry policy.
 """
 from __future__ import annotations
 
@@ -53,7 +58,7 @@ class Router:
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "claude-local/0.1"
+    server_version = "claude-local/0.2"
 
     @property
     def router(self) -> Router:
@@ -62,6 +67,7 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         if self.server.verbose:  # type: ignore[attr-defined]
             sys.stderr.write("gateway: " + (fmt % args) + "\n")
+            sys.stderr.flush()
 
     def _json(self, status: int, obj: dict):
         raw = json.dumps(obj).encode()
@@ -70,6 +76,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("content-length", str(len(raw)))
         self.end_headers()
         self.wfile.write(raw)
+        self.wfile.flush()
 
     def do_GET(self):
         path = urlsplit(self.path).path
@@ -86,6 +93,28 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"object": "list", "data": data})
         return self._json(404, {"type": "error", "error": {"type": "not_found_error", "message": "local gateway route not found"}})
 
+    def _backend_connection(self, route: dict):
+        parsed = urlsplit(route["url"])
+        conn_cls = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+        return conn_cls(parsed.hostname, parsed.port, timeout=route.get("timeout", 3600))
+
+    def _forward_headers(self, resp: http.client.HTTPResponse, content_length: str | None):
+        self.send_response(resp.status, resp.reason)
+        for k, v in resp.getheaders():
+            kl = k.lower()
+            if kl in HOP_HEADERS or kl == "content-length":
+                continue
+            self.send_header(k, v)
+        if content_length:
+            self.send_header("content-length", content_length)
+        else:
+            # http.client already de-chunks an upstream chunked response. Use
+            # connection-close framing downstream so raw SSE bytes can be
+            # flushed immediately without manufacturing a second chunk layer.
+            self.send_header("connection", "close")
+            self.close_connection = True
+        self.end_headers()
+
     def do_POST(self):
         path = urlsplit(self.path).path
         if path not in ("/v1/messages", "/v1/messages/count_tokens"):
@@ -99,46 +128,78 @@ class Handler(BaseHTTPRequestHandler):
         route = self.router.resolve(str(body.get("model", "")))
         body["model"] = route["backend_alias"]
         raw = json.dumps(body, separators=(",", ":")).encode()
-        parsed = urlsplit(route["url"])
-        conn_cls = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
-        conn = conn_cls(parsed.hostname, parsed.port, timeout=route.get("timeout", 3600))
         headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP_HEADERS}
         headers["content-type"] = "application/json"
         headers["content-length"] = str(len(raw))
-        try:
-            conn.request("POST", path, body=raw, headers=headers)
-            resp = conn.getresponse()
-            self.send_response(resp.status, resp.reason)
-            content_length = resp.getheader("content-length")
-            for k, v in resp.getheaders():
-                kl = k.lower()
-                if kl in HOP_HEADERS or kl == "content-length":
+
+        # One transparent retry is useful for an immediately reset local
+        # connection or transient 5xx. We only retry before response headers /
+        # bytes are committed to Claude Code.
+        attempts = int(route.get("proxy_attempts", 2))
+        last_exc: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            conn = self._backend_connection(route)
+            committed = False
+            try:
+                conn.request("POST", path, body=raw, headers=headers)
+                resp = conn.getresponse()
+
+                # Retry a transient backend 5xx before exposing it downstream.
+                if resp.status in (500, 502, 503, 504) and attempt < attempts:
+                    self.log_message("backend %s returned %s before stream; retrying (%d/%d)", route["url"], resp.status, attempt, attempts)
+                    try:
+                        resp.read()
+                    except Exception:
+                        pass
                     continue
-                self.send_header(k, v)
-            if content_length:
-                self.send_header("content-length", content_length)
-            else:
-                # End-of-stream is signalled by connection close. This lets us
-                # forward SSE incrementally without re-chunking it ourselves.
-                self.send_header("connection", "close")
-                self.close_connection = True
-            self.end_headers()
-            while True:
-                chunk = resp.read1(65536)
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
-                self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
-            pass
-        except Exception as exc:
-            if not self.wfile.closed:
-                try:
-                    self._json(502, {"type": "error", "error": {"type": "api_error", "message": f"local backend failure: {exc}"}})
-                except Exception:
-                    pass
-        finally:
-            conn.close()
+
+                content_type = (resp.getheader("content-type") or "").lower()
+                content_length = resp.getheader("content-length")
+                first = b""
+                if "text/event-stream" in content_type and 200 <= resp.status < 300:
+                    # Do not commit a nominal 200 SSE response until at least
+                    # one upstream byte exists. If llama-server dies before its
+                    # first event, the request can still be retried safely.
+                    first = resp.read1(65536)
+                    if not first:
+                        raise ConnectionError("backend closed SSE stream before first event")
+
+                self._forward_headers(resp, content_length)
+                committed = True
+                if first:
+                    self.wfile.write(first)
+                    self.wfile.flush()
+                while True:
+                    chunk = resp.read1(65536)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                return
+            except (BrokenPipeError, ConnectionResetError) as exc:
+                last_exc = exc
+                if committed:
+                    self.log_message("downstream/upstream connection reset after stream commit: %r", exc)
+                    self.close_connection = True
+                    return
+            except Exception as exc:
+                last_exc = exc
+                if committed:
+                    # Never attempt to write a second HTTP/JSON response after
+                    # Anthropic SSE headers have already been emitted. That
+                    # corrupts the stream and produces misleading client errors.
+                    self.log_message("backend failed after stream commit: %r", exc)
+                    self.close_connection = True
+                    return
+            finally:
+                conn.close()
+
+            if attempt < attempts:
+                self.log_message("backend failed before downstream commit: %r; retrying (%d/%d)", last_exc, attempt, attempts)
+                continue
+            break
+
+        return self._json(502, {"type": "error", "error": {"type": "api_error", "message": f"local backend failure before response: {last_exc}"}})
 
 
 def main() -> int:
