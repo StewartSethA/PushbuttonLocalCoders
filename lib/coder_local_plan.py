@@ -34,12 +34,12 @@ def expand_workers(models: list[str], agents: int | None) -> list[str]:
 
 
 def score(c: base.Candidate) -> tuple[int, ...]:
-    # Worker mode is quality-first rather than card-count-first. This is
-    # deliberate for large agentic models: 4x V100 IQ4 Flash-Next is preferred
-    # over squeezing a much lower-bit copy onto 3 GPUs merely to save a card.
+    # After candidates are trimmed to a near-best quality band, preserve GPUs
+    # first. This prevents a tiny quant-quality bump from consuming an extra
+    # whole accelerator that could host another worker or remain as headroom.
     return (
-        c.profile.quality,
         -c.card_count,
+        c.profile.quality,
         c.headroom_mib,
         c.free_mib,
         c.link_score,
@@ -47,8 +47,22 @@ def score(c: base.Candidate) -> tuple[int, ...]:
     )
 
 
+def _near_best(candidates: list[base.Candidate], quality_slack: int = 3) -> list[base.Candidate]:
+    """Keep candidates within a small quality band of the best feasible tier.
+
+    A three-point band intentionally treats Flash-Next IQ4_XS (97) as a peer of
+    Q4_K_XL (100), allowing the planner to prefer 4 GPUs over 5 on 32 GB V100s,
+    while still rejecting materially lower-bit 3-GPU fallbacks unless required.
+    """
+    if not candidates:
+        return candidates
+    best = max(c.profile.quality for c in candidates)
+    kept = [c for c in candidates if c.profile.quality >= best - quality_slack]
+    return kept or candidates
+
+
 def choose_workers(models: list[str], gpus: list[base.GPU], context: int) -> list[base.Candidate]:
-    candidates = [base.placement_candidates(m, gpus, context) for m in models]
+    candidates = [_near_best(base.placement_candidates(m, gpus, context)) for m in models]
     if any(not x for x in candidates):
         raise ValueError("at least one requested worker model cannot fit current free VRAM")
 
@@ -123,6 +137,7 @@ def self_test() -> None:
         4, synthetic_v100(8), 262144,
     )
     assert [len(w["gpus"]) for w in p["workers"]] == [4, 1, 1, 1], p
+    assert p["workers"][0]["profile"]["quant"] == "UD-IQ4_XS", p
     assert len(p["unused_gpus"]) == 1, p
     assert len({g["index"] for w in p["workers"] for g in w["gpus"]}) == 7, p
     print("coder-local planner self-test: PASS")
