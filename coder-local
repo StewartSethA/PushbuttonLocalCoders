@@ -12,9 +12,11 @@ LOCK_FILE="${CLAUDE_LOCAL_LOCK_FILE:-$STATE_DIR/startup.lock}"
 CTX="${CLAUDE_LOCAL_CONTEXT:-262144}"
 CLIENT_CTX="${CLAUDE_LOCAL_CLIENT_CONTEXT:-200000}"
 PORT_BASE="${CODER_LOCAL_PORT_BASE:-20180}"
+PLACEMENT_CONFIG="${PUSHBUTTON_PLACEMENT_CONFIG:-$HOME/.config/pushbutton-local/placement.json}"
 FRONTEND="${CODER_LOCAL_FRONTEND:-}"
 AGENTS=""
 RESUME=0
+PLAN_ONLY=0
 MODELS=()
 FRONTEND_ARGS=()
 PIDS=()
@@ -27,31 +29,51 @@ die(){ printf '\033[1;31m[coder-local]\033[0m %s\n' "$*" >&2; exit 1; }
 have(){ command -v "$1" >/dev/null 2>&1; }
 usage(){ cat <<'EOF'
 Usage:
-  qwen-local MODEL [MODEL ...] [--agents 1..4] [--resume] [-- QWEN_ARGS...]
+  qwen-local MODEL [MODEL ...] [--agents 1..8] [--resume] [options]
   coder-local --frontend qwen MODEL [MODEL ...] [options]
+
+Per-model placement syntax:
+  MODEL@gpu=INDEX,vram=SIZE
+  MODEL@gpu=INDEX+INDEX,vram=SIZE
+
+`gpu=` pins that worker to exactly those physical NVIDIA GPU indices.
+`vram=` is a per-selected-GPU hard planning lease; the best quant that fits is
+chosen automatically. The loaded llama.cpp process is checked after startup and
+is terminated if its measured allocation exceeds the lease.
+
+Examples on 2x RTX 3090 24 GB, preserving about 8 GB/card for other work:
+  qwen-local \
+    'qwen3.8:27b@gpu=0,vram=16G' \
+    'qwen3.6:35b@gpu=1,vram=16G' \
+    --agents 2
+
+Preview the selected GPUs/quants without compiling or downloading:
+  qwen-local \
+    'qwen3.8:27b@gpu=0,vram=16G' \
+    'qwen3.6:35b@gpu=1,vram=16G' \
+    --agents 2 --plan-only
 
 Worker semantics:
   one model + --agents N  -> N independent replicas of that model
   N models                -> one independent worker/backend per model
   N models + --agents N   -> explicit N-worker heterogeneous team
 
-Examples on 8x V100 32GB:
-  qwen-local qwen3.8-flash-next --agents 2
-    -> 2 independent Flash-Next coders, 4 GPUs each
-
-  qwen-local qwen3.8-flash-next qwen3.8:27b qwen3.6:35b nemotron-3.5-lightning --agents 4
-    -> 4+1+1+1 GPUs, one V100 intentionally left free
-
 Options:
   --frontend qwen
   --agents N
   --resume
+  --placement-config FILE       default: ~/.config/pushbutton-local/placement.json
+  --plan-only                   print placement/quant and exit before provisioning
   --local-context N
   --local-client-context N
   --local-cache DIR
   --local-port-base N
   --self-test
   -h, --help
+
+Persistent placement config example:
+  {"models":{"qwen3.8:27b":{"gpus":[0],"vram_limit":"16G"}}}
+Inline @gpu/@vram constraints override persistent model defaults.
 EOF
 }
 cleanup(){
@@ -140,7 +162,8 @@ import json,sys
 sep='\x1f'
 for w in json.load(open(sys.argv[1]))['workers']:
  x=w['profile']; env=';'.join(f'{k}={v}' for k,v in x.get('extra_env',{}).items())
- print(sep.join(map(str,[w['worker'],w['id'],x['hf_spec'],w['cuda_visible_devices'],int(w['multi_gpu']),x['kv_k'],x['kv_v'],x['batch'],x['ubatch'],x['flash_attn'],x['template'],env,x.get('note','')])))
+ cap=w.get('vram_limit_mib_per_gpu') or ''
+ print(sep.join(map(str,[w['worker'],w['id'],x['hf_spec'],w['cuda_visible_devices'],int(w['multi_gpu']),x['kv_k'],x['kv_v'],x['batch'],x['ubatch'],x['flash_attn'],x['template'],env,x.get('note',''),cap])))
 PY
 }
 print_plan(){ python3 - "$PLAN_FILE" <<'PY'
@@ -148,15 +171,50 @@ import json,sys
 p=json.load(open(sys.argv[1])); print(f"Coding agents: {p['agents']}  physical context: {p['context']:,}")
 for w in p['workers']:
  x=w['profile']; gs=','.join(str(g['index']) for g in w['gpus'])
- print(f"  agent {w['worker']}: {w['model']} / {x['quant']} -> GPU[{gs}] ({len(w['gpus'])} GPU{'s' if len(w['gpus'])!=1 else ''})")
+ cap=w.get('vram_limit_mib_per_gpu')
+ lease=f"  lease={cap/1024:.1f} GiB/GPU" if cap else ""
+ print(f"  agent {w['worker']}: {w['model']} / {x['quant']} -> GPU[{gs}] ({len(w['gpus'])} GPU{'s' if len(w['gpus'])!=1 else ''}){lease}")
 print(f"  spare GPUs: {[g['index'] for g in p['unused_gpus']]}")
+PY
+}
+enforce_vram_cap(){
+ local pid="$1" selected="$2" cap="$3"
+ [[ -n "$cap" ]] || return 0
+ python3 - "$pid" "$selected" "$cap" <<'PY'
+import subprocess,sys
+pid=int(sys.argv[1]); selected={int(x) for x in sys.argv[2].split(',') if x}; cap=int(sys.argv[3])
+def out(cmd):
+ try: return subprocess.check_output(cmd,text=True,stderr=subprocess.DEVNULL)
+ except Exception: return ''
+uuid_to_idx={}
+for line in out(['nvidia-smi','--query-gpu=index,uuid','--format=csv,noheader,nounits']).splitlines():
+ p=[x.strip() for x in line.split(',',1)]
+ if len(p)==2:
+  try: uuid_to_idx[p[1]]=int(p[0])
+  except ValueError: pass
+usage={i:0 for i in selected}; found=False
+for line in out(['nvidia-smi','--query-compute-apps=pid,gpu_uuid,used_memory','--format=csv,noheader,nounits']).splitlines():
+ p=[x.strip() for x in line.split(',')]
+ if len(p)<3: continue
+ try: app_pid=int(p[0]); mem=int(float(p[2]))
+ except ValueError: continue
+ if app_pid!=pid: continue
+ idx=uuid_to_idx.get(p[1])
+ if idx in selected:
+  usage[idx]+=mem; found=True
+if not found:
+ print(f"VRAM lease warning: could not read allocation for PID {pid}",file=sys.stderr)
+ raise SystemExit(0)
+over={i:m for i,m in usage.items() if m>cap}
+print("VRAM lease actual: "+", ".join(f"GPU{i}={m/1024:.2f}GiB/{cap/1024:.2f}GiB" for i,m in sorted(usage.items())),file=sys.stderr)
+if over: raise SystemExit(1)
 PY
 }
 start_backends(){
  mkdir -p "$STATE_DIR/logs" "$CACHE_DIR"; BACKENDS="$STATE_DIR/coder-backends.$$.tsv"; : >"$BACKENDS"
  export LLAMA_CACHE="$CACHE_DIR" GGML_CUDA_ENABLE_UNIFIED_MEMORY=0 CUDA_SCALE_LAUNCH_QUEUES=4x
  local next=$((PORT_BASE+1))
- while IFS=$'\x1f' read -r worker id hf gpus multi kvk kvv batch ubatch fa template envpairs note; do
+ while IFS=$'\x1f' read -r worker id hf gpus multi kvk kvv batch ubatch fa template envpairs note vramcap; do
    local port log pid waited=0 failed=0
    port="$(free_port "$next")"; next=$((port+1)); log="$STATE_DIR/logs/coder-$id.log"; : >"$log"
    local -a cmd=("$LLAMA_SERVER" -hf "$hf" --alias "$id" --no-mmproj -ngl 999 -c "$CTX" -np 1 --cache-type-k "$kvk" --cache-type-v "$kvv" -b "$batch" -ub "$ubatch" -fa "$fa" --jinja --no-context-shift --host 127.0.0.1 --port "$port")
@@ -164,12 +222,16 @@ start_backends(){
    [[ "$template" == qwen-fixed ]] && cmd+=(--chat-template-file "$QWEN_TEMPLATE")
    local -a envcmd=(env "CUDA_VISIBLE_DEVICES=$gpus" "LLAMA_CACHE=$CACHE_DIR" "GGML_CUDA_ENABLE_UNIFIED_MEMORY=0")
    if [[ -n "$envpairs" ]]; then local -a pairs; IFS=';' read -ra pairs<<<"$envpairs"; local pair; for pair in "${pairs[@]}";do envcmd+=("$pair");done;fi
-   say "Starting agent $worker: $hf on GPU(s) [$gpus]${note:+ — $note}"
+   say "Starting agent $worker: $hf on GPU(s) [$gpus]${vramcap:+ with ${vramcap} MiB/GPU lease}${note:+ — $note}"
    "${envcmd[@]}" "${cmd[@]}" > >(tee -a "$log" >&2) 2>&1 & pid=$!; PIDS+=("$pid")
    until curl -fsS "http://127.0.0.1:$port/health" >/dev/null 2>&1; do
      kill -0 "$pid" 2>/dev/null || { failed=1;break;}; sleep 1; waited=$((waited+1)); ((waited%30==0))&&say "Still loading agent $worker (${waited}s)..."
    done
    ((failed==0)) || { tail -80 "$log" >&2 || true; die "agent $worker backend failed"; }
+   if [[ -n "$vramcap" ]] && ! enforce_vram_cap "$pid" "$gpus" "$vramcap"; then
+     kill "$pid" 2>/dev/null || true
+     die "agent $worker exceeded its ${vramcap} MiB/GPU VRAM lease; choose a lower cap/context/model or update the model profile"
+   fi
    say "Agent $worker backend ready: http://127.0.0.1:$port/v1"
    printf '%s\t%s\t%s\t%s\n' "$worker" "$id" "$port" "$hf" >>"$BACKENDS"
  done < <(worker_rows)
@@ -231,6 +293,8 @@ while (($#));do
   --frontend) [[ $# -ge 2 ]]||die "--frontend needs a value";FRONTEND="$2";shift 2;;
   --agents) [[ $# -ge 2 ]]||die "--agents needs a value";AGENTS="$2";shift 2;;
   --resume) RESUME=1;shift;;
+  --placement-config) [[ $# -ge 2 ]]||die "--placement-config needs a file";PLACEMENT_CONFIG="$2";shift 2;;
+  --plan-only) PLAN_ONLY=1;shift;;
   --local-context) CTX="$2";shift 2;; --local-client-context) CLIENT_CTX="$2";shift 2;;
   --local-cache) CACHE_DIR="$2";shift 2;; --local-port-base) PORT_BASE="$2";shift 2;;
   --self-test) self_test;exit 0;;
@@ -241,15 +305,19 @@ while (($#));do
 done
 [[ "$FRONTEND" == qwen ]] || die "frontend '$FRONTEND' is not installed in this revision"
 ((${#MODELS[@]}>=1))||die "supply at least one model"
-[[ -z "$AGENTS" ]]||[[ "$AGENTS" =~ ^[1-4]$ ]]||die "--agents must be 1..4"
+[[ -z "$AGENTS" ]]||[[ "$AGENTS" =~ ^[1-8]$ ]]||die "--agents must be 1..8"
 [[ "$CTX" =~ ^[0-9]+$ && "$CLIENT_CTX" =~ ^[0-9]+$ ]]||die "context values must be integers"
 ((CLIENT_CTX<=CTX))||die "client context exceeds physical context"
 for c in git cmake ninja python3 curl tar flock nvidia-smi;do have "$c"||die "$c is required";done
 mkdir -p "$STATE_DIR" "$CACHE_DIR" "$(dirname "$LOCK_FILE")"
 exec {STARTUP_LOCK_FD}>"$LOCK_FILE"; flock "$STARTUP_LOCK_FD"
 PLAN_FILE="$STATE_DIR/coder-plan.$$.json"
-pa=(--context "$CTX"); [[ -n "$AGENTS" ]]&&pa+=(--agents "$AGENTS"); pa+=("${MODELS[@]}")
+pa=(--context "$CTX" --placement-config "$PLACEMENT_CONFIG"); [[ -n "$AGENTS" ]]&&pa+=(--agents "$AGENTS"); pa+=("${MODELS[@]}")
 python3 "$PLAN_PY" "${pa[@]}" >"$PLAN_FILE"; print_plan
+if ((PLAN_ONLY)); then
+  flock -u "$STARTUP_LOCK_FD"; eval "exec ${STARTUP_LOCK_FD}>&-"; STARTUP_LOCK_FD=""
+  exit 0
+fi
 source "$HOSTCC_SH"; claude_local_prepare_hostcc; activate_cuda; ensure_llamacpp; grep -q '"template": "qwen-fixed"' "$PLAN_FILE" && fetch_qwen_template || true; start_backends
 flock -u "$STARTUP_LOCK_FD"; eval "exec ${STARTUP_LOCK_FD}>&-"; STARTUP_LOCK_FD=""
 launch_qwen
