@@ -1,0 +1,49 @@
+name: backend benchmark tests
+
+on:
+  pull_request:
+    paths:
+      - "pushbutton-backend"
+      - "pushbutton-bench"
+      - "configs/backend-registry.json"
+      - "benchmarks/**"
+      - "install-coder-local.sh"
+      - ".github/workflows/backend-bench-tests.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python syntax
+        run: |
+          python3 -m py_compile pushbutton-backend pushbutton-bench
+          python3 -m json.tool configs/backend-registry.json >/dev/null
+      - name: Backend registry
+        run: python3 pushbutton-backend --dry-run list
+      - name: Dry-run all backend adapters
+        run: |
+          python3 pushbutton-backend --dry-run prepare llama.cpp qwen3.8:27b --gpus 0
+          python3 pushbutton-backend --dry-run prepare llamampere qwen3.8:27b --gpus 0
+          python3 pushbutton-backend --dry-run prepare volta-llama qwen3.8:27b --gpus 0
+          python3 pushbutton-backend --dry-run prepare sglang-v100 qwen3.8-flash-next --gpus 0,1,2,3
+          python3 pushbutton-backend --dry-run prepare vllm-qwen38-3090 qwen3.8:27b --gpus 0
+          python3 pushbutton-backend --dry-run prepare ninfer-3090 qwen3.8:27b --gpus 0
+          python3 pushbutton-backend --dry-run prepare vllm-flashnext-3090 qwen3.8-flash-next --gpus 0,1,2,3
+          python3 pushbutton-backend --dry-run serve llama.cpp qwen3.8:27b --gpus 0 --no-prepare
+          python3 pushbutton-backend --dry-run serve llamampere qwen3.8:27b --gpus 0 --no-prepare
+          python3 pushbutton-backend --dry-run serve volta-llama qwen3.8:27b --gpus 0 --no-prepare
+          python3 pushbutton-backend --dry-run serve sglang-v100 qwen3.8-flash-next --gpus 0,1,2,3 --no-prepare
+          python3 pushbutton-backend --dry-run serve vllm-qwen38-3090 qwen3.8:27b --gpus 0 --no-prepare
+          python3 pushbutton-backend --dry-run serve ninfer-3090 qwen3.8:27b --gpus 0 --no-prepare
+          python3 pushbutton-backend --dry-run serve vllm-flashnext-3090 qwen3.8-flash-next --gpus 0,1,2,3 --no-prepare
+      - name: Report index generator
+        run: |
+          mkdir -p /tmp/pushbutton-results
+          python3 pushbutton-bench --summarize --output-dir /tmp/pushbutton-results
+          test -s /tmp/RESULTS.md
+      - name: Installer syntax
+        run: bash -n install-coder-local.sh
