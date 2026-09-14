@@ -9,6 +9,7 @@ on:
       - "mini-swe-local"
       - "install-coder-local.sh"
       - "configs/qwen-local-defaults.json"
+      - "configs/placement.example.json"
       - "lib/coder_local_*.py"
       - "tests/test_coder_local.py"
       - ".github/workflows/coder-frontends-tests.yml"
@@ -24,6 +25,7 @@ jobs:
           bash -n coder-local install-coder-local.sh
           python3 -m py_compile lib/coder_local_plan.py lib/coder_local_lb.py
           python3 -m json.tool configs/qwen-local-defaults.json >/dev/null
+          python3 -m json.tool configs/placement.example.json >/dev/null
           python3 -m unittest -v tests/test_coder_local.py
           ./coder-local --self-test
       - name: Install official Qwen Code CLI
