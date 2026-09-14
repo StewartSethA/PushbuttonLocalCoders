@@ -33,13 +33,14 @@ def set_telemetry(enabled: bool, upload_url: str | None = None) -> pathlib.Path:
 def queue_report(report: dict) -> pathlib.Path | None:
     cfg=telemetry_config()
     if not cfg.get("enabled"): return None
-    # Deliberately exclude prompts, generated text, usernames, paths and hostnames.
+    backend=report.get("backend") or {}
     compact={
       "schema_version":1,
       "timestamp_utc":report.get("timestamp_utc"),
       "model":report.get("model"),
-      "backend":(report.get("backend") or {}).get("id"),
-      "backend_fingerprint":report.get("backend"),
+      "backend":backend.get("id"),
+      "artifact":backend.get("artifact") or backend.get("quant"),
+      "backend_fingerprint":{k:backend.get(k) for k in ("id","commit","version","artifact","quant") if backend.get(k) is not None},
       "context":report.get("context"),
       "gpus":report.get("gpus"),
       "gpu_models":[g.get("name") for g in (report.get("hardware") or {}).get("gpus",[])],
@@ -92,13 +93,19 @@ def local_rows() -> list[dict]:
     return rows
 
 
-def observations(model: str, backend: str, gpu_name: str | None = None, context: int | None = None) -> list[dict]:
-    rows=local_rows()+_remote_rows()
-    out=[]
+def observations(model: str, backend: str, artifact: str | None = None, gpu_name: str | None = None, context: int | None = None) -> list[dict]:
+    rows=local_rows()+_remote_rows(); out=[]
     for r in rows:
         if r.get("model")!=model or r.get("backend")!=backend: continue
+        if artifact:
+            ra=r.get("artifact")
+            if not ra or artifact.lower() not in str(ra).lower() and str(ra).lower() not in artifact.lower(): continue
         names=r.get("gpu_models") or ([r.get("gpu")] if r.get("gpu") else [])
         if gpu_name and names and not any(gpu_name.lower() in str(n).lower() or str(n).lower() in gpu_name.lower() for n in names): continue
+        if context and r.get("context"):
+            rc=int(r["context"])
+            # Avoid mixing radically different depth regimes into one SLA.
+            if rc < max(1024,int(context*.25)) or rc > int(context*4): continue
         out.append(r)
     return out
 
