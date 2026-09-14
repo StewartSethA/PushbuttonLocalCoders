@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "updated_utc": "2026-09-14T19:40:00Z",
+  "samples": [
+    {
+      "source": "upstream",
+      "model": "qwen3.8:27b",
+      "backend": "vllm-qwen38-3090",
+      "artifact": "patched vLLM W4A16/int8-requantized",
+      "gpu": "RTX 3090",
+      "context": 65536,
+      "case": "1k-c1",
+      "prompt_tokens": 1024,
+      "pp": 1895.0,
+      "tg": 127.0,
+      "note": "curated upstream reference; exact recipe provenance remains in backend docs"
+    },
+    {
+      "source": "upstream",
+      "model": "qwen3.8:27b",
+      "backend": "llamampere",
+      "artifact": "ATX-IQ4_XS-M (4.56 bpw)",
+      "gpu": "RTX 3090 Ti",
+      "context": 200000,
+      "case": "200k-c1",
+      "prompt_tokens": 200000,
+      "pp": 694.0,
+      "tg": 99.4,
+      "note": "curated upstream reference"
+    },
+    {
+      "source": "upstream",
+      "model": "qwen3.8:27b",
+      "backend": "ninfer-3090",
+      "artifact": "NInfer groupwise 16.96 GiB",
+      "gpu": "RTX 3090",
+      "context": 65536,
+      "case": "1k-c1",
+      "prompt_tokens": 1024,
+      "pp": 861.5,
+      "tg": 71.0,
+      "note": "curated upstream reference; measured C1 peak VRAM 19641 MiB"
+    }
+  ]
+}

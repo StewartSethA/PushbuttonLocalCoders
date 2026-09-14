@@ -1,138 +1,218 @@
 #!/usr/bin/env python3
-"""Interactive model/backend selector with VRAM, quality and benchmark guidance."""
+"""Interactive model/backend selector with live hardware and benchmark guidance."""
 from __future__ import annotations
-import argparse, json, os, pathlib, re, subprocess, sys
+import argparse, json, os, pathlib, re, socket, subprocess, sys, urllib.request
 
 ROOT=pathlib.Path(__file__).resolve().parent
 sys.path.insert(0,str(ROOT/'lib'))
 import claude_local_plan as plan
-RESULTS=ROOT/'benchmarks/results'
+import pushbutton_metrics as metrics
 
-# Upstream measurements are reference hints only. Local Pushbutton reports override
-# them whenever a matching backend/model result exists.
 UPSTREAM={
- ('qwen3.8:27b','llamampere'):{
-   'artifact':'ATX-IQ4_XS-M (4.56 bpw)','tested_card_mib':24576,'hard_min_mib':None,
-   'quality':'~97*','pp':694.0,'tg':99.4,
-   'note':'3090 Ti upstream; PP is populated ~200K-context measurement, TG clean-fixture C1. 22.1 GiB ready at largest measured fit.'},
- ('qwen3.8:27b','vllm-qwen38-3090'):{
-   'artifact':'patched vLLM W4A16/int8-requantized','tested_card_mib':24576,'hard_min_mib':None,
-   'quality':'n/a','pp':1895.0,'tg':127.0,
-   'note':'RTX 3090 upstream; PP ~1K prompt with INT8_ACT range 1850-1940, TG DFlash2 C1 default.'},
- ('qwen3.8:27b','ninfer-3090'):{
-   'artifact':'NInfer groupwise 16.96 GiB','tested_card_mib':24576,'hard_min_mib':17368,
-   'quality':'n/a','pp':861.5,'tg':71.0,
-   'note':'RTX 3090 upstream C1; artifact alone exceeds 16 GiB; measured C1 peak 19,641 MiB.'},
+ ('qwen3.8:27b','llamampere'):{'artifact':'ATX-IQ4_XS-M (4.56 bpw)','tested_card_mib':24576,'hard_min_mib':None,'host_ram_mib':8192,'quality':'~97*','note':'3090/3090 Ti specialized path; reduced-memory behavior is recipe-dependent.'},
+ ('qwen3.8:27b','vllm-qwen38-3090'):{'artifact':'patched vLLM W4A16/int8-requantized','tested_card_mib':24576,'hard_min_mib':None,'host_ram_mib':12288,'quality':'n/a','note':'single-3090 specialized stack; use measured rows for exact speed/context claims.'},
+ ('qwen3.8:27b','ninfer-3090'):{'artifact':'NInfer groupwise 16.96 GiB','tested_card_mib':24576,'hard_min_mib':17368,'host_ram_mib':8192,'quality':'n/a','note':'artifact alone exceeds 16 GiB; published C1 peak is about 19.2 GiB.'},
 }
-
 ALIASES={'qwen38':'qwen3.8:27b','qwen3.8-27b':'qwen3.8:27b','q38':'qwen3.8:27b'}
 
-def canon(x:str)->str:return ALIASES.get(x.lower(),x.lower())
+RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; BOLD='\033[1m'; RESET='\033[0m'
+def color(s,c): return f'{c}{s}{RESET}' if sys.stdout.isatty() else s
 
+def canon(x:str)->str:return ALIASES.get(x.lower(),x.lower())
 def parse_mem(s:str|None)->int|None:
  if not s:return None
- m=re.fullmatch(r'\s*(\d+(?:\.\d+)?)\s*([GM]?)B?\s*',s,re.I)
+ m=re.fullmatch(r'\s*(\d+(?:\.\d+)?)\s*([GM]?)I?B?\s*',s,re.I)
  if not m:raise ValueError(f'invalid memory size {s!r}')
- v=float(m.group(1));u=m.group(2).upper()
- return int(v*1024) if u=='G' else int(v)
+ v=float(m.group(1));u=m.group(2).upper(); return int(v*1024) if u=='G' else int(v)
 
-def inventory():
+def ram_info():
+ try:
+  text=pathlib.Path('/proc/meminfo').read_text(); vals={k:int(v) for k,v in re.findall(r'^(MemTotal|MemAvailable):\s+(\d+)',text,re.M)}
+  return vals.get('MemTotal',0)//1024,vals.get('MemAvailable',0)//1024
+ except Exception:return None,None
+
+def gpu_inventory():
  try:return plan.inventory()
  except Exception:return []
 
-def local_metrics(model:str,backend:str):
- best=None
- if not RESULTS.exists():return None
- for p in RESULTS.glob('*.json'):
-  try:x=json.loads(p.read_text())
-  except Exception:continue
-  if x.get('model')!=model or (x.get('backend') or {}).get('id')!=backend:continue
-  for c in x.get('cases',[]):
-   if c.get('name')!='1k-c1':continue
-   pp=c.get('median_prefill_tok_s')
-   tg=c.get('median_decode_tok_s')
-   stamp=x.get('timestamp_utc','')
-   cand=(stamp,pp,tg,p.name)
-   if best is None or stamp>best[0]:best=cand
- return best
+def gpu_for(index:int|None):
+ inv=gpu_inventory()
+ if index is None:return inv[0] if len(inv)==1 else None
+ return next((g for g in inv if g.index==index),None)
 
-def rows_for(model:str,gpu:int|None,cap:int|None,context:int):
+def free_port(start=20180):
+ for p in range(start,min(65535,start+400)):
+  s=socket.socket()
+  try:s.bind(('127.0.0.1',p));return p
+  except OSError:pass
+  finally:s.close()
+ raise RuntimeError('no free local port found')
+
+def known_endpoints():
+ state=pathlib.Path(os.environ.get('CLAUDE_LOCAL_STATE',pathlib.Path.home()/'.local/share/pushbutton/claude-local'))
  rows=[]
- # Curated llama.cpp quant ladder. Under a lease, this is the path that can
- # genuinely down-select quant automatically.
+ for p in state.glob('coder-backends.*.tsv') if state.exists() else []:
+  try:
+   for line in p.read_text().splitlines():
+    x=line.split('\t')
+    if len(x)<4:continue
+    worker,mid,port,hf=x[:4]; port=int(port)
+    try:
+     with urllib.request.urlopen(f'http://127.0.0.1:{port}/v1/models',timeout=.25) as r: obj=json.load(r)
+     served=((obj.get('data') or [{}])[0]).get('id') or mid
+     rows.append({'source':p.name,'worker':worker,'model_id':served,'port':port,'artifact':hf})
+    except Exception:pass
+  except Exception:pass
+ return rows
+
+def model_menu():
+ names=list(plan.PROFILES)
+ print('\nAvailable model families:')
+ for i,m in enumerate(names,1):
+  profiles=plan.PROFILES[m]; q=profiles[0].quality if profiles else '-'
+  print(f' {i:>2}. {m:<26} best planner quality {q}')
+ while True:
+  s=input('Choose model [1]: ').strip() or '1'
+  try:
+   n=int(s)
+   if 1<=n<=len(names):return names[n-1]
+  except ValueError:
+   try:return plan.canonical_model(s)
+   except Exception:pass
+  print('Please enter a number or model name.')
+
+def ask_caps(gpu):
+ total,avail=ram_info()
+ print('\nResource ceilings (blank = use detected availability).')
+ rs=input(f'Host RAM ceiling [{avail/1024:.1f}G available]: ' if avail else 'Host RAM ceiling [auto]: ').strip()
+ default_v=f'{gpu.free_mib/1024:.1f}G' if gpu else 'auto'
+ vs=input(f'VRAM ceiling [{default_v}]: ').strip()
+ return parse_mem(rs) if rs else avail, parse_mem(vs) if vs else (gpu.free_mib if gpu else None)
+
+def estimate_llama_rates(gpu,req):
+ if not gpu or not req:return None,None
+ bw=max(150,getattr(gpu,'speed_score',200))
+ weight_gib=max(4.0,(req/1024)*.88)
+ tg=max(1.0,.76*bw/weight_gib)
+ pp=tg*28.0
+ return pp,tg
+
+def measured_summary(model,backend,gpu_name,context):
+ rows=metrics.observations(model,backend,gpu_name,context)
+ s=metrics.summarize_observations(rows)
+ return rows,s
+
+def rows_for(model,gpu,cap,ram_cap,context):
+ rows=[]; gpu_name=gpu.name if gpu else None
  if model in plan.PROFILES:
   for p in plan.PROFILES[model]:
-   req=plan.scaled_required_mib(p,context)
-   status='FIT' if cap is None or req<=cap else 'BLOCK'
-   rows.append({'backend':'llama.cpp','artifact':p.quant,'req':req,'quality':str(p.quality),'pp':None,'tg':None,'status':status,'note':'auto-selectable GGUF quant','local':False})
- # Specialized fixed/tuned stacks.
+   req=plan.scaled_required_mib(p,context); ram_req=max(2048,int(req*.12))
+   status='FIT'
+   if cap is not None and req>cap:status='BLOCK'
+   if ram_cap is not None and ram_req>ram_cap:status='BLOCK'
+   obs,sm=measured_summary(model,'llama.cpp',gpu_name,context)
+   pp=(sm.get('pp') or {}).get('median'); tg=(sm.get('tg') or {}).get('median'); evidence='MEASURED' if pp or tg else 'ESTIMATED'
+   if evidence=='ESTIMATED':pp,tg=estimate_llama_rates(gpu,req)
+   rows.append({'model':model,'backend':'llama.cpp','artifact':p.quant,'req':req,'ram_req':ram_req,'quality':str(p.quality),'pp':pp,'tg':tg,'status':status,'note':'quant-selectable GGUF lane','evidence':evidence,'spread':sm,'local':any(r.get('source')=='local' for r in obs)})
  for (m,b),d in UPSTREAM.items():
   if m!=model:continue
-  hard=d.get('hard_min_mib'); tested=d.get('tested_card_mib')
+  hard=d.get('hard_min_mib'); tested=d.get('tested_card_mib'); ram_req=d.get('host_ram_mib')
   if cap is None:status='FIT' if tested else 'UNVERIFIED'
   elif hard is not None and hard>cap:status='BLOCK'
   elif tested is not None and cap>=tested:status='FIT'
   else:status='UNVERIFIED'
-  lm=local_metrics(model,b)
-  pp,tg=d.get('pp'),d.get('tg'); local=False
-  if lm:
-   _,lpp,ltg,_=lm
-   if lpp is not None:pp=lpp
-   if ltg is not None:tg=ltg
-   local=True
-  rows.append({'backend':b,'artifact':d['artifact'],'req':hard,'quality':d.get('quality','n/a'),'pp':pp,'tg':tg,'status':status,'note':d['note'],'local':local})
- # Rank usable rows by local evidence first, then TG, then quality; blocked last.
+  if ram_cap is not None and ram_req is not None and ram_req>ram_cap:status='BLOCK'
+  obs,sm=measured_summary(model,b,gpu_name,context)
+  pp=(sm.get('pp') or {}).get('median'); tg=(sm.get('tg') or {}).get('median')
+  evidence='MEASURED' if pp or tg else 'ESTIMATED'
+  rows.append({'model':model,'backend':b,'artifact':d['artifact'],'req':hard,'ram_req':ram_req,'quality':d.get('quality','n/a'),'pp':pp,'tg':tg,'status':status,'note':d['note'],'evidence':evidence,'spread':sm,'local':any(r.get('source')=='local' for r in obs)})
  rank={'FIT':0,'UNVERIFIED':1,'BLOCK':2}
- rows.sort(key=lambda r:(rank[r['status']],0 if r['local'] else 1,-(r['tg'] or -1),-(int(r['quality']) if str(r['quality']).isdigit() else -1)))
+ rows.sort(key=lambda r:(rank[r['status']],0 if r['evidence']=='MEASURED' else 1,-(r['tg'] or -1),-(int(r['quality']) if str(r['quality']).isdigit() else -1)))
  return rows
 
 def fmt_mib(v):return '-' if v is None else f'{v/1024:.1f}G'
 def fmt_rate(v):return '-' if v is None else f'{v:.0f}'
+def ev_label(r):
+ s='MEASURED' if r['evidence']=='MEASURED' else 'ESTIMATED'
+ return color(s,GREEN if s=='MEASURED' else RED)
 
-def print_table(rows,gpu,cap):
- print(f"GPU: {gpu if gpu is not None else 'auto'}   VRAM lease: {fmt_mib(cap) if cap else 'uncapped'}")
- print('')
- print(f"{'#':>2}  {'status':<10} {'backend':<20} {'quant/artifact':<31} {'VRAM':>7} {'quality':>8} {'PP':>7} {'TG':>7} {'data':<8}")
- print('-'*112)
+def print_hw(gpu,ram_cap,vram_cap):
+ total,avail=ram_info(); print('')
+ if gpu:
+  used=max(0,gpu.total_mib-gpu.free_mib)
+  print(f"GPU {gpu.index}: {gpu.name}  {gpu.free_mib/1024:.1f}G free / {gpu.total_mib/1024:.1f}G total  ({used/1024:.1f}G occupied)")
+  if vram_cap and vram_cap>gpu.free_mib: print(color(f'WARNING: requested VRAM ceiling {fmt_mib(vram_cap)} exceeds currently free VRAM {fmt_mib(gpu.free_mib)}.',YELLOW),file=sys.stderr)
+ elif gpu_inventory(): print('Multiple GPUs detected; use --gpu or select one interactively for card-specific guidance.')
+ if total: print(f'Host RAM: {avail/1024:.1f}G available / {total/1024:.1f}G total  planning ceiling={fmt_mib(ram_cap)}')
+
+def print_table(rows,gpu,cap,ram_cap):
+ print_hw(gpu,ram_cap,cap)
+ print(f"{'#':>2} {'status':<10} {'backend':<19} {'quant/artifact':<28} {'VRAM':>7} {'RAM':>7} {'qual':>6} {'PP':>7} {'TG':>7} {'evidence':<10}")
+ print('-'*116)
  for i,r in enumerate(rows,1):
-  data='local' if r['local'] else ('upstream' if r['backend']!='llama.cpp' else 'profile')
-  print(f"{i:>2}  {r['status']:<10} {r['backend']:<20} {r['artifact'][:31]:<31} {fmt_mib(r['req']):>7} {r['quality']:>8} {fmt_rate(r['pp']):>7} {fmt_rate(r['tg']):>7} {data:<8}")
- print('\nPP/TG are tok/s. Local benchmark reports supersede upstream reference numbers.')
- print('Quality scores are planner-relative for curated GGUFs; ~ values are heuristic and n/a is intentionally not guessed.')
+  print(f"{i:>2} {r['status']:<10} {r['backend']:<19} {r['artifact'][:28]:<28} {fmt_mib(r['req']):>7} {fmt_mib(r['ram_req']):>7} {r['quality']:>6} {fmt_rate(r['pp']):>7} {fmt_rate(r['tg']):>7} {ev_label(r):<10}")
+ print('\nPP/TG are tok/s. Green MEASURED rows come from local or repo aggregate observations; red ESTIMATED rows are planning estimates only.')
+
+def preview(row,gpu,cap,context):
+ eps=known_endpoints(); same=[e for e in eps if row['model'].split(':')[0] in str(e['model_id']).lower() or row['model'].replace(':','-') in str(e['model_id']).lower()]
+ print('\nPlacement preview:')
+ if same:
+  e=same[0]; print(color(f"  REUSE resident endpoint http://127.0.0.1:{e['port']}/v1 ({e['model_id']})",GREEN)); return
+ port=free_port(); print(f"  GPU: {gpu.index if gpu else 'auto'}   backend: {row['backend']}   artifact: {row['artifact']}")
+ print(f"  VRAM plan: {fmt_mib(row['req'])} within lease {fmt_mib(cap)}   context: {context:,}   proposed port: {port}")
+ print('  Existing listeners are not overwritten; launchers choose a free loopback port.')
+ if row['status']=='UNVERIFIED': print(color('  WARNING: memory compatibility is not proven for this specialized backend/profile.',YELLOW),file=sys.stderr)
 
 def main():
  ap=argparse.ArgumentParser(prog='pushbutton-select')
- ap.add_argument('model')
+ ap.add_argument('model',nargs='?')
  ap.add_argument('--gpu',type=int)
- ap.add_argument('--vram-limit')
+ ap.add_argument('--vram-limit'); ap.add_argument('--ram-limit')
  ap.add_argument('--context',type=int,default=262144)
- ap.add_argument('--json',action='store_true')
- ap.add_argument('--no-interactive',action='store_true')
- a=ap.parse_args();model=canon(a.model);cap=parse_mem(a.vram_limit)
+ ap.add_argument('--json',action='store_true'); ap.add_argument('--no-interactive',action='store_true')
+ ap.add_argument('--telemetry-opt-in',action='store_true'); ap.add_argument('--telemetry-off',action='store_true'); ap.add_argument('--telemetry-upload-url')
+ a=ap.parse_args()
+ if a.telemetry_opt_in:
+  p=metrics.set_telemetry(True,a.telemetry_upload_url); print(f'Opt-in telemetry enabled in {p}. Only compact benchmark metadata is queued; prompts/text are excluded.')
+ if a.telemetry_off:
+  p=metrics.set_telemetry(False); print(f'Telemetry disabled in {p}.')
+ inv=gpu_inventory(); gpu=gpu_for(a.gpu)
+ if a.gpu is None and len(inv)>1 and not a.no_interactive and sys.stdin.isatty():
+  print('Detected GPUs:')
+  for g in inv:print(f' {g.index}: {g.name}  free {g.free_mib/1024:.1f}G/{g.total_mib/1024:.1f}G')
+  try:gpu=gpu_for(int(input(f'Choose GPU [{inv[0].index}]: ').strip() or inv[0].index))
+  except Exception:gpu=inv[0]
+ ram_cap=parse_mem(a.ram_limit); cap=parse_mem(a.vram_limit)
+ if not a.no_interactive and sys.stdin.isatty() and not a.model and not a.ram_limit and not a.vram_limit:
+  ram_cap,cap=ask_caps(gpu)
+ model=canon(a.model) if a.model else (model_menu() if not a.no_interactive and sys.stdin.isatty() else 'qwen3.8:27b')
  if model not in plan.PROFILES and not any(m==model for m,_ in UPSTREAM):raise SystemExit(f'unknown selector model {model}')
- rs=rows_for(model,a.gpu,cap,a.context)
+ if cap is None and gpu:cap=gpu.free_mib
+ if ram_cap is None:_,ram_cap=ram_info()
+ rs=rows_for(model,gpu,cap,ram_cap,a.context)
  if a.json:
-  print(json.dumps(rs,indent=2));return
- print_table(rs,a.gpu,cap)
+  print(json.dumps({'model':model,'gpu':None if gpu is None else gpu.__dict__,'ram_limit_mib':ram_cap,'vram_limit_mib':cap,'rows':rs,'resident':known_endpoints()},indent=2));return
+ print_table(rs,gpu,cap,ram_cap)
  usable=[(i,r) for i,r in enumerate(rs,1) if r['status']=='FIT']
- if not usable:
-  print('\nNo proven configuration fits this lease. Increase the cap or choose a smaller model/quant.',file=sys.stderr);return
+ if not usable:raise SystemExit('No proven configuration fits the current ceilings.')
  default=usable[0][0]
+ choice=default
  if sys.stdin.isatty() and not a.no_interactive:
-  try:s=input(f'\nSelect configuration [{default}]: ').strip();choice=int(s) if s else default
-  except (EOFError,ValueError):choice=default
- else:choice=default
+  try:choice=int(input(f'\nSelect configuration [{default}]: ').strip() or default)
+  except Exception:choice=default
  if not (1<=choice<=len(rs)):raise SystemExit('selection out of range')
  r=rs[choice-1]
- if r['status']=='BLOCK':raise SystemExit('selected configuration exceeds the requested VRAM lease')
- if r['status']=='UNVERIFIED':
-  print('WARNING: this specialized backend has no proven profile under the requested cap; benchmark before relying on the lease.',file=sys.stderr)
- gpu_clause=f'@gpu={a.gpu}' if a.gpu is not None else ''
- vram_clause=((',' if gpu_clause else '@')+f'vram={a.vram_limit}') if a.vram_limit else ''
- if r['backend']=='llama.cpp':
-  print(f"\nRecommended command:\n  qwen-local '{model}{gpu_clause}{vram_clause}' --agents 1")
+ if r['status']=='BLOCK':raise SystemExit('selected configuration exceeds a requested resource ceiling')
+ preview(r,gpu,cap,a.context)
+ gpu_clause=f'@gpu={gpu.index}' if gpu else ''
+ vram_clause=((',' if gpu_clause else '@')+f'vram={cap}MiB') if cap else ''
+ if r['backend']=='llama.cpp':print(f"\nRecommended launch:\n  qwen-local '{model}{gpu_clause}{vram_clause}' --agents 1 --local-context {a.context}")
  else:
-  gp=f' --gpus {a.gpu}' if a.gpu is not None else ''
-  print(f"\nBenchmark specialized backend first:\n  pushbutton-bench {model} --backend {r['backend']}{gp} --suite standard")
-  print('Specialized backends do not yet inherit qwen-local VRAM leases automatically; fixed-artifact limits are enforced by this selector as evidence allows.')
+  gp=f' --gpus {gpu.index}' if gpu else ''
+  print(f"\nRecommended validation first:\n  pushbutton-bench {model} --backend {r['backend']}{gp} --context {a.context} --suite standard")
+  print('After a local benchmark, this selector will prefer the local measured PP/TG distribution over repo/upstream values.')
+ cfg=metrics.telemetry_config()
+ if cfg.get('enabled'):
+  try:n,msg=metrics.upload_pending(); print(f'\nTelemetry: {msg}')
+  except Exception as exc:print(f'\nTelemetry upload deferred: {exc}',file=sys.stderr)
 if __name__=='__main__':main()
