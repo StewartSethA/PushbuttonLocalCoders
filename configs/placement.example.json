@@ -1,0 +1,12 @@
+{
+  "models": {
+    "qwen3.8:27b": {
+      "gpus": [0],
+      "vram_limit": "16G"
+    },
+    "qwen3.6:35b": {
+      "gpus": [1],
+      "vram_limit": "16G"
+    }
+  }
+}

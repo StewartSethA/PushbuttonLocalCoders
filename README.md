@@ -159,6 +159,63 @@ These are large-model alternatives, not additions to the four-agent mixed
 layout: each large model can consume roughly four 32 GB V100s at the selected
 full-context profile.
 
+### Explicit GPU pins and per-model VRAM leases
+
+Placement constraints can be attached directly to each model selector:
+
+```bash
+qwen-local \
+  'qwen3.8:27b@gpu=0,vram=16G' \
+  'qwen3.6:35b@gpu=1,vram=16G' \
+  --agents 2
+```
+
+On a 2x RTX 3090 24 GB system this pins the first model to physical GPU 0 and
+the second to GPU 1 while exposing only 16 GiB/card to each model planner. At
+256K context the current catalogue chooses `IQ3_XXS` for Qwen3.8-27B and
+`UD-IQ3_XXS` for Qwen3.6-35B. The remaining roughly 8 GiB/card stays available
+to other work such as training.
+
+Preview the selection without building llama.cpp or downloading weights:
+
+```bash
+qwen-local \
+  'qwen3.8:27b@gpu=0,vram=16G' \
+  'qwen3.6:35b@gpu=1,vram=16G' \
+  --agents 2 --plan-only
+```
+
+For an exact multi-GPU placement use `+` between physical GPU indices:
+
+```bash
+qwen-local 'qwen3.8-flash-next@gpu=0+1+2+3,vram=30G' --agents 1
+```
+
+`vram=` is a per-selected-GPU lease. CUDA unified-memory spill remains disabled.
+After a capped llama.cpp server loads, Pushbutton also reads that process's
+actual allocation from `nvidia-smi`; if it exceeds the lease, the server is
+terminated rather than silently taking the reserved memory.
+
+Persistent defaults live at `~/.config/pushbutton-local/placement.json` by
+default (override with `--placement-config FILE` or `PUSHBUTTON_PLACEMENT_CONFIG`):
+
+```json
+{
+  "models": {
+    "qwen3.8:27b": {"gpus": [0], "vram_limit": "16G"},
+    "qwen3.6:35b": {"gpus": [1], "vram_limit": "16G"}
+  }
+}
+```
+
+With that file present the equivalent launch is simply:
+
+```bash
+qwen-local qwen3.8:27b qwen3.6:35b --agents 2
+```
+
+Inline `@gpu=` / `@vram=` values override persistent defaults for that launch.
+
 ---
 
 ## Current model families
