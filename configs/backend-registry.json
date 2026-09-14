@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "backends": {
+    "llama.cpp": {
+      "name": "Upstream llama.cpp baseline",
+      "source": "https://github.com/ggml-org/llama.cpp",
+      "status": "baseline",
+      "gpu_arch": ["sm70", "sm75", "sm80", "sm86", "sm89", "sm90"],
+      "models": ["qwen3.8:27b", "qwen3.8-flash-next"],
+      "notes": "Portable baseline and fallback used by PushbuttonLocalCoders."
+    },
+    "llamampere": {
+      "name": "llamAmpere",
+      "source": "https://github.com/JakeATX/llamAmpere",
+      "status": "experimental",
+      "gpu_arch": ["sm86"],
+      "models": ["qwen3.8:27b"],
+      "notes": "Single RTX 3090/3090 Ti, SM86-specialized IQ4_XS/Turbo3/MTP path."
+    },
+    "volta-llama": {
+      "name": "Volta-optimized llama.cpp",
+      "source": "https://github.com/jackjusko/jusko-llama-volta-qwen3flash",
+      "status": "experimental",
+      "gpu_arch": ["sm70", "sm75"],
+      "models": ["qwen3.8:27b"],
+      "notes": "V100/Turing llama.cpp fork; especially interesting for long-context incremental prefill."
+    },
+    "sglang-v100": {
+      "name": "SGLang V100",
+      "source": "https://github.com/haohervchb/sglang-V100",
+      "status": "experimental",
+      "gpu_arch": ["sm70"],
+      "models": ["qwen3.8-flash-next"],
+      "notes": "Four-V100 optimized SGLang path with MTP and V100-specific kernels."
+    },
+    "vllm-qwen38-3090": {
+      "name": "Patched vLLM Qwen3.8-27B RTX 3090",
+      "source": "https://github.com/syv-ai/qwen38-27b-rtx3090",
+      "status": "experimental",
+      "gpu_arch": ["sm86"],
+      "models": ["qwen3.8:27b"],
+      "notes": "Single-3090 DFlash2/MTP vLLM stack; prebuilt GHCR image."
+    },
+    "ninfer-3090": {
+      "name": "NInfer RTX 3090",
+      "source": "https://github.com/Don-Chad/ninfer-3090",
+      "status": "experimental",
+      "gpu_arch": ["sm86"],
+      "models": ["qwen3.8:27b"],
+      "notes": "Native SM86 engine with MTP, prefix reuse and concurrent cohorts."
+    },
+    "vllm-flashnext-3090": {
+      "name": "Patched vLLM Flash-Next 4x3090",
+      "source": "https://github.com/loktar00/qwen38-flash-next-vllm-3090-recipe",
+      "status": "experimental",
+      "gpu_arch": ["sm86"],
+      "models": ["qwen3.8-flash-next"],
+      "notes": "Four-RTX-3090 W4A16 Flash-Next path; MTP profile is the default benchmark lane."
+    }
+  }
+}
