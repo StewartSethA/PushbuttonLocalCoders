@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+"""Run comparable local inference benchmarks and save contribution-ready reports."""
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import datetime as dt
+import hashlib
+import http.client
+import json
+import os
+import pathlib
+import platform
+import re
+import signal
+import statistics
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+ROOT = pathlib.Path(__file__).resolve().parent
+BACKEND = ROOT / "pushbutton-backend"
+REGISTRY = json.loads((ROOT / "configs/backend-registry.json").read_text())["backends"]
+DEFAULT_RESULTS = ROOT / "benchmarks/results"
+
+
+def say(s: str) -> None:
+    print(f"[pushbutton-bench] {s}", file=sys.stderr, flush=True)
+
+
+def canonical_model(x: str) -> str:
+    a = {"qwen38":"qwen3.8:27b", "qwen3.8-27b":"qwen3.8:27b", "flash-next":"qwen3.8-flash-next", "qwen38-flash-next":"qwen3.8-flash-next"}
+    return a.get(x.lower(), x.lower())
+
+
+def hardware() -> dict:
+    out = {"platform": platform.platform(), "python": platform.python_version(), "cpu": platform.processor()}
+    try:
+        out["kernel"] = subprocess.check_output(["uname", "-a"], text=True).strip()
+    except Exception: pass
+    try:
+        q = "index,name,memory.total,compute_cap,driver_version,power.limit"
+        raw = subprocess.check_output(["nvidia-smi", f"--query-gpu={q}", "--format=csv,noheader,nounits"], text=True)
+        g = []
+        for line in raw.splitlines():
+            p = [x.strip() for x in line.split(",")]
+            g.append({"index":int(p[0]), "name":p[1], "memory_total_mib":int(float(p[2])), "compute_cap":p[3], "driver":p[4], "power_limit_w":float(p[5])})
+        out["gpus"] = g
+    except Exception:
+        out["gpus"] = []
+    try:
+        mem = pathlib.Path("/proc/meminfo").read_text()
+        m = re.search(r"MemTotal:\s+(\d+) kB", mem)
+        if m: out["ram_gib"] = round(int(m.group(1))/1048576, 1)
+    except Exception: pass
+    return out
+
+
+def backend_check(backend: str, model: str, gpus: str | None) -> tuple[bool, str]:
+    cmd = [str(BACKEND), "check", backend, model]
+    if gpus: cmd += ["--gpus", gpus]
+    cp = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    return cp.returncode == 0, cp.stdout.strip()
+
+
+def wait_ready(port: int, proc: subprocess.Popen, timeout: int = 7200) -> None:
+    deadline = time.time() + timeout
+    urls = [f"http://127.0.0.1:{port}/health", f"http://127.0.0.1:{port}/v1/models"]
+    last = ""
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(f"backend exited during startup with status {proc.returncode}")
+        for u in urls:
+            try:
+                with urllib.request.urlopen(u, timeout=3) as r:
+                    if 200 <= r.status < 300:
+                        return
+            except Exception as exc:
+                last = str(exc)
+        time.sleep(2)
+    raise TimeoutError(f"backend did not become ready within {timeout}s: {last}")
+
+
+def discover_model(port: int, fallback: str) -> str:
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/models", timeout=10) as r:
+            obj = json.load(r)
+        data = obj.get("data") or []
+        if data and data[0].get("id"): return str(data[0]["id"])
+    except Exception: pass
+    return fallback
+
+
+def request_stream(port: int, model_id: str, prompt: str, max_tokens: int) -> dict:
+    body = {
+        "model": model_id,
+        "messages": [{"role":"user", "content":prompt}],
+        "temperature": 0.0,
+        "max_tokens": max_tokens,
+        "stream": True,
+        "stream_options": {"include_usage": True}
+    }
+    encoded = json.dumps(body).encode()
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3600)
+    start = time.perf_counter(); first = None; usage = {}; text_parts = []
+    try:
+        conn.request("POST", "/v1/chat/completions", body=encoded, headers={"Content-Type":"application/json", "Authorization":"Bearer pushbutton-bench"})
+        resp = conn.getresponse()
+        if resp.status >= 400:
+            data = resp.read().decode(errors="replace")
+            # Older compatibility layers may reject stream_options. Retry once without it.
+            if resp.status == 400 and "stream" in data.lower():
+                body.pop("stream_options", None); encoded = json.dumps(body).encode(); conn.close()
+                return request_stream_compat(port, model_id, prompt, max_tokens)
+            raise RuntimeError(f"HTTP {resp.status}: {data[:1000]}")
+        while True:
+            line = resp.readline()
+            if not line: break
+            if not line.startswith(b"data:"): continue
+            data = line[5:].strip()
+            if not data or data == b"[DONE]": continue
+            try: obj = json.loads(data)
+            except Exception: continue
+            if obj.get("usage"): usage = obj["usage"]
+            choices = obj.get("choices") or []
+            if choices:
+                delta = choices[0].get("delta") or {}
+                content = delta.get("content")
+                if content:
+                    if first is None: first = time.perf_counter()
+                    text_parts.append(content)
+        end = time.perf_counter()
+    finally:
+        conn.close()
+    return finish_metrics(start, first, end, usage, "".join(text_parts))
+
+
+def request_stream_compat(port: int, model_id: str, prompt: str, max_tokens: int) -> dict:
+    body = {"model":model_id,"messages":[{"role":"user","content":prompt}],"temperature":0.0,"max_tokens":max_tokens,"stream":True}
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3600)
+    start=time.perf_counter(); first=None; text_parts=[]
+    try:
+        conn.request("POST","/v1/chat/completions",body=json.dumps(body).encode(),headers={"Content-Type":"application/json","Authorization":"Bearer pushbutton-bench"})
+        resp=conn.getresponse()
+        if resp.status>=400: raise RuntimeError(f"HTTP {resp.status}: {resp.read().decode(errors='replace')[:1000]}")
+        while True:
+            line=resp.readline()
+            if not line: break
+            if not line.startswith(b"data:"): continue
+            data=line[5:].strip()
+            if not data or data==b"[DONE]": continue
+            try: obj=json.loads(data)
+            except Exception: continue
+            choices=obj.get("choices") or []
+            if choices:
+                c=(choices[0].get("delta") or {}).get("content")
+                if c:
+                    if first is None:first=time.perf_counter()
+                    text_parts.append(c)
+        end=time.perf_counter()
+    finally: conn.close()
+    return finish_metrics(start,first,end,{},"".join(text_parts))
+
+
+def finish_metrics(start: float, first: float | None, end: float, usage: dict, text: str) -> dict:
+    ttft = (first-start) if first else None; total=end-start
+    pt = usage.get("prompt_tokens"); ct = usage.get("completion_tokens")
+    estimated = False
+    if not ct:
+        ct = max(1, round(len(text.split()) * 1.33)); estimated = True
+    decode = None
+    if ttft is not None and total > ttft and ct > 1: decode = (ct-1)/(total-ttft)
+    return {"ttft_s":ttft,"elapsed_s":total,"prompt_tokens":pt,"completion_tokens":ct,"completion_tokens_estimated":estimated,"decode_tok_s":decode,"chars":len(text)}
+
+
+def make_prompt(words: int) -> str:
+    # Usage.prompt_tokens in the response is authoritative; words only sets scale.
+    filler = ("alpha beta gamma delta epsilon zeta eta theta " * ((words+7)//8))[: words*8]
+    return filler + "\n\nWrite a long deterministic numbered list of concise software-engineering observations. Continue until the output limit; do not stop early."
+
+
+def cases(suite: str) -> list[dict]:
+    if suite == "quick": return [{"name":"1k-c1","words":1024,"output":256,"concurrency":1,"repetitions":1}]
+    base = [
+        {"name":"1k-c1","words":1024,"output":1024,"concurrency":1,"repetitions":2},
+        {"name":"25k-c1","words":25000,"output":1024,"concurrency":1,"repetitions":2},
+        {"name":"1k-c4","words":1024,"output":512,"concurrency":4,"repetitions":1},
+    ]
+    if suite == "long": base.append({"name":"100k-c1","words":100000,"output":1024,"concurrency":1,"repetitions":1})
+    return base
+
+
+def run_case(port: int, model_id: str, spec: dict) -> dict:
+    prompt=make_prompt(spec["words"]); all_requests=[]; waves=[]
+    for _ in range(spec["repetitions"]):
+        wave_start=time.perf_counter()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=spec["concurrency"]) as ex:
+            fut=[ex.submit(request_stream,port,model_id,prompt,spec["output"]) for _ in range(spec["concurrency"])]
+            rows=[x.result() for x in fut]
+        wave_elapsed=time.perf_counter()-wave_start; all_requests.extend(rows)
+        tokens=sum(int(r["completion_tokens"] or 0) for r in rows)
+        waves.append({"elapsed_s":wave_elapsed,"aggregate_output_tok_s":tokens/wave_elapsed if wave_elapsed else None})
+    def med(key):
+        vals=[r[key] for r in all_requests if r.get(key) is not None]
+        return statistics.median(vals) if vals else None
+    return {**spec,"requests":all_requests,"waves":waves,"median_ttft_s":med("ttft_s"),"median_decode_tok_s":med("decode_tok_s"),"median_prompt_tokens":med("prompt_tokens"),"aggregate_output_tok_s":statistics.median([w["aggregate_output_tok_s"] for w in waves])}
+
+
+def fingerprint(backend: str, model: str, gpus: str | None) -> dict:
+    cmd=[str(BACKEND),"fingerprint",backend,model]
+    if gpus: cmd += ["--gpus",gpus]
+    try: return json.loads(subprocess.check_output(cmd,text=True))
+    except Exception: return {"id":backend,"model":model,"source":REGISTRY[backend]["source"]}
+
+
+def safe(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+","-",s).strip("-")
+
+
+def summarize(outdir: pathlib.Path) -> pathlib.Path:
+    rows=[]
+    for p in sorted(outdir.glob("*.json")):
+        try:
+            x=json.loads(p.read_text())
+            for c in x.get("cases",[]):
+                rows.append((x.get("timestamp_utc",""),x.get("label",""),x["backend"]["id"],x["model"],c["name"],c.get("median_decode_tok_s"),c.get("aggregate_output_tok_s"),c.get("median_ttft_s"),p.name))
+        except Exception: pass
+    md=["# Collected Pushbutton benchmark results","","Generated by `pushbutton-bench --summarize`. Raw JSON is authoritative.","","| UTC | label | backend | model | case | median decode tok/s | aggregate output tok/s | median TTFT s | report |","|---|---|---|---|---|---:|---:|---:|---|"]
+    for r in rows:
+        fmt=lambda v: "" if v is None else f"{v:.2f}"
+        md.append(f"| {r[0]} | {r[1]} | {r[2]} | {r[3]} | {r[4]} | {fmt(r[5])} | {fmt(r[6])} | {fmt(r[7])} | [{r[8]}](results/{r[8]}) |")
+    path=outdir.parent/"RESULTS.md"; path.write_text("\n".join(md)+"\n"); return path
+
+
+def main() -> int:
+    ap=argparse.ArgumentParser(prog="pushbutton-bench")
+    ap.add_argument("model", nargs="?")
+    ap.add_argument("--backend", default="llama.cpp", help="backend id or 'all'")
+    ap.add_argument("--suite", choices=["quick","standard","long"], default="standard")
+    ap.add_argument("--gpus", help="physical GPU indices, comma-separated")
+    ap.add_argument("--context", type=int, default=65536)
+    ap.add_argument("--port-base", type=int, default=20880)
+    ap.add_argument("--label", default="local")
+    ap.add_argument("--output-dir", type=pathlib.Path, default=DEFAULT_RESULTS)
+    ap.add_argument("--no-prepare", action="store_true")
+    ap.add_argument("--stage", action="store_true", help="git add the report and regenerated benchmark index")
+    ap.add_argument("--summarize", action="store_true")
+    args=ap.parse_args(); args.output_dir.mkdir(parents=True,exist_ok=True)
+    if args.summarize:
+        print(summarize(args.output_dir)); return 0
+    if not args.model: ap.error("MODEL is required unless --summarize is used")
+    model=canonical_model(args.model)
+    wanted=list(REGISTRY) if args.backend=="all" else [args.backend]
+    wanted=[b for b in wanted if b in REGISTRY and model in REGISTRY[b]["models"]]
+    if not wanted: raise SystemExit(f"no selected backends support {model}")
+    hw=hardware(); reports=[]
+    for i,b in enumerate(wanted):
+        ok,msg=backend_check(b,model,args.gpus)
+        if not ok:
+            say(f"SKIP {b}: {msg}"); continue
+        port=args.port_base+i
+        logdir=pathlib.Path(os.environ.get("PUSHBUTTON_BACKEND_STATE",os.environ.get("CLAUDE_LOCAL_STATE",str(pathlib.Path.home()/".local/share/pushbutton/claude-local"))))/"optional-backends/logs"
+        logdir.mkdir(parents=True,exist_ok=True); log=open(logdir/f"bench-{safe(b)}.log","w")
+        cmd=[str(BACKEND),"serve",b,model,"--port",str(port),"--context",str(args.context)]
+        if args.gpus: cmd += ["--gpus",args.gpus]
+        if args.no_prepare: cmd.append("--no-prepare")
+        say(f"starting {b}; first run may compile and/or download model weights")
+        proc=subprocess.Popen(cmd,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
+        try:
+            wait_ready(port,proc); mid=discover_model(port,model); say(f"{b} ready as model {mid!r}; running {args.suite} suite")
+            result_cases=[]
+            for spec in cases(args.suite):
+                if spec["words"] > args.context*0.90:
+                    say(f"skip {spec['name']}: requested prompt scale exceeds context {args.context}"); continue
+                say(f"{b}: {spec['name']} c={spec['concurrency']} output={spec['output']}")
+                result_cases.append(run_case(port,mid,spec))
+            now=dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+            gpu_sig=",".join(g.get("name","") for g in hw.get("gpus",[])); hid=hashlib.sha256(gpu_sig.encode()).hexdigest()[:8] if gpu_sig else "nogpu"
+            report={"schema_version":1,"timestamp_utc":now,"label":args.label,"hardware_id":hid,"hardware":hw,"backend":fingerprint(b,model,args.gpus),"model":model,"served_model":mid,"suite":args.suite,"context":args.context,"gpus":args.gpus,"cases":result_cases,"backend_log":str(log.name)}
+            name=f"{now[:10]}__{safe(args.label)}__{hid}__{safe(b)}__{safe(model)}.json"; path=args.output_dir/name; path.write_text(json.dumps(report,indent=2)+"\n"); reports.append(path); say(f"wrote {path}")
+        finally:
+            try: os.killpg(proc.pid,signal.SIGTERM); proc.wait(timeout=30)
+            except Exception:
+                try: os.killpg(proc.pid,signal.SIGKILL)
+                except Exception: pass
+            log.close()
+    index=summarize(args.output_dir)
+    if args.stage and reports:
+        subprocess.run(["git","-C",str(ROOT),"add",str(index),*[str(p) for p in reports]],check=True)
+        say("staged benchmark report(s); review, commit, and push normally")
+    if not reports: return 2
+    print(index); return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
