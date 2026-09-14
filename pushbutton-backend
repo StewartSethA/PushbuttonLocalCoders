@@ -1,0 +1,302 @@
+#!/usr/bin/env python3
+"""Prepare and serve optional high-performance local inference backends.
+
+Every adapter exposes an OpenAI-compatible endpoint so frontends and the
+benchmark harness do not need backend-specific logic.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pathlib
+import shlex
+import shutil
+import subprocess
+import sys
+from typing import Iterable
+
+ROOT = pathlib.Path(__file__).resolve().parent
+REGISTRY_PATH = ROOT / "configs" / "backend-registry.json"
+STATE = pathlib.Path(os.environ.get("PUSHBUTTON_BACKEND_STATE", os.environ.get("CLAUDE_LOCAL_STATE", str(pathlib.Path.home() / ".local/share/pushbutton/claude-local")))) / "optional-backends"
+CACHE = pathlib.Path(os.environ.get("PUSHBUTTON_MODEL_CACHE", os.environ.get("CLAUDE_LOCAL_CACHE", str(pathlib.Path.home() / ".cache/pushbutton/llama"))))
+DRY = False
+
+
+def say(msg: str) -> None:
+    print(f"[pushbutton-backend] {msg}", file=sys.stderr, flush=True)
+
+
+def shell(cmd: Iterable[str]) -> str:
+    return " ".join(shlex.quote(str(x)) for x in cmd)
+
+
+def run(cmd: list[str], *, cwd: pathlib.Path | None = None, env: dict[str, str] | None = None, capture: bool = False) -> str:
+    say(("DRY-RUN " if DRY else "") + shell(cmd))
+    if DRY:
+        return ""
+    cp = subprocess.run(cmd, cwd=cwd, env=env, text=True, check=True, stdout=subprocess.PIPE if capture else None)
+    return (cp.stdout or "").strip()
+
+
+def exec_cmd(cmd: list[str], *, cwd: pathlib.Path | None = None, env: dict[str, str] | None = None) -> None:
+    say(("DRY-RUN exec " if DRY else "exec ") + shell(cmd))
+    if DRY:
+        return
+    if cwd:
+        os.chdir(cwd)
+    if env is not None:
+        os.environ.clear(); os.environ.update(env)
+    os.execvp(cmd[0], cmd)
+
+
+def registry() -> dict:
+    return json.loads(REGISTRY_PATH.read_text())
+
+
+def canonical_model(x: str) -> str:
+    x = x.lower().strip()
+    aliases = {
+        "qwen38": "qwen3.8:27b", "qwen3.8-27b": "qwen3.8:27b", "qwen3.8:27b": "qwen3.8:27b",
+        "flash-next": "qwen3.8-flash-next", "qwen3.8-flash-next": "qwen3.8-flash-next", "qwen38-flash-next": "qwen3.8-flash-next",
+    }
+    return aliases.get(x, x)
+
+
+def gpu_rows() -> list[dict]:
+    if not shutil.which("nvidia-smi"):
+        return []
+    out = subprocess.check_output([
+        "nvidia-smi", "--query-gpu=index,name,memory.total,memory.free,compute_cap",
+        "--format=csv,noheader,nounits"
+    ], text=True)
+    rows = []
+    for line in out.splitlines():
+        p = [z.strip() for z in line.split(",")]
+        if len(p) >= 5:
+            rows.append({"index": int(p[0]), "name": p[1], "memory_total_mib": int(float(p[2])), "memory_free_mib": int(float(p[3])), "compute_cap": p[4]})
+    return rows
+
+
+def select_gpus(backend: str, explicit: str | None) -> list[int]:
+    if explicit:
+        return [int(x) for x in explicit.split(",") if x.strip()]
+    need = {"llamampere": 1, "volta-llama": 1, "sglang-v100": 4, "vllm-qwen38-3090": 1, "ninfer-3090": 1, "vllm-flashnext-3090": 4}.get(backend, 1)
+    rows = gpu_rows()
+    if not rows:
+        if DRY:
+            return list(range(need))
+        raise SystemExit("no NVIDIA GPUs visible; use --gpus only if nvidia-smi is working")
+    return [r["index"] for r in rows[:need]]
+
+
+def validate(backend: str, model: str, gpus: list[int], force: bool) -> None:
+    info = registry()["backends"].get(backend)
+    if not info:
+        raise SystemExit(f"unknown backend {backend!r}; run: pushbutton-backend list")
+    if model not in info["models"]:
+        raise SystemExit(f"backend {backend} does not currently have a tested adapter for {model}; supported: {', '.join(info['models'])}")
+    if DRY or force:
+        return
+    rows = {r["index"]: r for r in gpu_rows()}
+    missing = [g for g in gpus if g not in rows]
+    if missing:
+        raise SystemExit(f"GPU index(es) not visible: {missing}")
+    caps = {f"sm{rows[g]['compute_cap'].replace('.', '')}" for g in gpus}
+    allowed = set(info["gpu_arch"])
+    if not caps <= allowed:
+        raise SystemExit(f"{backend} is tuned for {sorted(allowed)}, selected GPUs are {sorted(caps)}; use --force only for deliberate experiments")
+    minimum = {"sglang-v100": 4, "vllm-flashnext-3090": 4}.get(backend, 1)
+    if len(gpus) < minimum:
+        raise SystemExit(f"{backend} needs at least {minimum} GPU(s); selected {gpus}")
+
+
+def ensure_repo(name: str, url: str, ref: str = "main") -> pathlib.Path:
+    dst = STATE / "src" / name
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if (dst / ".git").exists():
+        run(["git", "-C", str(dst), "fetch", "--depth=1", "origin", ref])
+        run(["git", "-C", str(dst), "checkout", "-q", "--detach", "FETCH_HEAD"])
+    else:
+        run(["git", "clone", "--depth=1", "--branch", ref, url, str(dst)])
+    return dst
+
+
+def docker_prefix() -> list[str]:
+    if DRY:
+        return ["sudo", "docker"]
+    probes = (["docker", "info"], ["sudo", "docker", "info"])
+    for probe in probes:
+        try:
+            subprocess.run(probe, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            return probe[:-1]
+        except Exception:
+            pass
+    raise SystemExit("Docker is required for this backend; install Docker + NVIDIA Container Toolkit (sudo docker is supported)")
+
+
+def ensure_hf() -> pathlib.Path:
+    venv = STATE / "hf"
+    hf = venv / "bin" / "hf"
+    if hf.exists() or DRY:
+        return hf
+    run([sys.executable, "-m", "venv", str(venv)])
+    run([str(venv / "bin" / "python"), "-m", "pip", "install", "-U", "huggingface_hub[hf_xet]"])
+    return hf
+
+
+def hf_download(repo: str, *, filename: str | None = None, include: str | None = None, local_dir: pathlib.Path | None = None, revision: str | None = None) -> str:
+    hf = ensure_hf()
+    cmd = [str(hf), "download", repo]
+    if filename: cmd.append(filename)
+    if include: cmd += ["--include", include]
+    if revision: cmd += ["--revision", revision]
+    if local_dir:
+        local_dir.mkdir(parents=True, exist_ok=True)
+        cmd += ["--local-dir", str(local_dir)]
+    return run(cmd, capture=local_dir is None)
+
+
+def find_largest(path: pathlib.Path, glob: str) -> pathlib.Path:
+    files = list(path.rglob(glob))
+    if not files:
+        if DRY:
+            return path / "MODEL.gguf"
+        raise SystemExit(f"no {glob} found under {path}")
+    return max(files, key=lambda p: p.stat().st_size)
+
+
+def prepare(backend: str, model: str, gpus: list[int]) -> None:
+    STATE.mkdir(parents=True, exist_ok=True); CACHE.mkdir(parents=True, exist_ok=True)
+    if backend == "llama.cpp":
+        src = ensure_repo("llama.cpp-bench", "https://github.com/ggml-org/llama.cpp.git")
+        caps = sorted({r["compute_cap"].replace(".", "") for r in gpu_rows() if r["index"] in gpus}) or ["86"]
+        build = src / ("build-sm" + "_".join(caps))
+        run(["cmake", "-S", str(src), "-B", str(build), "-G", "Ninja", "-DGGML_CUDA=ON", "-DGGML_CUDA_FA_ALL_QUANTS=ON", "-DCMAKE_BUILD_TYPE=Release", f"-DCMAKE_CUDA_ARCHITECTURES={';'.join(caps)}"])
+        run(["cmake", "--build", str(build), "--target", "llama-server", "-j", str(os.cpu_count() or 8)])
+        return
+    if backend == "llamampere":
+        src = ensure_repo("llamAmpere", "https://github.com/JakeATX/llamAmpere.git")
+        build = src / "build-sm86"
+        run(["cmake", "-S", str(src), "-B", str(build), "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release", "-DGGML_CUDA=ON", "-DGGML_CUDA_FA=ON", "-DCMAKE_CUDA_ARCHITECTURES=86", "-DGGML_NATIVE=ON"])
+        run(["cmake", "--build", str(build), "-j", str(os.cpu_count() or 8), "--target", "llama-server"])
+        hf_download("jakeatx/Qwen3.8-27B-ATX-IQ4_XS-M-GGUF", include="*.gguf", local_dir=CACHE / "llamampere-qwen38")
+        return
+    if backend == "volta-llama":
+        src = ensure_repo("volta-llama", "https://github.com/jackjusko/jusko-llama-volta-qwen3flash.git")
+        build = src / "build-sm70"
+        run(["cmake", "-S", str(src), "-B", str(build), "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release", "-DGGML_CUDA=ON", "-DCMAKE_CUDA_ARCHITECTURES=70", "-DLLAMA_BUILD_UI=OFF"])
+        run(["cmake", "--build", str(build), "-j", str(os.cpu_count() or 8), "--target", "llama-server"])
+        hf_download("unsloth/Qwen3.8-27B-GGUF", filename="Qwen3.8-27B-UD-Q5_K_XL.gguf", local_dir=CACHE / "volta-qwen38")
+        return
+    if backend == "sglang-v100":
+        d = docker_prefix(); run(d + ["pull", "geesegeesegeese/sglang-v100:v100-qwen38-flash-next-v4"]); return
+    if backend == "vllm-qwen38-3090":
+        d = docker_prefix(); run(d + ["pull", "ghcr.io/syv-ai/qwen38-27b-rtx3090:latest"]); return
+    if backend == "ninfer-3090":
+        src = ensure_repo("ninfer-3090", "https://github.com/Don-Chad/ninfer-3090.git", "master")
+        d = docker_prefix(); run(d + ["build", "--tag", "pushbutton-ninfer-3090:sm86", "."], cwd=src)
+        model_dir = CACHE / "ninfer-3090"; model_dir.mkdir(parents=True, exist_ok=True)
+        env = os.environ.copy(); env["NINFER_MODEL_DIR"] = str(model_dir)
+        run(["bash", "scripts/download-qwen38.sh"], cwd=src, env=env)
+        return
+    if backend == "vllm-flashnext-3090":
+        src = ensure_repo("vllm-flashnext-3090", "https://github.com/loktar00/qwen38-flash-next-vllm-3090-recipe.git")
+        venv = STATE / "vllm-flashnext-3090-venv"; vsrc = STATE / "vllm-flashnext-3090-src"
+        env = os.environ.copy(); env.update({"VENV": str(venv), "SRC": str(vsrc), "TORCH_CUDA_ARCH_LIST": "8.6", "CMAKE_BUILD_TYPE": "Release", "HF_HOME": str(CACHE / "hf-flashnext-3090")})
+        run(["bash", "install.sh"], cwd=src, env=env)
+        hf_download("VnimanieAI/Qwen3.8-Flash-Next-W4A16", revision="9236d703b25f25eb5c17e9640204f84fa1ce0c6e")
+        return
+    raise SystemExit(f"prepare not implemented for {backend}")
+
+
+def source_revision(backend: str) -> str | None:
+    paths = {
+        "llama.cpp": STATE / "src/llama.cpp-bench", "llamampere": STATE / "src/llamAmpere",
+        "volta-llama": STATE / "src/volta-llama", "ninfer-3090": STATE / "src/ninfer-3090",
+        "vllm-flashnext-3090": STATE / "src/vllm-flashnext-3090",
+    }
+    p = paths.get(backend)
+    if p and (p / ".git").exists():
+        try: return subprocess.check_output(["git", "-C", str(p), "rev-parse", "HEAD"], text=True).strip()
+        except Exception: return None
+    return None
+
+
+def llama_build_path(srcname: str, prefix: str = "build-sm") -> pathlib.Path:
+    src = STATE / "src" / srcname
+    builds = sorted(src.glob(prefix + "*"), key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+    if not builds:
+        return src / (prefix + "86")
+    return builds[0]
+
+
+def serve(backend: str, model: str, gpus: list[int], port: int, context: int, profile: str | None) -> None:
+    gpu_csv = ",".join(map(str, gpus)); env = os.environ.copy(); env["CUDA_VISIBLE_DEVICES"] = gpu_csv
+    env["HF_HOME"] = str(CACHE / "huggingface"); env["LLAMA_CACHE"] = str(CACHE)
+    if backend == "llama.cpp":
+        build = llama_build_path("llama.cpp-bench")
+        hf = "unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL" if model == "qwen3.8:27b" else "unsloth/Qwen3.8-Flash-Next-GGUF:UD-IQ4_XS"
+        cmd = [str(build / "bin/llama-server"), "-hf", hf, "--host", "127.0.0.1", "--port", str(port), "-c", str(context), "-ngl", "999", "-np", "1", "--jinja", "--cache-type-k", "q8_0", "--cache-type-v", "q8_0", "-fa", "on"]
+        if len(gpus) > 1: cmd += ["--split-mode", "layer"]
+        exec_cmd(cmd, env=env); return
+    if backend == "llamampere":
+        src = STATE / "src/llamAmpere"; model_path = find_largest(CACHE / "llamampere-qwen38", "*.gguf")
+        env["GGML_Q8_TURBO3_MMA_FUSED"] = "1"
+        cmd = [str(src / "build-sm86/bin/llama-server"), "-m", str(model_path), "--host", "127.0.0.1", "--port", str(port), "-c", str(context), "-b", "4096", "-ub", "1024", "-t", "8", "-tb", "8", "-ngl", "99", "-fa", "on", "-ctk", "q8_0", "-ctv", "turbo3", "--parallel", "1", "--jinja", "--fit", "off", "--cache-prompt", "--cache-ram", "8192", "--ctx-checkpoints", "24", "--checkpoint-min-step", "10240", "--spec-type", "draft-mtp", "--spec-draft-n-max", "3", "--spec-draft-p-min", "0", "--spec-draft-type-k", "q8_0", "--spec-draft-type-v", "q8_0", "--spec-draft-vocab-map", str(src / "docs/mtp-vocab/atx_65536.txt")]
+        exec_cmd(cmd, env=env); return
+    if backend == "volta-llama":
+        src = STATE / "src/volta-llama"; model_path = find_largest(CACHE / "volta-qwen38", "*.gguf")
+        env.update({"GGML_CUDA_VOLTA_Q8_FATTN_TC":"1", "GGML_CUDA_VOLTA_Q5_X4":"1", "GGML_CUDA_VOLTA_Q6_W4R4":"1", "GGML_CUDA_QWEN35_MTP_SHORTLIST":str(src / "data/mtp-shortlists/qwen38-27b-exact-131072.i32")})
+        cmd = [str(src / "build-sm70/bin/llama-server"), "--model", str(model_path), "--alias", "qwen3.8-27b", "--host", "127.0.0.1", "--port", str(port), "--ctx-size", str(context), "--parallel", "1", "--fit", "off", "--gpu-layers", "63", "--split-mode", "layer", "--flash-attn", "on", "--batch-size", "4096", "--ubatch-size", "1024", "--cache-type-k", "q8_0", "--cache-type-v", "q8_0", "--spec-type", "draft-mtp", "--spec-draft-n-max", "3", "--spec-mtp-defer-prompt", "--jinja"]
+        exec_cmd(cmd, env=env); return
+    if backend == "sglang-v100":
+        d = docker_prefix(); cache = CACHE / "huggingface"; cache.mkdir(parents=True, exist_ok=True)
+        cmd = d + ["run", "--rm", "--gpus", f"device={gpu_csv}", "--network", "host", "--ipc", "host", "--ulimit", "memlock=-1", "--ulimit", "stack=67108864", "-v", f"{cache}:/root/.cache/huggingface", "-e", "FLASHINFER_DISABLE_VERSION_CHECK=1", "-e", "NCCL_P2P_LEVEL=NVL", "-e", "SGLANG_CUSTOM_ALLREDUCE_ALGO=1stage", "-e", "SGLANG_MAMBA_CONV_DTYPE=float16", "-e", "SGLANG_MAMBA_SSM_DTYPE=float16", "-e", "SGLANG_SM70_FORCE_FP16=1", "-e", "SGLANG_SM70_DENSE_GEMV=1", "-e", "SGLANG_SM70_QWEN_FUSIONS=1", "geesegeesegeese/sglang-v100:v100-qwen38-flash-next-v4", "python", "-m", "sglang.launch_server", "--trust-remote-code", "--model-path", "RadixArk/Qwen3.8-Flash-Next-NVFP4", "--served-model-name", "qwen3.8-flash-next", "--dtype", "float16", "--quantization", "modelopt_fp4", "--reasoning-parser", "auto", "--tool-call-parser", "auto", "--attention-backend", "tilelang_fa_v100", "--linear-attn-prefill-backend", "tilelang", "--linear-attn-decode-backend", "triton", "--kv-cache-dtype", "fp8_e5m2", "--tensor-parallel-size", str(len(gpus)), "--host", "127.0.0.1", "--port", str(port), "--mem-fraction-static", "0.80", "--context-length", str(context), "--max-running-requests", "1", "--chunked-prefill-size", "8192", "--cuda-graph-bs", "1", "--speculative-algorithm", "EAGLE", "--speculative-draft-model-path", "RadixArk/Qwen3.8-Flash-Next-NVFP4", "--speculative-num-steps", "3", "--speculative-eagle-topk", "1", "--speculative-num-draft-tokens", "4"]
+        exec_cmd(cmd); return
+    if backend == "vllm-qwen38-3090":
+        d = docker_prefix(); models = CACHE / "syv-qwen38-models"; vc = CACHE / "syv-qwen38-cache"; models.mkdir(parents=True, exist_ok=True); vc.mkdir(parents=True, exist_ok=True)
+        cmd = d + ["run", "--rm", "--gpus", f"device={gpu_csv}", "--ipc=host", "-p", f"127.0.0.1:{port}:18020", "-v", f"{models}:/app/models", "-v", f"{vc}:/cache", "-e", "SPEC=dflash2", "-e", "PREFIX_CACHE=1", "ghcr.io/syv-ai/qwen38-27b-rtx3090:latest"]
+        exec_cmd(cmd); return
+    if backend == "ninfer-3090":
+        d = docker_prefix(); model_path = find_largest(CACHE / "ninfer-3090", "*.ninfer")
+        cmd = d + ["run", "--rm", "--gpus", f"device={gpu_csv}", "-p", f"127.0.0.1:{port}:8080", "-v", f"{model_path.parent}:/workspace/models:ro", "pushbutton-ninfer-3090:sm86", "ninfer-serve", f"models/{model_path.name}", "--host", "0.0.0.0", "--port", "8080", "--max-context", str(context), "--kv-capacity", str(context), "--max-concurrency", "1", "--max-pending-requests", "16", "--prefill-chunk", "1024", "--kv-dtype", "int8", "--spec", "mtp", "--draft-tokens", "3", "--lm-head-draft"]
+        exec_cmd(cmd); return
+    if backend == "vllm-flashnext-3090":
+        src = STATE / "src/vllm-flashnext-3090"; hf = ensure_hf(); env = os.environ.copy()
+        snap = run([str(hf), "download", "VnimanieAI/Qwen3.8-Flash-Next-W4A16", "--revision", "9236d703b25f25eb5c17e9640204f84fa1ce0c6e"], capture=True)
+        env.update({"MODEL": snap or str(CACHE / "hf-flashnext-3090"), "VENV": str(STATE / "vllm-flashnext-3090-venv"), "SRC": str(STATE / "vllm-flashnext-3090-src"), "GPUS": gpu_csv, "HOST": "127.0.0.1", "PORT": str(port), "PROFILE": profile or "mtp", "HF_HOME": str(CACHE / "hf-flashnext-3090"), "LAB": str(STATE / "vllm-flashnext-3090-runs"), "RUN": "pushbutton"})
+        exec_cmd(["bash", "serve.sh"], cwd=src, env=env); return
+    raise SystemExit(f"serve not implemented for {backend}")
+
+
+def main() -> int:
+    global DRY
+    ap = argparse.ArgumentParser(prog="pushbutton-backend")
+    ap.add_argument("--dry-run", action="store_true")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("list")
+    for name in ("check", "prepare", "serve", "fingerprint"):
+        p = sub.add_parser(name); p.add_argument("backend"); p.add_argument("model"); p.add_argument("--gpus"); p.add_argument("--force", action="store_true")
+        if name == "serve":
+            p.add_argument("--port", type=int, default=20880); p.add_argument("--context", type=int, default=65536); p.add_argument("--profile"); p.add_argument("--no-prepare", action="store_true")
+    args = ap.parse_args(); DRY = args.dry_run
+    reg = registry()["backends"]
+    if args.cmd == "list":
+        for k, v in reg.items(): print(f"{k:24} {v['status']:12} models={','.join(v['models'])}  {v['name']}")
+        return 0
+    model = canonical_model(args.model); gpus = select_gpus(args.backend, args.gpus); validate(args.backend, model, gpus, args.force)
+    if args.cmd == "check":
+        print(json.dumps({"backend": args.backend, "model": model, "gpus": gpus, "ok": True}, indent=2)); return 0
+    if args.cmd == "prepare": prepare(args.backend, model, gpus); return 0
+    if args.cmd == "fingerprint":
+        info = reg[args.backend].copy(); info.update({"id": args.backend, "model": model, "gpus": gpus, "source_revision": source_revision(args.backend)})
+        print(json.dumps(info, indent=2)); return 0
+    if args.cmd == "serve":
+        if not args.no_prepare: prepare(args.backend, model, gpus)
+        serve(args.backend, model, gpus, args.port, args.context, args.profile); return 0
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
