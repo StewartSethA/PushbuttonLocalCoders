@@ -1,0 +1,111 @@
+{
+  "schema_version": 1,
+  "updated_utc": "2026-09-14T20:20:00Z",
+  "models": {
+    "ornith-1.5:9b": {
+      "display": "Ornith 1.5 9B",
+      "aliases": ["ornith", "ornith-1.5", "ornith-9b", "ornith-1.5-9b"],
+      "family": "Ornith 1.5",
+      "context": 262144,
+      "local": true,
+      "hf_model": "ornith-ai/Ornith-1.5-9B",
+      "gguf_repo": "ornith-ai/Ornith-1.5-9B-GGUF",
+      "runtimes": ["llama.cpp", "ollama", "vllm", "sglang", "mlx"],
+      "quants": [
+        {"name": "Q8_0", "weight_gib": 9.79, "quality": 100},
+        {"name": "Q6_K", "weight_gib": 7.56, "quality": 98},
+        {"name": "Q5_K_M", "weight_gib": 6.64, "quality": 97},
+        {"name": "Q4_K_M", "weight_gib": 5.78, "quality": 95}
+      ],
+      "benchmarks": {
+        "Terminal-Bench 2.1 (Claude Code)": {"score": 47.0, "source": "vendor", "higher_is_better": true},
+        "SWE-bench Verified": {"score": 70.6, "source": "vendor", "higher_is_better": true},
+        "SWE-bench Pro": {"score": 47.5, "source": "vendor", "higher_is_better": true},
+        "NL2Repo": {"score": 32.4, "source": "vendor", "higher_is_better": true},
+        "GPQA Diamond": {"score": 86.4, "source": "vendor", "higher_is_better": true}
+      },
+      "benchmark_source": "https://ornith.ai/ornith_1_5.html"
+    },
+    "ornith-1.5:35b-a3b": {
+      "display": "Ornith 1.5 35B-A3B",
+      "aliases": ["ornith-35b", "ornith-1.5-35b", "ornith-1.5-35b-a3b"],
+      "family": "Ornith 1.5",
+      "context": 262144,
+      "local": true,
+      "hf_model": "ornith-ai/Ornith-1.5-35B-A3B",
+      "gguf_repo": "ornith-ai/Ornith-1.5-35B-A3B-GGUF",
+      "runtimes": ["llama.cpp", "ollama", "vllm", "sglang", "mlx"],
+      "quants": [
+        {"name": "Q8_0", "weight_gib": 37.8, "quality": 100},
+        {"name": "Q6_K", "weight_gib": 29.2, "quality": 98},
+        {"name": "Q5_K_M", "weight_gib": 25.3, "quality": 97},
+        {"name": "Q4_K_M", "weight_gib": 21.7, "quality": 95}
+      ],
+      "benchmarks": {
+        "Terminal-Bench 2.1 (Claude Code)": {"score": 68.5, "source": "vendor", "higher_is_better": true},
+        "SWE-bench Verified": {"score": 79.0, "source": "vendor", "higher_is_better": true},
+        "SWE-bench Pro": {"score": 59.6, "source": "vendor", "higher_is_better": true},
+        "DeepSWE": {"score": 22.0, "source": "vendor", "higher_is_better": true},
+        "NL2Repo": {"score": 46.2, "source": "vendor", "higher_is_better": true},
+        "GPQA Diamond": {"score": 89.2, "source": "vendor", "higher_is_better": true}
+      },
+      "benchmark_source": "https://ornith.ai/ornith_1_5.html"
+    },
+    "ornith-1.5:397b": {
+      "display": "Ornith 1.5 397B",
+      "aliases": ["ornith-397b", "ornith-1.5-397b"],
+      "family": "Ornith 1.5",
+      "context": 262144,
+      "local": true,
+      "hf_model": "ornith-ai/Ornith-1.5-397B",
+      "gguf_repo": "ornith-ai/Ornith-1.5-397B-GGUF",
+      "runtimes": ["llama.cpp", "vllm", "sglang"],
+      "quants": [],
+      "benchmarks": {
+        "Terminal-Bench 2.1 (Claude Code)": {"score": 85.2, "source": "vendor", "higher_is_better": true},
+        "SWE-bench Verified": {"score": 86.0, "source": "vendor", "higher_is_better": true},
+        "SWE-bench Pro": {"score": 65.1, "source": "vendor", "higher_is_better": true},
+        "DeepSWE": {"score": 56.0, "source": "vendor", "higher_is_better": true},
+        "NL2Repo": {"score": 59.5, "source": "vendor", "higher_is_better": true},
+        "GPQA Diamond": {"score": 92.8, "source": "vendor", "higher_is_better": true}
+      },
+      "benchmark_source": "https://ornith.ai/ornith_1_5.html"
+    },
+    "deepseek-v4.1-flash": {
+      "display": "DeepSeek V4.1 Flash",
+      "aliases": ["deepseek", "deepseek-latest", "deepseek-flash", "deepseek-v4.1", "deepseek-v41", "dsv41"],
+      "family": "DeepSeek V4.1",
+      "context": 1048576,
+      "local": true,
+      "hf_model": "deepseek-ai/DeepSeek-V4.1-Flash",
+      "runtimes": ["vllm"],
+      "minimum_vram_gib": 614,
+      "recommended_runtime": "vllm>=0.30.0 dedicated DeepSeek V4.1 image",
+      "quants": [],
+      "benchmarks": {
+        "Terminal-Bench 2.1": {"score": 90.6, "source": "vendor", "higher_is_better": true},
+        "Terminal-Bench 3.0": {"score": 30.0, "source": "vendor", "higher_is_better": true},
+        "DeepSWE v1.1": {"score": 74.2, "source": "vendor", "higher_is_better": true},
+        "NL2Repo-Bench": {"score": 64.0, "source": "vendor", "higher_is_better": true},
+        "CyberGym": {"score": 88.1, "source": "vendor", "higher_is_better": true},
+        "GPQA Diamond": {"score": 90.9, "source": "vendor", "higher_is_better": true}
+      },
+      "benchmark_source": "https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash"
+    },
+    "deepseek-v4-flash-0731": {
+      "display": "DeepSeek V4 Flash 0731 (legacy local option)",
+      "aliases": ["deepseek-v4-flash", "deepseek-v4-flash-0731"],
+      "family": "DeepSeek V4",
+      "context": 1048576,
+      "local": true,
+      "deprecated_by": "deepseek-v4.1-flash",
+      "runtimes": ["llama.cpp", "vllm"],
+      "benchmarks": {
+        "Terminal-Bench 2.1": {"score": 82.7, "source": "vendor", "higher_is_better": true},
+        "DeepSWE": {"score": 54.4, "source": "vendor", "higher_is_better": true},
+        "NL2Repo": {"score": 54.2, "source": "vendor", "higher_is_better": true}
+      },
+      "benchmark_source": "https://api-docs.deepseek.com/updates/"
+    }
+  }
+}
