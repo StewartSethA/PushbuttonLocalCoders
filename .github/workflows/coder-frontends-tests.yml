@@ -8,10 +8,13 @@ on:
       - "deepseek-local"
       - "mini-swe-local"
       - "pushbutton-select"
+      - "pushbutton-observe"
       - "install-coder-local.sh"
       - "configs/qwen-local-defaults.json"
       - "configs/placement.example.json"
+      - "benchmarks/aggregate.json"
       - "lib/coder_local_*.py"
+      - "lib/pushbutton_metrics.py"
       - "tests/test_coder_local.py"
       - "tests/test_selector.py"
       - ".github/workflows/coder-frontends-tests.yml"
@@ -25,11 +28,14 @@ jobs:
       - name: Static and planner tests
         run: |
           bash -n coder-local install-coder-local.sh
-          python3 -m py_compile lib/coder_local_plan.py lib/coder_local_lb.py pushbutton-select
+          python3 -m py_compile lib/coder_local_plan.py lib/coder_local_lb.py lib/pushbutton_metrics.py pushbutton-select pushbutton-observe
           python3 -m json.tool configs/qwen-local-defaults.json >/dev/null
           python3 -m json.tool configs/placement.example.json >/dev/null
+          python3 -m json.tool benchmarks/aggregate.json >/dev/null
           python3 -m unittest -v tests/test_coder_local.py tests/test_selector.py
           ./coder-local --self-test
+          ./pushbutton-select qwen3.8:27b --vram-limit 16G --ram-limit 32G --no-interactive --json >/dev/null
+          ./pushbutton-observe --help >/dev/null
       - name: Install official Qwen Code CLI
         run: |
           curl -fsSL https://qwen-code-assets.oss-cn-hangzhou.aliyuncs.com/installation/install-qwen-standalone.sh | bash
