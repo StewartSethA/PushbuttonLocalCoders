@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+"""Measure an existing OpenAI-compatible local endpoint at several context depths.
+
+This never uploads prompts or generated text. With telemetry opt-in enabled it queues
+only compact hardware/performance metadata via lib/pushbutton_metrics.py.
+"""
+from __future__ import annotations
+import argparse, datetime as dt, http.client, json, os, pathlib, platform, statistics, subprocess, sys, time, urllib.parse, urllib.request
+
+ROOT=pathlib.Path(__file__).resolve().parent
+sys.path.insert(0,str(ROOT/'lib'))
+import pushbutton_metrics as metrics
+
+
+def hardware():
+ out={"platform":platform.platform(),"gpus":[]}
+ try:
+  raw=subprocess.check_output(['nvidia-smi','--query-gpu=index,name,memory.total,memory.free,compute_cap,driver_version','--format=csv,noheader,nounits'],text=True)
+  for line in raw.splitlines():
+   p=[x.strip() for x in line.split(',')]
+   out['gpus'].append({'index':int(p[0]),'name':p[1],'memory_total_mib':int(float(p[2])),'memory_free_mib':int(float(p[3])),'compute_cap':p[4],'driver':p[5]})
+ except Exception:pass
+ try:
+  t=pathlib.Path('/proc/meminfo').read_text(); import re
+  m=re.search(r'MemTotal:\s+(\d+)',t)
+  if m:out['ram_gib']=round(int(m.group(1))/1048576,1)
+ except Exception:pass
+ return out
+
+
+def discover_model(host,port,fallback):
+ try:
+  with urllib.request.urlopen(f'http://{host}:{port}/v1/models',timeout=3) as r:o=json.load(r)
+  return str((o.get('data') or [{}])[0].get('id') or fallback)
+ except Exception:return fallback
+
+
+def prompt_words(target_tokens):
+ # Repeated short English tokens give a stable scale; API usage is authoritative.
+ words=max(64,int(target_tokens*.73))
+ return ('alpha beta gamma delta epsilon zeta eta theta ' * ((words+7)//8))[:words*7]+'\nContinue with a numbered list of terse software engineering observations until the output limit.'
+
+
+def request(host,port,model,prompt,max_tokens):
+ body={'model':model,'messages':[{'role':'user','content':prompt}],'temperature':0.0,'max_tokens':max_tokens,'stream':True,'stream_options':{'include_usage':True}}
+ conn=http.client.HTTPConnection(host,port,timeout=3600); start=time.perf_counter(); first=None; usage={}; chars=0
+ try:
+  conn.request('POST','/v1/chat/completions',body=json.dumps(body).encode(),headers={'Content-Type':'application/json','Authorization':'Bearer pushbutton-observe'})
+  resp=conn.getresponse()
+  if resp.status>=400:raise RuntimeError(f'HTTP {resp.status}: {resp.read().decode(errors="replace")[:500]}')
+  while True:
+   line=resp.readline()
+   if not line:break
+   if not line.startswith(b'data:'):continue
+   data=line[5:].strip()
+   if not data or data==b'[DONE]':continue
+   try:o=json.loads(data)
+   except Exception:continue
+   if o.get('usage'):usage=o['usage']
+   ch=o.get('choices') or []
+   if ch:
+    c=(ch[0].get('delta') or {}).get('content')
+    if c:
+     if first is None:first=time.perf_counter()
+     chars+=len(c)
+  end=time.perf_counter()
+ finally:conn.close()
+ pt=usage.get('prompt_tokens'); ct=usage.get('completion_tokens')
+ if not ct:ct=max(1,round(chars/4)); ct_est=True
+ else:ct_est=False
+ ttft=(first-start) if first else None
+ tg=(ct-1)/(end-first) if first and end>first and ct>1 else None
+ pp=pt/ttft if pt and ttft else None
+ return {'ttft_s':ttft,'prompt_tokens':pt,'completion_tokens':ct,'completion_tokens_estimated':ct_est,'prefill_tok_s':pp,'decode_tok_s':tg,'elapsed_s':end-start}
+
+
+def run_depth(host,port,model,depth,out_tokens,reps):
+ rows=[request(host,port,model,prompt_words(depth),out_tokens) for _ in range(reps)]
+ def med(k):
+  v=[r[k] for r in rows if r.get(k) is not None]; return statistics.median(v) if v else None
+ return {'name':f'{depth//1000 if depth>=1000 else depth}k-c1','target_prompt_tokens':depth,'concurrency':1,'repetitions':reps,'requests':rows,'median_prompt_tokens':med('prompt_tokens'),'median_prefill_tok_s':med('prefill_tok_s'),'median_decode_tok_s':med('decode_tok_s'),'median_ttft_s':med('ttft_s')}
+
+
+def main():
+ ap=argparse.ArgumentParser(prog='pushbutton-observe')
+ ap.add_argument('--endpoint',default='http://127.0.0.1:20180/v1')
+ ap.add_argument('--model',default='local-model'); ap.add_argument('--backend',default='resident')
+ ap.add_argument('--depths',default='1024,8192,25000,65536,100000'); ap.add_argument('--output-tokens',type=int,default=512); ap.add_argument('--repetitions',type=int,default=2)
+ ap.add_argument('--label',default='resident'); ap.add_argument('--output-dir',type=pathlib.Path,default=ROOT/'benchmarks/results')
+ ap.add_argument('--upload-now',action='store_true'); ap.add_argument('--telemetry-opt-in',action='store_true'); ap.add_argument('--telemetry-upload-url')
+ a=ap.parse_args(); u=urllib.parse.urlparse(a.endpoint); host=u.hostname or '127.0.0.1'; port=u.port or 80
+ if a.telemetry_opt_in:metrics.set_telemetry(True,a.telemetry_upload_url)
+ model=discover_model(host,port,a.model); depths=[int(x.strip()) for x in a.depths.split(',') if x.strip()]
+ cases=[]
+ for d in depths:
+  print(f'[pushbutton-observe] depth {d:,}...',file=sys.stderr); cases.append(run_depth(host,port,model,d,a.output_tokens,a.repetitions))
+ now=dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat(); hw=hardware()
+ report={'schema_version':1,'timestamp_utc':now,'label':a.label,'hardware':hw,'backend':{'id':a.backend,'source':'resident endpoint','endpoint':a.endpoint},'model':a.model,'served_model':model,'context':max(depths),'cases':cases}
+ a.output_dir.mkdir(parents=True,exist_ok=True); safe=lambda s:''.join(c if c.isalnum() or c in '._-' else '-' for c in s)
+ p=a.output_dir/f"{now[:10]}__{safe(a.label)}__{safe(a.backend)}__{safe(a.model)}.json"; p.write_text(json.dumps(report,indent=2)+'\n')
+ q=metrics.queue_report(report); print(p)
+ if q:print(f'[pushbutton-observe] telemetry queued: {q}',file=sys.stderr)
+ if a.upload_now:
+  try:print('[pushbutton-observe] '+metrics.upload_pending()[1],file=sys.stderr)
+  except Exception as e:print(f'[pushbutton-observe] upload deferred: {e}',file=sys.stderr)
+if __name__=='__main__':main()
