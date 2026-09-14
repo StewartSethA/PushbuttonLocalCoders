@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+"""Interactive model/backend selector with VRAM, quality and benchmark guidance."""
+from __future__ import annotations
+import argparse, json, os, pathlib, re, subprocess, sys
+
+ROOT=pathlib.Path(__file__).resolve().parent
+sys.path.insert(0,str(ROOT/'lib'))
+import claude_local_plan as plan
+RESULTS=ROOT/'benchmarks/results'
+
+# Upstream measurements are reference hints only. Local Pushbutton reports override
+# them whenever a matching backend/model result exists.
+UPSTREAM={
+ ('qwen3.8:27b','llamampere'):{
+   'artifact':'ATX-IQ4_XS-M (4.56 bpw)','tested_card_mib':24576,'hard_min_mib':None,
+   'quality':'~97*','pp':694.0,'tg':99.4,
+   'note':'3090 Ti upstream; PP is populated ~200K-context measurement, TG clean-fixture C1. 22.1 GiB ready at largest measured fit.'},
+ ('qwen3.8:27b','vllm-qwen38-3090'):{
+   'artifact':'patched vLLM W4A16/int8-requantized','tested_card_mib':24576,'hard_min_mib':None,
+   'quality':'n/a','pp':1895.0,'tg':127.0,
+   'note':'RTX 3090 upstream; PP ~1K prompt with INT8_ACT range 1850-1940, TG DFlash2 C1 default.'},
+ ('qwen3.8:27b','ninfer-3090'):{
+   'artifact':'NInfer groupwise 16.96 GiB','tested_card_mib':24576,'hard_min_mib':17368,
+   'quality':'n/a','pp':861.5,'tg':71.0,
+   'note':'RTX 3090 upstream C1; artifact alone exceeds 16 GiB; measured C1 peak 19,641 MiB.'},
+}
+
+ALIASES={'qwen38':'qwen3.8:27b','qwen3.8-27b':'qwen3.8:27b','q38':'qwen3.8:27b'}
+
+def canon(x:str)->str:return ALIASES.get(x.lower(),x.lower())
+
+def parse_mem(s:str|None)->int|None:
+ if not s:return None
+ m=re.fullmatch(r'\s*(\d+(?:\.\d+)?)\s*([GM]?)B?\s*',s,re.I)
+ if not m:raise ValueError(f'invalid memory size {s!r}')
+ v=float(m.group(1));u=m.group(2).upper()
+ return int(v*1024) if u=='G' else int(v)
+
+def inventory():
+ try:return plan.inventory()
+ except Exception:return []
+
+def local_metrics(model:str,backend:str):
+ best=None
+ if not RESULTS.exists():return None
+ for p in RESULTS.glob('*.json'):
+  try:x=json.loads(p.read_text())
+  except Exception:continue
+  if x.get('model')!=model or (x.get('backend') or {}).get('id')!=backend:continue
+  for c in x.get('cases',[]):
+   if c.get('name')!='1k-c1':continue
+   pp=c.get('median_prefill_tok_s')
+   tg=c.get('median_decode_tok_s')
+   stamp=x.get('timestamp_utc','')
+   cand=(stamp,pp,tg,p.name)
+   if best is None or stamp>best[0]:best=cand
+ return best
+
+def rows_for(model:str,gpu:int|None,cap:int|None,context:int):
+ rows=[]
+ # Curated llama.cpp quant ladder. Under a lease, this is the path that can
+ # genuinely down-select quant automatically.
+ if model in plan.PROFILES:
+  for p in plan.PROFILES[model]:
+   req=plan.scaled_required_mib(p,context)
+   status='FIT' if cap is None or req<=cap else 'BLOCK'
+   rows.append({'backend':'llama.cpp','artifact':p.quant,'req':req,'quality':str(p.quality),'pp':None,'tg':None,'status':status,'note':'auto-selectable GGUF quant','local':False})
+ # Specialized fixed/tuned stacks.
+ for (m,b),d in UPSTREAM.items():
+  if m!=model:continue
+  hard=d.get('hard_min_mib'); tested=d.get('tested_card_mib')
+  if cap is None:status='FIT' if tested else 'UNVERIFIED'
+  elif hard is not None and hard>cap:status='BLOCK'
+  elif tested is not None and cap>=tested:status='FIT'
+  else:status='UNVERIFIED'
+  lm=local_metrics(model,b)
+  pp,tg=d.get('pp'),d.get('tg'); local=False
+  if lm:
+   _,lpp,ltg,_=lm
+   if lpp is not None:pp=lpp
+   if ltg is not None:tg=ltg
+   local=True
+  rows.append({'backend':b,'artifact':d['artifact'],'req':hard,'quality':d.get('quality','n/a'),'pp':pp,'tg':tg,'status':status,'note':d['note'],'local':local})
+ # Rank usable rows by local evidence first, then TG, then quality; blocked last.
+ rank={'FIT':0,'UNVERIFIED':1,'BLOCK':2}
+ rows.sort(key=lambda r:(rank[r['status']],0 if r['local'] else 1,-(r['tg'] or -1),-(int(r['quality']) if str(r['quality']).isdigit() else -1)))
+ return rows
+
+def fmt_mib(v):return '-' if v is None else f'{v/1024:.1f}G'
+def fmt_rate(v):return '-' if v is None else f'{v:.0f}'
+
+def print_table(rows,gpu,cap):
+ print(f"GPU: {gpu if gpu is not None else 'auto'}   VRAM lease: {fmt_mib(cap) if cap else 'uncapped'}")
+ print('')
+ print(f"{'#':>2}  {'status':<10} {'backend':<20} {'quant/artifact':<31} {'VRAM':>7} {'quality':>8} {'PP':>7} {'TG':>7} {'data':<8}")
+ print('-'*112)
+ for i,r in enumerate(rows,1):
+  data='local' if r['local'] else ('upstream' if r['backend']!='llama.cpp' else 'profile')
+  print(f"{i:>2}  {r['status']:<10} {r['backend']:<20} {r['artifact'][:31]:<31} {fmt_mib(r['req']):>7} {r['quality']:>8} {fmt_rate(r['pp']):>7} {fmt_rate(r['tg']):>7} {data:<8}")
+ print('\nPP/TG are tok/s. Local benchmark reports supersede upstream reference numbers.')
+ print('Quality scores are planner-relative for curated GGUFs; ~ values are heuristic and n/a is intentionally not guessed.')
+
+def main():
+ ap=argparse.ArgumentParser(prog='pushbutton-select')
+ ap.add_argument('model')
+ ap.add_argument('--gpu',type=int)
+ ap.add_argument('--vram-limit')
+ ap.add_argument('--context',type=int,default=262144)
+ ap.add_argument('--json',action='store_true')
+ ap.add_argument('--no-interactive',action='store_true')
+ a=ap.parse_args();model=canon(a.model);cap=parse_mem(a.vram_limit)
+ if model not in plan.PROFILES and not any(m==model for m,_ in UPSTREAM):raise SystemExit(f'unknown selector model {model}')
+ rs=rows_for(model,a.gpu,cap,a.context)
+ if a.json:
+  print(json.dumps(rs,indent=2));return
+ print_table(rs,a.gpu,cap)
+ usable=[(i,r) for i,r in enumerate(rs,1) if r['status']=='FIT']
+ if not usable:
+  print('\nNo proven configuration fits this lease. Increase the cap or choose a smaller model/quant.',file=sys.stderr);return
+ default=usable[0][0]
+ if sys.stdin.isatty() and not a.no_interactive:
+  try:s=input(f'\nSelect configuration [{default}]: ').strip();choice=int(s) if s else default
+  except (EOFError,ValueError):choice=default
+ else:choice=default
+ if not (1<=choice<=len(rs)):raise SystemExit('selection out of range')
+ r=rs[choice-1]
+ if r['status']=='BLOCK':raise SystemExit('selected configuration exceeds the requested VRAM lease')
+ if r['status']=='UNVERIFIED':
+  print('WARNING: this specialized backend has no proven profile under the requested cap; benchmark before relying on the lease.',file=sys.stderr)
+ gpu_clause=f'@gpu={a.gpu}' if a.gpu is not None else ''
+ vram_clause=((',' if gpu_clause else '@')+f'vram={a.vram_limit}') if a.vram_limit else ''
+ if r['backend']=='llama.cpp':
+  print(f"\nRecommended command:\n  qwen-local '{model}{gpu_clause}{vram_clause}' --agents 1")
+ else:
+  gp=f' --gpus {a.gpu}' if a.gpu is not None else ''
+  print(f"\nBenchmark specialized backend first:\n  pushbutton-bench {model} --backend {r['backend']}{gp} --suite standard")
+  print('Specialized backends do not yet inherit qwen-local VRAM leases automatically; fixed-artifact limits are enforced by this selector as evidence allows.')
+if __name__=='__main__':main()

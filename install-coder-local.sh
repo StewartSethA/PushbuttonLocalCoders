@@ -14,7 +14,7 @@ if [[ -d "$DEST/.git" ]]; then
 else
   git clone --depth=1 --branch "$REF" "$REPO_URL" "$DEST"
 fi
-chmod +x "$DEST/coder-local" "$DEST/opencode-local" "$DEST/deepseek-local" "$DEST/mini-swe-local" "$DEST/pushbutton-backend" "$DEST/pushbutton-bench"
+chmod +x "$DEST/coder-local" "$DEST/opencode-local" "$DEST/deepseek-local" "$DEST/mini-swe-local" "$DEST/pushbutton-backend" "$DEST/pushbutton-bench" "$DEST/pushbutton-select"
 
 install_wrapper(){
   local target="$1" body="$2" tmp="$ROOT/.coder-shim.$$"
@@ -36,6 +36,7 @@ deepseek_body="$(printf '%q' "$DEST/deepseek-local")"
 mini_body="$(printf '%q' "$DEST/mini-swe-local")"
 backend_body="$(printf '%q' "$DEST/pushbutton-backend")"
 bench_body="$(printf '%q' "$DEST/pushbutton-bench")"
+select_body="$(printf '%q' "$DEST/pushbutton-select")"
 
 install_wrapper "$HOME/.local/bin/qwen-local" "$qwen_body"
 install_wrapper "$HOME/.local/bin/opencode-local" "$opencode_body"
@@ -43,6 +44,7 @@ install_wrapper "$HOME/.local/bin/deepseek-local" "$deepseek_body"
 install_wrapper "$HOME/.local/bin/mini-swe-local" "$mini_body"
 install_wrapper "$HOME/.local/bin/pushbutton-backend" "$backend_body"
 install_wrapper "$HOME/.local/bin/pushbutton-bench" "$bench_body"
+install_wrapper "$HOME/.local/bin/pushbutton-select" "$select_body"
 
 if ((SYSTEM)); then
   install_wrapper /usr/local/bin/qwen-local "$qwen_body"
@@ -51,10 +53,11 @@ if ((SYSTEM)); then
   install_wrapper /usr/local/bin/mini-swe-local "$mini_body"
   install_wrapper /usr/local/bin/pushbutton-backend "$backend_body"
   install_wrapper /usr/local/bin/pushbutton-bench "$bench_body"
+  install_wrapper /usr/local/bin/pushbutton-select "$select_body"
 fi
 
 printf '[pushbutton] Installed coder frontends: qwen-local, opencode-local, deepseek-local, mini-swe-local\n'
-printf '[pushbutton] Installed backend bake-off tools: pushbutton-backend, pushbutton-bench\n'
+printf '[pushbutton] Installed backend tools: pushbutton-backend, pushbutton-bench, pushbutton-select\n'
 printf '[pushbutton] Qwen Code web MCP: Exa search + fetch enabled by default\n'
 if (($#)); then
   export QWEN_CODE_SYSTEM_DEFAULTS_PATH="$DEST/configs/qwen-local-defaults.json"
