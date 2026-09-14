@@ -36,7 +36,7 @@ jobs:
           python3 -m unittest -v tests/test_coder_local.py tests/test_selector.py tests/test_metrics.py
           ./coder-local --self-test
           ./pushbutton-select qwen3.8:27b --vram-limit 16G --ram-limit 32G --no-interactive --json >/dev/null
-          ./pushbutton-observe --help >/dev/null
+          python3 pushbutton-observe --help >/dev/null
       - name: Install official Qwen Code CLI
         run: |
           curl -fsSL https://qwen-code-assets.oss-cn-hangzhou.aliyuncs.com/installation/install-qwen-standalone.sh | bash
