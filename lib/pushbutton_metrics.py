@@ -59,8 +59,7 @@ def upload_pending() -> tuple[int,str]:
     if not url: return 0,"telemetry enabled locally; no upload URL configured"
     files=sorted(QUEUE.glob("*.json")) if QUEUE.exists() else []
     if not files: return 0,"nothing queued"
-    payload=("\n".join(p.read_text().strip() for p in files)+"\n").encode()
-    body=gzip.compress(payload,compresslevel=6)
+    payload=("\n".join(p.read_text().strip() for p in files)+"\n").encode(); body=gzip.compress(payload,compresslevel=6)
     req=urllib.request.Request(url,data=body,method="POST",headers={"Content-Type":"application/x-ndjson","Content-Encoding":"gzip","User-Agent":"PushbuttonLocalCoders-telemetry/1"})
     with urllib.request.urlopen(req,timeout=15) as r:
         if not (200 <= r.status < 300): raise RuntimeError(f"telemetry HTTP {r.status}")
@@ -70,13 +69,11 @@ def upload_pending() -> tuple[int,str]:
 
 def _remote_rows(max_age_s: int = 86400) -> list[dict]:
     CACHE.mkdir(parents=True,exist_ok=True); p=CACHE/"aggregate.json"
-    if p.exists() and time.time()-p.stat().st_mtime < max_age_s:
-        return (_read_json(p,{}) or {}).get("samples",[])
+    if p.exists() and time.time()-p.stat().st_mtime < max_age_s:return (_read_json(p,{}) or {}).get("samples",[])
     try:
-        with urllib.request.urlopen(REMOTE_URL,timeout=3) as r: raw=r.read()
+        with urllib.request.urlopen(REMOTE_URL,timeout=3) as r:raw=r.read()
         p.write_bytes(raw); return (json.loads(raw) or {}).get("samples",[])
-    except Exception:
-        return (_read_json(p,{}) or {}).get("samples",[])
+    except Exception:return (_read_json(p,{}) or {}).get("samples",[])
 
 
 def local_rows() -> list[dict]:
@@ -86,25 +83,28 @@ def local_rows() -> list[dict]:
         x=_read_json(p,{})
         if not x: continue
         gpu_names=[g.get("name") for g in (x.get("hardware") or {}).get("gpus",[])]
-        backend=(x.get("backend") or {}).get("id")
-        artifact=(x.get("backend") or {}).get("artifact") or (x.get("backend") or {}).get("quant")
-        for c in x.get("cases",[]):
-            rows.append({"source":"local","model":x.get("model"),"backend":backend,"artifact":artifact,"gpu_models":gpu_names,"context":x.get("context"),"case":c.get("name"),"prompt_tokens":c.get("median_prompt_tokens"),"pp":c.get("median_prefill_tok_s"),"tg":c.get("median_decode_tok_s"),"ttft":c.get("median_ttft_s")})
+        backend=(x.get("backend") or {}).get("id"); artifact=(x.get("backend") or {}).get("artifact") or (x.get("backend") or {}).get("quant")
+        for c in x.get("cases",[]):rows.append({"source":"local","model":x.get("model"),"backend":backend,"artifact":artifact,"gpu_models":gpu_names,"context":x.get("context"),"case":c.get("name"),"prompt_tokens":c.get("median_prompt_tokens"),"pp":c.get("median_prefill_tok_s"),"tg":c.get("median_decode_tok_s"),"ttft":c.get("median_ttft_s")})
     return rows
 
 
 def observations(model: str, backend: str, artifact: str | None = None, gpu_name: str | None = None, context: int | None = None) -> list[dict]:
+    # Backward-compatible form used by the selector before artifact-aware reports:
+    # observations(model, backend, gpu_name, context). Never apply those rows to
+    # llama.cpp, because doing so would silently mix different quants.
+    if isinstance(gpu_name,(int,float)) and context is None:
+        context=int(gpu_name); gpu_name=artifact; artifact=None
+    if backend=='llama.cpp' and artifact is None:return []
     rows=local_rows()+_remote_rows(); out=[]
     for r in rows:
         if r.get("model")!=model or r.get("backend")!=backend: continue
         if artifact:
             ra=r.get("artifact")
-            if not ra or artifact.lower() not in str(ra).lower() and str(ra).lower() not in artifact.lower(): continue
+            if not ra or (artifact.lower() not in str(ra).lower() and str(ra).lower() not in artifact.lower()): continue
         names=r.get("gpu_models") or ([r.get("gpu")] if r.get("gpu") else [])
-        if gpu_name and names and not any(gpu_name.lower() in str(n).lower() or str(n).lower() in gpu_name.lower() for n in names): continue
+        if gpu_name and names and not any(str(gpu_name).lower() in str(n).lower() or str(n).lower() in str(gpu_name).lower() for n in names): continue
         if context and r.get("context"):
             rc=int(r["context"])
-            # Avoid mixing radically different depth regimes into one SLA.
             if rc < max(1024,int(context*.25)) or rc > int(context*4): continue
         out.append(r)
     return out
