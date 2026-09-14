@@ -17,6 +17,7 @@ on:
       - "lib/pushbutton_metrics.py"
       - "tests/test_coder_local.py"
       - "tests/test_selector.py"
+      - "tests/test_metrics.py"
       - ".github/workflows/coder-frontends-tests.yml"
 permissions:
   contents: read
@@ -32,7 +33,7 @@ jobs:
           python3 -m json.tool configs/qwen-local-defaults.json >/dev/null
           python3 -m json.tool configs/placement.example.json >/dev/null
           python3 -m json.tool benchmarks/aggregate.json >/dev/null
-          python3 -m unittest -v tests/test_coder_local.py tests/test_selector.py
+          python3 -m unittest -v tests/test_coder_local.py tests/test_selector.py tests/test_metrics.py
           ./coder-local --self-test
           ./pushbutton-select qwen3.8:27b --vram-limit 16G --ram-limit 32G --no-interactive --json >/dev/null
           ./pushbutton-observe --help >/dev/null
