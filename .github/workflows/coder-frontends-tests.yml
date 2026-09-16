@@ -4,6 +4,7 @@ on:
     paths:
       - "pushbutton"
       - "pushbutton-instance"
+      - "pushbutton-scaler"
       - "coder-local"
       - "qwen-local"
       - "opencode-local"
@@ -38,7 +39,7 @@ jobs:
       - name: Syntax and data validation
         run: |
           bash -n coder-local install-coder-local.sh
-          python3 -m py_compile lib/coder_local_plan.py lib/coder_local_lb.py lib/pushbutton_metrics.py lib/pushbutton_policy.py lib/pushbutton_pool.py pushbutton pushbutton-instance pushbutton-select pushbutton-observe pushbutton-proxy pushbutton-broker
+          python3 -m py_compile lib/coder_local_plan.py lib/coder_local_lb.py lib/pushbutton_metrics.py lib/pushbutton_policy.py lib/pushbutton_pool.py pushbutton pushbutton-instance pushbutton-scaler pushbutton-select pushbutton-observe pushbutton-proxy pushbutton-broker
           python3 -m json.tool configs/qwen-local-defaults.json >/dev/null
           python3 -m json.tool configs/placement.example.json >/dev/null
           python3 -m json.tool configs/model-catalog.json >/dev/null
@@ -53,6 +54,7 @@ jobs:
         run: |
           python3 pushbutton --help >/dev/null
           python3 pushbutton-instance --help >/dev/null
+          python3 pushbutton-scaler --help >/dev/null
           python3 pushbutton-observe --help >/dev/null
           python3 pushbutton-proxy --help >/dev/null
           python3 pushbutton-broker --help >/dev/null
