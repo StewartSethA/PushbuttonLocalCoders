@@ -4,7 +4,7 @@
 # This is the installed Claude entrypoint. The existing claude-local script owns
 # planning, CUDA/toolchain provisioning, GGUF selection, llama-server startup and
 # the Anthropic-wire gateway. This wrapper hardens workstation contamination and
-# forces the current Qwen tool template/parser policy on every launch.
+# forces a low-latency agent/tool policy on every launch.
 set -euo pipefail
 SELF="${BASH_SOURCE[0]}"
 command -v readlink >/dev/null 2>&1 && SELF="$(readlink -f "$SELF" 2>/dev/null || printf '%s' "$SELF")"
@@ -19,10 +19,11 @@ unset OLLAMA_HOST OLLAMA_MODELS OLLAMA_KEEP_ALIVE OLLAMA_NUM_PARALLEL || true
 unset OPENAI_BASE_URL OPENAI_API_BASE OPENAI_API_KEY || true
 unset ANTHROPIC_BASE_URL ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN || true
 
-# Current llama.cpp supports this server-wide default, and the gateway now also
-# injects the same setting per request. The per-request setting is authoritative;
-# this remains useful for direct backend probes and non-gateway traffic.
-export LLAMA_ARG_CHAT_TEMPLATE_KWARGS='{"tool_call_format":"json","preserve_reasoning":true}'
+# Qwen3.6/3.8 natively emit XML-style tool calls. Do NOT force the template into
+# a JSON dialect: current llama.cpp's Qwen parser is designed around the native
+# format. For coding-agent traffic we disable generation/preservation of long
+# reasoning by default; the gateway repeats these kwargs per request.
+export LLAMA_ARG_CHAT_TEMPLATE_KWARGS='{"enable_thinking":false,"preserve_thinking":false,"preserve_reasoning":false}'
 
 # Never silently reuse an old cached community template. It is tiny compared with
 # model weights and current tool-parser behavior matters more than saving one HTTP
@@ -57,5 +58,5 @@ case "${1:-}" in
 esac
 
 say "engine policy: llama.cpp + Hugging Face GGUF only; Ollama endpoint variables cleared"
-say "tool policy: JSON tool calls enforced per request; every loaded backend must pass a real Anthropic tool-use probe before Claude Code starts"
+say "agent policy: native Qwen tool format; thinking/preserved reasoning disabled; each backend must pass a Claude-shaped tool probe before launch"
 exec "$CORE" "${auto_models[@]}" "$@"
