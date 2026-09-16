@@ -13,6 +13,7 @@ ROOT=pathlib.Path(__file__).resolve().parent
 sys.path.insert(0,str(ROOT/'lib'))
 import claude_local_plan as plan
 import pushbutton_policy as policy
+import pushbutton_registry as registry_store
 
 STATE=pathlib.Path(os.environ.get('PUSHBUTTON_RUNTIME_STATE',pathlib.Path.home()/'.local/share/pushbutton/runtime'))
 REGISTRY=STATE/'instances.json'
@@ -26,8 +27,6 @@ def say(s):print('[pushbutton-scaler] '+s,file=sys.stderr,flush=True)
 def read_json(p,default):
     try:return json.loads(p.read_text())
     except Exception:return default
-def write_json(p,obj):
-    p.parent.mkdir(parents=True,exist_ok=True);tmp=p.with_suffix(p.suffix+'.tmp');tmp.write_text(json.dumps(obj,indent=2)+'\n');tmp.replace(p)
 def get_json(url,timeout=1.0):
     try:
         with urllib.request.urlopen(url,timeout=timeout) as r:return json.load(r)
@@ -53,7 +52,7 @@ def selector_rows(model,context,gpu):
     cmd=[sys.executable,str(ROOT/'pushbutton-select'),model,'--context',str(context),'--gpu',str(gpu),'--no-interactive','--json']
     try:return json.loads(subprocess.check_output(cmd,text=True,stderr=subprocess.DEVNULL)).get('rows',[])
     except Exception:return []
-def registry():return read_json(REGISTRY,{'instances':[]})
+def registry():return registry_store.load(REGISTRY)
 def healthy_used_gpus(obj):
     used=set()
     for x in obj.get('instances',[]):
@@ -89,15 +88,13 @@ def wait_endpoint(proc,endpoint,timeout=3600):
         time.sleep(1)
     return False
 
-def add_registry(inst):
-    obj=registry();obj.setdefault('instances',[]).append(inst);write_json(REGISTRY,obj)
 def commission(source,row,gpu):
     model=source['model'];context=int(source.get('max_context') or 65536);backend=row['backend'];artifact=row.get('artifact');port=free_port();endpoint=f'http://127.0.0.1:{port}/v1'
     if backend=='llama.cpp':
         spec=hf_spec(model,artifact)
         if not spec:return False
         cmd=[sys.executable,ROOT/'pushbutton-instance','--hf-spec',spec,'--alias',model,'--port',port,'--context',context,'--parallel',1,'--gpus',gpu]
-    elif backend in SINGLE_GPU_BACKENDS-{ 'llama.cpp' }:
+    elif backend in SINGLE_GPU_BACKENDS-{'llama.cpp'}:
         cmd=[sys.executable,ROOT/'pushbutton-backend','serve',backend,model,'--port',port,'--context',context,'--gpus',gpu]
     else:return False
     log=STATE/'logs'/f'scale-{model.replace(":","-")}-{backend}-gpu{gpu}-{port}.log'
@@ -107,14 +104,12 @@ def commission(source,row,gpu):
         say(f'replica failed; leaving existing queue policy unchanged; inspect {log}')
         return False
     inst={'id':f'{model}-{backend}-{port}','model':model,'aliases':[model],'backend':backend,'artifact':artifact,'endpoint':endpoint,'pid':proc.pid,'max_context':context,'framework_max_concurrency':1,'measured_envelopes':[{'concurrency':1,'max_context':context,'safe':True,'evidence':'PROVEN'}],'tg':row.get('tg'),'tg_measured':row.get('evidence')=='MEASURED','healthy':True,'gpu':gpu,'required_mib':row.get('req'),'scaled_from':source.get('id')}
-    add_registry(inst);say(f'replica ready: {endpoint}')
+    registry_store.append_instance(inst,REGISTRY);say(f'replica ready: {endpoint}')
     return True
 
-def scale_once(broker):
-    st=get_json(broker.rstrip('/')+'/pushbutton/status',1.5)
-    if not st:return False
-    pressured=sorted([x for x in st.get('instances',[]) if int(x.get('queued') or 0)>0],key=lambda x:-int(x.get('queued') or 0))
-    if not pressured:return False
+def _scale_locked(pressured):
+    # Re-read all placement facts only after acquiring the same cold-start lock
+    # used by `pushbutton`; this prevents scaler/CLI races for apparently-free VRAM.
     obj=registry();by_id={x.get('id'):x for x in obj.get('instances',[])};used=healthy_used_gpus(obj)
     try:gpus=sorted(plan.inventory(),key=lambda g:g.free_mib,reverse=True)
     except Exception:return False
@@ -131,24 +126,26 @@ def scale_once(broker):
             return commission(source,row,g.index)
     return False
 
-def acquire_singleton():
-    STATE.mkdir(parents=True,exist_ok=True);p=STATE/'scaler.lock';f=p.open('a+')
+def scale_once(broker):
+    st=get_json(broker.rstrip('/')+'/pushbutton/status',1.5)
+    if not st:return False
+    pressured=sorted([x for x in st.get('instances',[]) if int(x.get('queued') or 0)>0],key=lambda x:-int(x.get('queued') or 0))
+    if not pressured:return False
     try:
-        import fcntl;fcntl.flock(f.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
-    except Exception:
-        return None
-    return f
+        with registry_store.named_lock('commission-global',timeout_s=7200):return _scale_locked(pressured)
+    except TimeoutError:return False
 
 def main():
     ap=argparse.ArgumentParser(prog='pushbutton-scaler');ap.add_argument('--broker',default='http://127.0.0.1:19780');ap.add_argument('--interval',type=float,default=1.0);ap.add_argument('--once',action='store_true');a=ap.parse_args()
-    lock=acquire_singleton()
-    if lock is None:
-        say('another scaler owns the singleton lock; exiting harmlessly');return
-    cooldown=0.0
-    while True:
-        now=time.monotonic()
-        if now>=cooldown and scale_once(a.broker):cooldown=now+10.0
-        if a.once:return
-        time.sleep(max(.25,a.interval))
+    try:
+        with registry_store.named_lock('scaler-singleton',timeout_s=.05,poll_s=.01):
+            cooldown=0.0
+            while True:
+                now=time.monotonic()
+                if now>=cooldown and scale_once(a.broker):cooldown=now+10.0
+                if a.once:return
+                time.sleep(max(.25,a.interval))
+    except TimeoutError:
+        say('another scaler owns the singleton lock; exiting harmlessly')
 
 if __name__=='__main__':main()
