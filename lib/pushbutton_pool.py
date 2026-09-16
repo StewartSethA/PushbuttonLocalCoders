@@ -14,6 +14,7 @@ class Instance:
     backend: str
     endpoint: str
     artifact: str | None = None
+    served_model: str | None = None
     aliases: list[str] = field(default_factory=list)
     max_context: int | None = None
     framework_max_concurrency: int | None = None
@@ -49,7 +50,7 @@ def instance_from_dict(x: dict) -> Instance:
         model=str(x.get('model') or x.get('id') or 'local-model'),
         backend=str(x.get('backend') or 'resident'),
         endpoint=str(x.get('endpoint') or ''),
-        artifact=x.get('artifact'),aliases=list(x.get('aliases') or []),
+        artifact=x.get('artifact'),served_model=x.get('served_model'),aliases=list(x.get('aliases') or []),
         max_context=x.get('max_context'),framework_max_concurrency=x.get('framework_max_concurrency'),
         measured_envelopes=list(x.get('measured_envelopes') or []),tg=x.get('tg'),
         tg_measured=bool(x.get('tg_measured')),active=int(x.get('active') or 0),
