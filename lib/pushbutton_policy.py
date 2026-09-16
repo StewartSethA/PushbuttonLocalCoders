@@ -70,12 +70,38 @@ def speed_label(tg: float | None, *, measured: bool) -> tuple[str, str | None]:
     return "OK", None
 
 
+def envelope_client_tg(e: dict) -> float | None:
+    """Return a conservative per-client decode SLA from a measured envelope.
+
+    Prefer explicit p10/client values. A median/client value is accepted only
+    when no percentile was captured. Aggregate throughput is divided by
+    concurrency as a last-resort approximation; it never counts as faster than
+    the explicitly reported per-client number.
+    """
+    for k in ("tg_per_client_p10", "decode_per_client_p10", "tg_client_p10"):
+        if e.get(k) is not None:
+            try:return float(e[k])
+            except Exception:return None
+    for k in ("tg_per_client", "decode_per_client", "tg_client"):
+        if e.get(k) is not None:
+            try:return float(e[k])
+            except Exception:return None
+    agg=e.get("aggregate_tg") or e.get("aggregate_output_tok_s")
+    if agg is not None:
+        try:return float(agg)/max(1,int(e.get("concurrency") or 1))
+        except Exception:return None
+    return None
+
+
 def proven_concurrency(*, backend: str, requested_context: int, framework_max: int | None = None,
-                       measured_envelopes: list[dict] | None = None, conservative_default: int = 1) -> int:
-    """Largest proven-safe concurrency at this context, capped by launch/framework max.
+                       measured_envelopes: list[dict] | None = None, conservative_default: int = 1,
+                       min_client_tg: float = MIN_DECODE_TOK_S) -> int:
+    """Largest proven-safe and acceptably fast concurrency at this context.
 
     A proof at a larger context is valid for a smaller request; a proof at a
-    smaller context is not promoted upward. Unknown configurations remain C1.
+    smaller context is not promoted upward. C>1 also requires a measured
+    per-client decode SLA at or above `min_client_tg`; high aggregate throughput
+    alone cannot hide slow individual subagents. Unknown configurations remain C1.
     """
     hard = backend_limits(backend, declared_concurrency=framework_max).max_concurrency
     best = max(1, min(conservative_default, hard))
@@ -90,8 +116,13 @@ def proven_concurrency(*, backend: str, requested_context: int, framework_max: i
             ctx = int(e.get("max_context") or e.get("context") or 0)
         except Exception:
             continue
-        if ctx >= requested_context:
-            best = max(best, min(c, hard))
+        if ctx < requested_context:
+            continue
+        if c > 1:
+            client_tg=envelope_client_tg(e)
+            if client_tg is None or client_tg < float(min_client_tg):
+                continue
+        best = max(best, min(c, hard))
     return max(1, min(best, hard))
 
 
