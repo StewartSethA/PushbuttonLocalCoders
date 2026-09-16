@@ -21,13 +21,26 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(policy.proven_concurrency(backend='mystery',requested_context=8192),1)
 
     def test_proof_at_larger_context_applies_downward(self):
-        env=[{'concurrency':4,'max_context':16384,'safe':True}]
+        env=[{'concurrency':4,'max_context':16384,'safe':True,'tg_per_client_p10':31.0}]
         self.assertEqual(policy.proven_concurrency(backend='llama.cpp',requested_context=8192,measured_envelopes=env),4)
         self.assertEqual(policy.proven_concurrency(backend='llama.cpp',requested_context=32768,measured_envelopes=env),1)
 
     def test_framework_cap_is_hard(self):
-        env=[{'concurrency':8,'max_context':65536,'safe':True}]
+        env=[{'concurrency':8,'max_context':65536,'safe':True,'tg_per_client_p10':40.0}]
         self.assertEqual(policy.proven_concurrency(backend='ninfer-3090',requested_context=8192,framework_max=2,measured_envelopes=env),2)
+
+    def test_aggregate_speed_cannot_hide_slow_clients(self):
+        env=[{'concurrency':4,'max_context':65536,'safe':True,'aggregate_tg':80.0}]
+        self.assertEqual(policy.envelope_client_tg(env[0]),20.0)
+        self.assertEqual(policy.proven_concurrency(backend='llama.cpp',requested_context=8192,measured_envelopes=env),1)
+
+    def test_per_client_floor_promotes_at_25(self):
+        env=[{'concurrency':3,'max_context':65536,'safe':True,'tg_per_client_p10':25.0}]
+        self.assertEqual(policy.proven_concurrency(backend='llama.cpp',requested_context=8192,measured_envelopes=env),3)
+
+    def test_missing_concurrent_speed_stays_c1(self):
+        env=[{'concurrency':4,'max_context':65536,'safe':True}]
+        self.assertEqual(policy.proven_concurrency(backend='llama.cpp',requested_context=8192,measured_envelopes=env),1)
 
     def test_admission(self):
         self.assertEqual(policy.admission_decision(active=0,capacity=1,queue_depth=0),'ADMIT')
