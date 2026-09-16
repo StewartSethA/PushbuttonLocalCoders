@@ -1,21 +1,27 @@
 #!/usr/bin/env bash
 # qwen-local — robust Qwen Code entrypoint for coder-local.
 #
-# Current llama.cpp `-hf user/repo:quant` requires HTTPS support.  Do not depend
-# on host OpenSSL development headers: rewrite coder-local's CMake configure to
-# use the same bundled BoringSSL path used by llama.cpp release builds.  Existing
-# builds made before this wrapper are rebuilt once; subsequent runs reuse them.
+# Current llama.cpp `-hf user/repo:quant` requires HTTPS support.  Use bundled
+# BoringSSL so host OpenSSL headers are not required, and use a modern full C/C++
+# toolchain so old distro compilers cannot ICE while building BoringSSL.
 set -euo pipefail
 SELF="${BASH_SOURCE[0]}"
 command -v readlink >/dev/null 2>&1 && SELF="$(readlink -f "$SELF" 2>/dev/null || printf '%s' "$SELF")"
 ROOT="$(cd "$(dirname "$SELF")" && pwd)"
 STATE_DIR="${CLAUDE_LOCAL_STATE:-$HOME/.local/share/pushbutton/claude-local}"
+HOSTCC_SH="$ROOT/lib/claude_local_hostcc.sh"
 
-# The wrapper is also useful when invoked directly from a checkout.  coder-local
-# still owns CUDA/toolchain detection, model planning, downloads, and launch.
+# Select/provision the compiler before inspecting CMake caches.  This affects the
+# whole llama.cpp/BoringSSL build; coder-local will source the helper again later
+# (idempotently) before invoking CMake/nvcc.
+source "$HOSTCC_SH"
+claude_local_prepare_hostcc
+
 real_cmake="$(command -v cmake || true)"
 [[ -n "$real_cmake" ]] || { echo "qwen-local: cmake is required" >&2; exit 1; }
 
+# coder-local still carries its historical OpenSSL configure flag.  Rewrite only
+# that flag at invocation time to bundled BoringSSL and disable the unused web UI.
 cmake() {
   local -a rewritten=()
   local arg
@@ -31,22 +37,35 @@ cmake() {
 export -f cmake
 export real_cmake
 
-# If every existing CUDA build predates the bundled-HTTPS configuration, force
-# coder-local through its normal update/configure/build path once.  CMake's
-# incremental build keeps this cheap after the first repair.
+# Trust an existing build only if all three are true:
+#   1) llama-server exists,
+#   2) bundled HTTPS was configured,
+#   3) the actual cached C++ compiler is GCC 11..14.
+# A failed reconfigure can leave BoringSSL=ON beside an old executable, so the
+# CMake cache alone is not enough.  Stale build dirs are disposable build output;
+# remove them so CMake cannot pin us to the previous GCC 9 compiler.
 https_build=0
 shopt -s nullglob
 for cache in "$STATE_DIR"/llama.cpp/build-cuda-*/CMakeCache.txt; do
   build="${cache%/CMakeCache.txt}"
-  if [[ -x "$build/bin/llama-server" ]] && grep -q '^LLAMA_BUILD_BORINGSSL:BOOL=ON$' "$cache"; then
+  cached_cxx="$(sed -n 's/^CMAKE_CXX_COMPILER:[^=]*=//p' "$cache" | head -1)"
+  cached_major="$(claude_local_hostcc_major "$cached_cxx" 2>/dev/null || true)"
+  if [[ -x "$build/bin/llama-server" ]] \
+     && grep -q '^LLAMA_BUILD_BORINGSSL:BOOL=ON$' "$cache" \
+     && [[ "$cached_major" =~ ^[0-9]+$ ]] \
+     && (( cached_major >= 11 && cached_major <= 14 )); then
     https_build=1
-    break
+    continue
   fi
+  printf '\033[1;36m[qwen-local]\033[0m discarding stale llama.cpp build cache %s (compiler=%s, gcc-major=%s)\n' \
+    "$build" "${cached_cxx:-unknown}" "${cached_major:-unknown}" >&2
+  rm -rf -- "$build"
 done
 shopt -u nullglob
+
 if (( ! https_build )); then
   export CLAUDE_LOCAL_REBUILD=1
-  printf '\033[1;36m[qwen-local]\033[0m repairing/building llama.cpp with bundled HTTPS support (one-time)\n' >&2
+  printf '\033[1;36m[qwen-local]\033[0m repairing/building llama.cpp with bundled HTTPS + modern host compiler (one-time)\n' >&2
 fi
 
 exec "$ROOT/coder-local" --frontend qwen "$@"
