@@ -133,6 +133,30 @@ def hf_spec(model,artifact):
     if m.get('gguf_repo') and artifact:return f"{m['gguf_repo']}:{artifact}"
     return None
 
+def provisioned_parallel(model,context,row):
+    """Memory-safe native slot reservation for generic llama.cpp.
+
+    Only memory is being provisioned here. Broker admission remains C1 until the
+    idle calibrator proves a faster concurrency envelope. The planner's own
+    conservative model treats at most 15% of profile memory as context-dependent;
+    extra slots use that estimate with another 25% margin plus global headroom.
+    """
+    if row.get('backend')!='llama.cpp' or row.get('gpu') is None or row.get('req') is None:return 1
+    try:g=next(x for x in plan.inventory() if x.index==int(row['gpu']))
+    except Exception:return 1
+    req=int(row['req']);slot_extra=None
+    for p in plan.PROFILES.get(model,()):
+        if p.quant==row.get('artifact'):
+            frac=max(0.0,min(1.0,float(context)/max(1,p.native_context)))
+            slot_extra=max(512,int(p.required_mib*.15*frac*1.25));break
+    if slot_extra is None:slot_extra=max(768,int(req*.12))
+    reserve=max(1024,int(g.total_mib*.04));budget=g.free_mib-req-reserve
+    memory_slots=1+max(0,budget//max(1,slot_extra))
+    try:speed_slots=max(1,int(float(row.get('tg') or policy.MIN_DECODE_TOK_S)//policy.MIN_DECODE_TOK_S))
+    except Exception:speed_slots=1
+    slots=max(1,min(8,memory_slots,speed_slots))
+    return slots
+
 def registry():return registry_store.load(REGISTRY)
 def healthy_resident(model,context):
     obj=registry()
@@ -173,20 +197,37 @@ def ensure_broker(cfg):
             time.sleep(.25)
         raise SystemExit(f'broker did not become ready; inspect {log}')
 def backend_endpoint(port):return f'http://127.0.0.1:{port}/v1'
+def served_model(endpoint,fallback):
+    obj=get_json(endpoint.rstrip('/')+'/models',1.5)
+    try:return str((obj.get('data') or [{}])[0].get('id') or fallback)
+    except Exception:return fallback
 def commission(model,context,row):
-    gpu=row.get('gpu');backend=row['backend'];artifact=row.get('artifact');port=free_port(20880);endpoint=backend_endpoint(port);logs=STATE/'logs';logs.mkdir(parents=True,exist_ok=True)
+    gpu=row.get('gpu');backend=row['backend'];artifact=row.get('artifact');port=free_port(20880);endpoint=backend_endpoint(port);logs=STATE/'logs';logs.mkdir(parents=True,exist_ok=True);slots=1
     if backend=='llama.cpp':
         spec=hf_spec(model,artifact)
         if not spec:raise SystemExit(f'cannot resolve GGUF artifact {model} / {artifact}')
-        cmd=[sys.executable,ROOT/'pushbutton-instance','--hf-spec',spec,'--alias',model,'--port',port,'--context',context,'--parallel',1]
+        slots=provisioned_parallel(model,context,row)
+        cmd=[sys.executable,ROOT/'pushbutton-instance','--hf-spec',spec,'--alias',model,'--port',port,'--context',context,'--parallel',slots]
         if gpu is not None:cmd += ['--gpus',str(gpu)]
     elif backend in {'llamampere','vllm-qwen38-3090','ninfer-3090','volta-llama','sglang-v100','vllm-flashnext-3090'}:
         cmd=[sys.executable,ROOT/'pushbutton-backend','serve',backend,model,'--port',port,'--context',context]
         if gpu is not None:cmd += ['--gpus',str(gpu)]
     else:raise SystemExit(f'backend {backend!r} is catalogued but does not yet have an automatic local launcher')
+    if slots>1:say(f'pre-provisioning {slots} native llama.cpp slots; broker admission remains C1 until calibrated')
     proc=start_detached(cmd,logs/f'{model.replace(":","-")}-{backend}-{port}.log',f'{model} / {backend}')
-    if not wait_endpoint(proc,endpoint):raise SystemExit(f'backend failed to become ready; inspect {logs}')
-    inst={'id':f'{model}-{backend}-{port}','model':model,'aliases':[model],'backend':backend,'artifact':artifact,'endpoint':endpoint,'pid':proc.pid,'max_context':context,'framework_max_concurrency':1,'measured_envelopes':[{'concurrency':1,'max_context':context,'safe':True,'evidence':'PROVEN'}],'tg':row.get('tg'),'tg_measured':row.get('evidence')=='MEASURED','healthy':True,'gpu':gpu,'required_mib':row.get('req')}
+    if not wait_endpoint(proc,endpoint):
+        if backend=='llama.cpp' and slots>1:
+            try:proc.terminate();proc.wait(timeout=5)
+            except Exception:
+                try:proc.kill()
+                except Exception:pass
+            warn(f'{slots}-slot memory provisioning did not start cleanly; falling back automatically to C1')
+            slots=1;cmd=[sys.executable,ROOT/'pushbutton-instance','--hf-spec',spec,'--alias',model,'--port',port,'--context',context,'--parallel',1]
+            if gpu is not None:cmd += ['--gpus',str(gpu)]
+            proc=start_detached(cmd,logs/f'{model.replace(":","-")}-{backend}-{port}-c1.log',f'{model} / {backend} C1 fallback')
+            if not wait_endpoint(proc,endpoint):raise SystemExit(f'backend failed to become ready even at C1; inspect {logs}')
+        else:raise SystemExit(f'backend failed to become ready; inspect {logs}')
+    inst={'id':f'{model}-{backend}-{port}','model':model,'served_model':served_model(endpoint,model),'aliases':[model],'backend':backend,'artifact':artifact,'endpoint':endpoint,'pid':proc.pid,'max_context':context,'framework_max_concurrency':slots,'measured_envelopes':[{'concurrency':1,'max_context':context,'safe':True,'evidence':'PROVEN'}],'tg':row.get('tg'),'tg_measured':row.get('evidence')=='MEASURED','healthy':True,'gpu':gpu,'required_mib':row.get('req'),'provisioned_slots':slots,'calibration_safe':bool(backend=='llama.cpp' and slots>1)}
     registry_store.append_instance(inst,REGISTRY);return inst
 
 def ensure_qwen():
