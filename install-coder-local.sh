@@ -8,6 +8,8 @@ SYSTEM=0
 [[ "${1:-}" == --system ]] && { SYSTEM=1; shift; }
 SELECT=0
 [[ "${1:-}" == --select ]] && { SELECT=1; shift; }
+INSTALL_ONLY="${PUSHBUTTON_INSTALL_ONLY:-0}"
+[[ "${1:-}" == --install-only ]] && { INSTALL_ONLY=1; shift; }
 command -v git >/dev/null || { echo "git is required" >&2; exit 1; }
 mkdir -p "$ROOT"
 if [[ -d "$DEST/.git" ]]; then
@@ -18,7 +20,7 @@ else
 fi
 chmod +x \
   "$DEST/pushbutton" "$DEST/pushbutton-instance" "$DEST/pushbutton-broker" "$DEST/pushbutton-proxy" \
-  "$DEST/coder-local" "$DEST/opencode-local" "$DEST/deepseek-local" "$DEST/mini-swe-local" \
+  "$DEST/coder-local" "$DEST/qwen-local" "$DEST/opencode-local" "$DEST/deepseek-local" "$DEST/mini-swe-local" \
   "$DEST/pushbutton-backend" "$DEST/pushbutton-bench" "$DEST/pushbutton-select" "$DEST/pushbutton-observe"
 
 install_wrapper(){
@@ -30,7 +32,7 @@ install_wrapper(){
 }
 
 qwen_defaults="$(printf '%q' "$DEST/configs/qwen-local-defaults.json")"
-qwen_body="env QWEN_CODE_SYSTEM_DEFAULTS_PATH=$qwen_defaults $(printf '%q' "$DEST/coder-local") --frontend qwen"
+qwen_body="env QWEN_CODE_SYSTEM_DEFAULTS_PATH=$qwen_defaults $(printf '%q' "$DEST/qwen-local")"
 opencode_body="$(printf '%q' "$DEST/opencode-local")"
 deepseek_body="$(printf '%q' "$DEST/deepseek-local")"
 mini_body="$(printf '%q' "$DEST/mini-swe-local")"
@@ -78,5 +80,6 @@ printf '[pushbutton] Installed unified runtime: pushbutton\n'
 printf '[pushbutton] Expert frontends/tools remain available: qwen-local, opencode-local, deepseek-local, mini-swe-local, pushbutton-select, pushbutton-bench, pushbutton-observe\n'
 
 export QWEN_CODE_SYSTEM_DEFAULTS_PATH="$DEST/configs/qwen-local-defaults.json"
+if ((INSTALL_ONLY)); then exit 0; fi
 if ((SELECT)); then exec "$DEST/pushbutton-select" "$@"; fi
 exec "$DEST/pushbutton" "$@"
