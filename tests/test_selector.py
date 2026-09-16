@@ -11,8 +11,8 @@ class SelectorTests(unittest.TestCase):
     def test_16g_qwen38_blocks_ninfer_and_fits_iq3(self):
         cp=self.run_sel('qwen3.8:27b','--gpu','0','--vram-limit','16G','--no-interactive')
         self.assertIn('IQ3_XXS',cp.stdout)
-        self.assertRegex(cp.stdout,r'BLOCK\s+ninfer-3090')
-        self.assertRegex(cp.stdout,r'UNVERIFIED\s+llamampere|UNVERIFIED\s+vllm-qwen38-3090')
+        self.assertRegex(cp.stdout,r'BLOCK\s+\S+\s+ninfer-3090')
+        self.assertRegex(cp.stdout,r'UNVERIFIED\s+\S+\s+(llamampere|vllm-qwen38-3090)')
         self.assertIn('Recommended launch:',cp.stdout)
 
     def test_24g_table_exposes_measured_upstream_speed(self):
@@ -22,6 +22,7 @@ class SelectorTests(unittest.TestCase):
         self.assertIn('llamampere',cp.stdout)
         self.assertIn('99',cp.stdout)
         self.assertIn('MEASURED',cp.stdout)
+        self.assertIn('25 TG/s',cp.stdout)
 
     def test_model_optional_noninteractive_defaults_safely(self):
         cp=self.run_sel('--vram-limit','16G','--ram-limit','32G','--no-interactive','--json')
@@ -29,6 +30,8 @@ class SelectorTests(unittest.TestCase):
         self.assertEqual(obj['model'],'qwen3.8:27b')
         self.assertEqual(obj['vram_limit_mib'],16384)
         self.assertEqual(obj['ram_limit_mib'],32768)
+        self.assertEqual(obj['speed_floor_tg'],25.0)
+        self.assertTrue(all('speed_status' in r for r in obj['rows']))
 
     def test_telemetry_is_explicit_opt_in(self):
         with tempfile.TemporaryDirectory() as td:
