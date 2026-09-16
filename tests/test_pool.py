@@ -26,9 +26,13 @@ class PoolTests(unittest.TestCase):
         self.assertIsNone(pool.choose_instance([x],'qwen3.8:27b',12000))
 
     def test_measured_concurrency_expands_capacity(self):
-        x=self.inst(measured_envelopes=[{'concurrency':4,'max_context':16384,'safe':True}])
+        x=self.inst(measured_envelopes=[{'concurrency':4,'max_context':16384,'safe':True,'tg_per_client_p10':30.0}])
         self.assertEqual(x.capacity(8192),4)
         self.assertEqual(x.capacity(32768),1)
+
+    def test_slow_concurrent_envelope_does_not_expand(self):
+        x=self.inst(measured_envelopes=[{'concurrency':4,'max_context':65536,'safe':True,'tg_per_client_p10':19.0}])
+        self.assertEqual(x.capacity(8192),1)
 
     def test_auto_prefers_non_slow(self):
         slow=self.inst(id='slow',tg=12.0);unknown=self.inst(id='unknown',tg=None,tg_measured=False)
