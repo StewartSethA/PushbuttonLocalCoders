@@ -14,7 +14,9 @@ command -v git >/dev/null || { echo "git is required" >&2; exit 1; }
 mkdir -p "$ROOT"
 if [[ -d "$DEST/.git" ]]; then
   git -C "$DEST" fetch --depth=1 origin "$REF"
-  git -C "$DEST" checkout -q --detach FETCH_HEAD
+  # This is an installer-managed immutable checkout, not a user worktree.
+  # Always replace local edits/stale generated changes with the requested ref.
+  git -C "$DEST" checkout -q -f --detach FETCH_HEAD
 else
   git clone --depth=1 --branch "$REF" "$REPO_URL" "$DEST"
 fi
