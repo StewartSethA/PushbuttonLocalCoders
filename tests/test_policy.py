@@ -1,10 +1,10 @@
-import importlib.util
 import pathlib
+import sys
 import unittest
 
 ROOT=pathlib.Path(__file__).resolve().parents[1]
-spec=importlib.util.spec_from_file_location('pushbutton_policy',ROOT/'lib/pushbutton_policy.py')
-policy=importlib.util.module_from_spec(spec); spec.loader.exec_module(policy)
+sys.path.insert(0,str(ROOT/'lib'))
+import pushbutton_policy as policy
 
 
 class PolicyTests(unittest.TestCase):
