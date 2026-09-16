@@ -30,6 +30,7 @@ on:
       - "tests/test_policy.py"
       - "tests/test_pool.py"
       - "tests/test_registry.py"
+      - "tests/test_broker.py"
       - ".github/workflows/coder-frontends-tests.yml"
 permissions:
   contents: read
@@ -46,8 +47,8 @@ jobs:
           python3 -m json.tool configs/placement.example.json >/dev/null
           python3 -m json.tool configs/model-catalog.json >/dev/null
           python3 -m json.tool benchmarks/aggregate.json >/dev/null
-      - name: Unit tests
-        run: python3 -m unittest -v tests/test_coder_local.py tests/test_selector.py tests/test_metrics.py tests/test_policy.py tests/test_pool.py tests/test_registry.py
+      - name: Unit and broker integration tests
+        run: python3 -m unittest -v tests/test_coder_local.py tests/test_selector.py tests/test_metrics.py tests/test_policy.py tests/test_pool.py tests/test_registry.py tests/test_broker.py
       - name: Planner self-test
         run: ./coder-local --self-test
       - name: Selector smoke
