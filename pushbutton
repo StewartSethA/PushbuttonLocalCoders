@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+"""PushbuttonLocalCoders unified zero-argument configurator and runner.
+
+Normal flow:
+  detect -> choose/reuse fast model+backend -> commission if needed -> broker -> frontend
+
+Expert tools remain available, but ordinary users should not need to invoke them.
+"""
+from __future__ import annotations
+import argparse, json, os, pathlib, shutil, socket, subprocess, sys, time, urllib.request
+
+ROOT=pathlib.Path(__file__).resolve().parent
+sys.path.insert(0,str(ROOT/'lib'))
+import claude_local_plan as plan
+import pushbutton_metrics as metrics
+import pushbutton_policy as policy
+
+CONFIG_DIR=pathlib.Path(os.environ.get('PUSHBUTTON_CONFIG_DIR',pathlib.Path.home()/'.config/pushbutton-local'))
+CONFIG=CONFIG_DIR/'runtime.json'
+STATE=pathlib.Path(os.environ.get('PUSHBUTTON_RUNTIME_STATE',pathlib.Path.home()/'.local/share/pushbutton/runtime'))
+REGISTRY=STATE/'instances.json'
+CATALOG_PATH=ROOT/'configs/model-catalog.json'
+DEFAULT_BROKER_PORT=19780
+
+
+def say(s):print('[pushbutton] '+s,file=sys.stderr,flush=True)
+def warn(s):print('\n*** PUSHBUTTON WARNING ***\n'+s+'\n',file=sys.stderr,flush=True)
+def read_json(p,default):
+    try:return json.loads(p.read_text())
+    except Exception:return default
+def write_json(p,obj):
+    p.parent.mkdir(parents=True,exist_ok=True);t=p.with_suffix(p.suffix+'.tmp');t.write_text(json.dumps(obj,indent=2)+'\n');t.replace(p)
+def catalog():return read_json(CATALOG_PATH,{}).get('models',{})
+def aliases():
+    a={}
+    for k in plan.PROFILES:a[k.lower()]=k
+    for k,v in catalog().items():
+        a[k.lower()]=k
+        for z in v.get('aliases',[]):a[str(z).lower()]=k
+    a.update({'qwen38':'qwen3.8:27b','q38':'qwen3.8:27b'})
+    return a
+def canon(x):
+    k=str(x).lower().strip();return aliases().get(k,k)
+def model_context(model):
+    if model in catalog():return int(catalog()[model].get('context') or 262144)
+    if model in plan.PROFILES:return max(int(p.native_context) for p in plan.PROFILES[model])
+    return 262144
+
+def free_port(start):
+    for p in range(start,min(65535,start+1000)):
+        s=socket.socket()
+        try:s.bind(('127.0.0.1',p));return p
+        except OSError:pass
+        finally:s.close()
+    raise RuntimeError('no free local port found')
+def get_json(url,timeout=.6):
+    try:
+        with urllib.request.urlopen(url,timeout=timeout) as r:return json.load(r)
+    except Exception:return None
+def endpoint_ok(url):return bool(get_json(url.rstrip('/')+'/models'))
+def broker_ok(port):
+    x=get_json(f'http://127.0.0.1:{port}/v1/models');return isinstance(x,dict) and any((r.get('owned_by')=='pushbutton') for r in x.get('data',[]) if isinstance(r,dict))
+
+def choose_model(cfg,arg):
+    if arg:return canon(arg)
+    if cfg.get('model'):return canon(cfg['model'])
+    choices=['qwen3.8:27b','ornith-1.5:35b-a3b','ornith-1.5:9b','deepseek-v4.1-flash']
+    if sys.stdin.isatty():
+        print('\nModel family:')
+        for i,m in enumerate(choices,1):print(f' {i}. {catalog().get(m,{}).get("display",m)}')
+        raw=input('Choose [1]: ').strip() or '1'
+        try:return choices[int(raw)-1]
+        except Exception:return canon(raw) if raw else choices[0]
+    return choices[0]
+
+def configure(cfg,args):
+    first=not bool(cfg)
+    model=choose_model(cfg,args.model);cfg['model']=model
+    default_ctx=min(model_context(model),int(cfg.get('context') or 65536))
+    ctx=int(args.context or default_ctx)
+    if first and sys.stdin.isatty() and args.context is None:
+        raw=input(f'Context per request [{ctx}]: ').strip()
+        if raw:
+            try:ctx=int(raw)
+            except ValueError:pass
+    cfg['context']=min(ctx,model_context(model))
+    if args.frontend:cfg['frontend']=args.frontend
+    elif not cfg.get('frontend'):
+        cfg['frontend']='qwen'
+        if first and sys.stdin.isatty():
+            raw=input('Frontend [qwen/opencode/none] [qwen]: ').strip().lower()
+            if raw in {'qwen','opencode','none'}:cfg['frontend']=raw
+    if args.telemetry_on:metrics.set_telemetry(True,args.telemetry_url)
+    elif args.telemetry_off:metrics.set_telemetry(False)
+    elif first and sys.stdin.isatty() and not metrics.telemetry_consent_recorded():
+        raw=input('Contribute anonymous compact performance measurements? [y/N]: ').strip().lower()
+        metrics.set_telemetry(raw in {'y','yes'},args.telemetry_url)
+    write_json(CONFIG,cfg);return cfg
+
+def selector_views(model,context):
+    gpus=[]
+    try:gpus=plan.inventory()
+    except Exception:pass
+    indices=[g.index for g in gpus] or [None];out=[]
+    for idx in indices:
+        cmd=[sys.executable,str(ROOT/'pushbutton-select'),model,'--context',str(context),'--no-interactive','--json']
+        if idx is not None:cmd += ['--gpu',str(idx)]
+        try:
+            obj=json.loads(subprocess.check_output(cmd,text=True,stderr=subprocess.DEVNULL));
+            for r in obj.get('rows',[]):
+                if r.get('status')=='FIT':out.append({**r,'gpu':idx})
+        except Exception:pass
+    return out
+
+def quality_number(x):
+    try:return float(str(x).replace('~','').replace('*',''))
+    except Exception:return 0.0
+def choose_candidate(rows,allow_slow=False):
+    if not rows:return None
+    def speed(r):return policy.speed_label(r.get('tg'),measured=r.get('evidence')=='MEASURED')[0]
+    okay=[r for r in rows if speed(r)=='OK']
+    unknown=[r for r in rows if speed(r)=='UNKNOWN']
+    pool=okay or (unknown if unknown else rows)
+    if not allow_slow and not okay and not unknown:
+        best=max(rows,key=lambda r:r.get('tg') or 0);label,msg=policy.speed_label(best.get('tg'),measured=best.get('evidence')=='MEASURED');warn((msg or 'selected model is slow')+'\nNo >=25 tok/s fitting alternative was found.')
+    return max(pool,key=lambda r:(1 if r.get('evidence')=='MEASURED' else 0,r.get('tg') or 0,quality_number(r.get('quality')), -(r.get('req') or 0)))
+def hf_spec(model,artifact):
+    if model in plan.PROFILES:
+        for p in plan.PROFILES[model]:
+            if p.quant==artifact:return p.hf_spec
+    m=catalog().get(model,{})
+    if m.get('gguf_repo') and artifact:return f"{m['gguf_repo']}:{artifact}"
+    return None
+
+def registry():return read_json(REGISTRY,{'instances':[]})
+def save_registry(obj):write_json(REGISTRY,obj)
+def healthy_resident(model,context):
+    obj=registry();changed=False
+    for x in obj.get('instances',[]):
+        if not x.get('endpoint'):continue
+        if not endpoint_ok(x['endpoint']):
+            x['healthy']=False;changed=True;continue
+        x['healthy']=True
+        names={canon(x.get('model','')),*[canon(a) for a in x.get('aliases',[])]}
+        if canon(model) in names and int(x.get('max_context') or 0)>=context:
+            if changed:save_registry(obj)
+            return x
+    if changed:save_registry(obj)
+    return None
+
+def start_detached(cmd,log,name):
+    log.parent.mkdir(parents=True,exist_ok=True);f=log.open('ab',buffering=0)
+    say(f'commissioning {name}; log={log}')
+    return subprocess.Popen([str(x) for x in cmd],stdout=f,stderr=subprocess.STDOUT,start_new_session=True,env=os.environ.copy())
+def wait_endpoint(proc,endpoint,timeout=3600):
+    deadline=time.monotonic()+timeout
+    while time.monotonic()<deadline:
+        if proc.poll() is not None:return False
+        if endpoint_ok(endpoint):return True
+        time.sleep(1)
+    return False
+
+def ensure_broker(cfg):
+    port=int(cfg.get('broker_port') or DEFAULT_BROKER_PORT)
+    if broker_ok(port):return port
+    # Never overwrite an unrelated listener.
+    if free_port(port)!=port:port=free_port(DEFAULT_BROKER_PORT+1)
+    log=STATE/'logs/broker.log';start_detached([sys.executable,ROOT/'pushbutton-broker','--port',port],log,'broker')
+    deadline=time.monotonic()+20
+    while time.monotonic()<deadline:
+        if broker_ok(port):cfg['broker_port']=port;write_json(CONFIG,cfg);return port
+        time.sleep(.25)
+    raise SystemExit(f'broker did not become ready; inspect {log}')
+def backend_endpoint(port):return f'http://127.0.0.1:{port}/v1'
+def commission(model,context,row):
+    gpu=row.get('gpu');backend=row['backend'];artifact=row.get('artifact');port=free_port(20880);endpoint=backend_endpoint(port);logs=STATE/'logs';logs.mkdir(parents=True,exist_ok=True)
+    if backend=='llama.cpp':
+        spec=hf_spec(model,artifact)
+        if not spec:raise SystemExit(f'cannot resolve GGUF artifact {model} / {artifact}')
+        cmd=[sys.executable,ROOT/'pushbutton-instance','--hf-spec',spec,'--alias',model,'--port',port,'--context',context,'--parallel',1]
+        if gpu is not None:cmd += ['--gpus',str(gpu)]
+    elif backend in {'llamampere','vllm-qwen38-3090','ninfer-3090','volta-llama','sglang-v100','vllm-flashnext-3090'}:
+        cmd=[sys.executable,ROOT/'pushbutton-backend','serve',backend,model,'--port',port,'--context',context]
+        if gpu is not None:cmd += ['--gpus',str(gpu)]
+    else:raise SystemExit(f'backend {backend!r} is catalogued but does not yet have an automatic local launcher')
+    proc=start_detached(cmd,logs/f'{model.replace(":","-")}-{backend}-{port}.log',f'{model} / {backend}')
+    if not wait_endpoint(proc,endpoint):raise SystemExit(f'backend failed to become ready; inspect {logs}')
+    inst={'id':f'{model}-{backend}-{port}','model':model,'aliases':[model],'backend':backend,'artifact':artifact,'endpoint':endpoint,'pid':proc.pid,'max_context':context,'framework_max_concurrency':1,'measured_envelopes':[{'concurrency':1,'max_context':context,'safe':True}],'tg':row.get('tg'),'tg_measured':row.get('evidence')=='MEASURED','healthy':True,'gpu':gpu}
+    obj=registry();obj.setdefault('instances',[]).append(inst);save_registry(obj);return inst
+
+def ensure_qwen():
+    if shutil.which('qwen'):return shutil.which('qwen')
+    say('installing official Qwen Code frontend')
+    subprocess.run('curl -fsSL https://qwen-code-assets.oss-cn-hangzhou.aliyuncs.com/installation/install-qwen-standalone.sh | bash',shell=True,check=True)
+    p=pathlib.Path.home()/'.local/bin/qwen'
+    if p.exists():return str(p)
+    return shutil.which('qwen') or (_ for _ in ()).throw(SystemExit('Qwen Code install finished but qwen was not found'))
+def launch_qwen(port,context,extra):
+    qwen=ensure_qwen();qhome=STATE/'frontends/qwen';qhome.mkdir(parents=True,exist_ok=True)
+    settings={'modelProviders':{'openai':[{'id':'pushbutton/auto','name':'Pushbutton automatic resident pool','envKey':'PUSHBUTTON_LOCAL_API_KEY','baseUrl':f'http://127.0.0.1:{port}/v1','streamIdleTimeoutMs':0,'generationConfig':{'contextWindowSize':context,'maxRetries':2}}]},'security':{'auth':{'selectedType':'openai'}},'model':{'name':'pushbutton/auto'},'experimental':{'agentTeam':True},'privacy':{'usageStatisticsEnabled':False},'telemetry':{'enabled':False}}
+    write_json(qhome/'settings.json',settings);env=os.environ.copy();env.update({'QWEN_HOME':str(qhome),'PUSHBUTTON_LOCAL_API_KEY':'pushbutton-local','QWEN_CODE_ENABLE_AGENT_TEAM':'1','QWEN_USAGE_STATISTICS_ENABLED':'0','QWEN_TELEMETRY_ENABLED':'0'})
+    os.execvpe(qwen,[qwen,'--auth-type','openai','--model','pushbutton/auto',*extra],env)
+def ensure_opencode():
+    if shutil.which('opencode'):return shutil.which('opencode')
+    subprocess.run('curl -fsSL https://opencode.ai/install | bash',shell=True,check=True);return shutil.which('opencode') or str(pathlib.Path.home()/'.opencode/bin/opencode')
+def launch_opencode(port,context,extra):
+    exe=ensure_opencode();p=STATE/'frontends/opencode/opencode.json';p.parent.mkdir(parents=True,exist_ok=True)
+    obj={'$schema':'https://opencode.ai/config.json','model':'pushbutton/pushbutton/auto','provider':{'pushbutton':{'npm':'@ai-sdk/openai-compatible','name':'Pushbutton','options':{'baseURL':f'http://127.0.0.1:{port}/v1','apiKey':'pushbutton-local'},'models':{'pushbutton/auto':{'name':'Pushbutton automatic resident pool','limit':{'context':context,'output':32768},'capabilities':{'tools':True,'input':['text'],'output':['text']}}}}}}
+    write_json(p,obj);env=os.environ.copy();env.update({'OPENCODE_CONFIG':str(p),'OPENCODE_DISABLE_AUTOUPDATE':'1'});os.execvpe(exe,[exe,*extra],env)
+def show_status(cfg):
+    port=int(cfg.get('broker_port') or DEFAULT_BROKER_PORT);x=get_json(f'http://127.0.0.1:{port}/pushbutton/status',2)
+    if not x:print('Pushbutton broker is not running.');return
+    print(json.dumps(x,indent=2))
+
+def main():
+    ap=argparse.ArgumentParser(prog='pushbutton');ap.add_argument('model',nargs='?');ap.add_argument('--context',type=int);ap.add_argument('--frontend',choices=['qwen','opencode','none']);ap.add_argument('--status',action='store_true');ap.add_argument('--allow-slow',action='store_true');ap.add_argument('--reconfigure',action='store_true');ap.add_argument('--telemetry-on',action='store_true');ap.add_argument('--telemetry-off',action='store_true');ap.add_argument('--telemetry-url');ap.add_argument('frontend_args',nargs=argparse.REMAINDER);a=ap.parse_args()
+    cfg={} if a.reconfigure else read_json(CONFIG,{})
+    if a.status:return show_status(cfg)
+    cfg=configure(cfg,a);model=cfg['model'];ctx=int(cfg['context'])
+    resident=healthy_resident(model,ctx)
+    if resident:say(f"reusing {resident['model']} at {resident['endpoint']}")
+    else:
+        rows=selector_views(model,ctx);row=choose_candidate(rows,a.allow_slow)
+        if not row:raise SystemExit(f'no fitting local configuration found for {model} at {ctx:,} context')
+        label,msg=policy.speed_label(row.get('tg'),measured=row.get('evidence')=='MEASURED')
+        if label in {'SLOW','VERY_SLOW'}:warn(msg or f'{model} is expected to decode below {policy.MIN_DECODE_TOK_S:.0f} tok/s')
+        say(f"selected {model} / {row['backend']} / {row['artifact']} on GPU {row.get('gpu')} — TG {row.get('tg') or '?'} tok/s ({row.get('evidence')})")
+        resident=commission(model,ctx,row)
+    broker_port=ensure_broker(cfg);say(f'broker ready: http://127.0.0.1:{broker_port}/v1')
+    frontend=cfg.get('frontend','qwen')
+    if frontend=='none':print(f'http://127.0.0.1:{broker_port}/v1');return
+    extra=list(a.frontend_args);extra=extra[1:] if extra[:1]==['--'] else extra
+    if frontend=='opencode':launch_opencode(broker_port,ctx,extra)
+    launch_qwen(broker_port,ctx,extra)
+
+if __name__=='__main__':main()
