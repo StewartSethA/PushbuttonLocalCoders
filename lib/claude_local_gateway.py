@@ -3,13 +3,18 @@
 
 Claude Code sometimes sends canonical Claude family IDs even when custom model
 aliases are configured. This proxy routes by family (haiku/sonnet/opus/fable)
-and by our explicit local aliases, then forwards the request unchanged except
-for the model field to the matching llama-server `/v1/messages` endpoint.
+and by our explicit local aliases, then forwards requests to the matching local
+llama-server `/v1/messages` endpoint.
 
-The proxy deliberately retries only before any downstream response bytes are
-committed. Once an SSE stream has started, replaying the request would duplicate
-partial model output; on a later upstream failure we therefore log and close the
-connection cleanly so Claude Code can apply its own request-level retry policy.
+For tool-bearing requests the gateway enforces the Qwen fixed-template JSON tool
+format per request.  This is deliberately done here, rather than trusting only a
+server environment default, because llama.cpp's Anthropic adapter explicitly
+passes `chat_template_kwargs` through to the chat-template/parser path.
+
+Before listening, the gateway also performs a real forced tool call against every
+unique configured backend.  Claude Code is never launched if a loaded quant,
+template, or parser leaks raw tool markup instead of returning a structured
+Anthropic `tool_use` block.
 """
 from __future__ import annotations
 
@@ -25,6 +30,10 @@ HOP_HEADERS = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "transfer-encoding", "upgrade", "host", "content-length",
 }
+RAW_TOOL_MARKERS = (
+    "<tool_call", "</tool_call", "<function=", "</function>",
+    "<parameter=", "</parameter>", "</prompt>", "</tool>", "</tool_calls>",
+)
 
 
 def family_for(model: str) -> str | None:
@@ -33,6 +42,29 @@ def family_for(model: str) -> str | None:
         if family in m:
             return family
     return None
+
+
+def apply_local_tool_policy(body: dict) -> None:
+    """Make tool-bearing Qwen requests deterministic and parser-friendly."""
+    if not body.get("tools"):
+        return
+    kwargs = body.get("chat_template_kwargs")
+    if not isinstance(kwargs, dict):
+        kwargs = {}
+    # froggeric Qwen fixed templates default to tagged XML.  JSON_NATIVE is much
+    # less fragile in current llama.cpp and avoids the Qwen3.6 </parameter> bug.
+    kwargs["tool_call_format"] = "json"
+    kwargs.setdefault("preserve_reasoning", True)
+    body["chat_template_kwargs"] = kwargs
+
+    # Qwen3.6's tagged tool parser is known to become materially less reliable at
+    # high sampling temperatures.  Claude Code does not need creative sampling
+    # while selecting/serializing a tool call, so cap only tool-bearing requests.
+    try:
+        temp = float(body.get("temperature", 0.2))
+    except (TypeError, ValueError):
+        temp = 0.2
+    body["temperature"] = min(temp, 0.2)
 
 
 class Router:
@@ -55,10 +87,108 @@ class Router:
         # driver rather than ever falling through to a cloud API.
         return self.roles["sonnet"]
 
+    def unique_routes(self) -> list[dict]:
+        out: list[dict] = []
+        seen: set[tuple[str, str]] = set()
+        for route in self.roles.values():
+            key = (str(route.get("url", "")), str(route.get("backend_alias", "")))
+            if key not in seen:
+                seen.add(key)
+                out.append(route)
+        return out
+
+
+def backend_connection(route: dict) -> http.client.HTTPConnection:
+    parsed = urlsplit(route["url"])
+    conn_cls = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+    return conn_cls(parsed.hostname, parsed.port, timeout=route.get("timeout", 3600))
+
+
+def probe_tool_route(route: dict) -> None:
+    """Require a real structured Anthropic tool_use response from this backend."""
+    token = "pushbutton-tool-probe-ok"
+    body = {
+        "model": route["backend_alias"],
+        "max_tokens": 512,
+        "temperature": 0,
+        "stream": False,
+        "messages": [{
+            "role": "user",
+            "content": f"Call pushbutton_probe exactly once with token {token}. Do not answer in prose.",
+        }],
+        "tools": [{
+            "name": "pushbutton_probe",
+            "description": "Startup validation tool. Always call it when requested.",
+            "input_schema": {
+                "type": "object",
+                "properties": {"token": {"type": "string"}},
+                "required": ["token"],
+                "additionalProperties": False,
+            },
+        }],
+        "tool_choice": {"type": "tool", "name": "pushbutton_probe"},
+    }
+    apply_local_tool_policy(body)
+    raw = json.dumps(body, separators=(",", ":")).encode()
+    conn = backend_connection(route)
+    try:
+        conn.request(
+            "POST", "/v1/messages", body=raw,
+            headers={"content-type": "application/json", "content-length": str(len(raw))},
+        )
+        resp = conn.getresponse()
+        payload = resp.read()
+    finally:
+        conn.close()
+
+    text = payload.decode("utf-8", "replace")
+    if resp.status < 200 or resp.status >= 300:
+        raise RuntimeError(
+            f"tool probe HTTP {resp.status} for {route['backend_alias']}: {text[:2000]}"
+        )
+    try:
+        obj = json.loads(text)
+    except Exception as exc:
+        raise RuntimeError(
+            f"tool probe returned non-JSON for {route['backend_alias']}: {text[:2000]}"
+        ) from exc
+
+    blocks = obj.get("content") if isinstance(obj, dict) else None
+    if not isinstance(blocks, list):
+        blocks = []
+    tool_blocks = [b for b in blocks if isinstance(b, dict) and b.get("type") == "tool_use"]
+    valid = any(
+        b.get("name") == "pushbutton_probe"
+        and isinstance(b.get("input"), dict)
+        and b["input"].get("token") == token
+        for b in tool_blocks
+    )
+    serialized = json.dumps(obj, ensure_ascii=False)
+    leaked = [m for m in RAW_TOOL_MARKERS if m in serialized]
+    if not valid or leaked:
+        raise RuntimeError(
+            "tool probe failed for " + str(route["backend_alias"]) +
+            (f"; raw markup leaked: {leaked}" if leaked else "; no valid tool_use block") +
+            f"; response={serialized[:3000]}"
+        )
+
+
+def probe_all_routes(router: Router) -> None:
+    for route in router.unique_routes():
+        print(
+            f"claude-local gateway: validating structured tool calls on {route['backend_alias']}...",
+            flush=True,
+        )
+        probe_tool_route(route)
+        print(
+            f"claude-local gateway: tool-call probe PASS on {route['backend_alias']}",
+            flush=True,
+        )
+
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "claude-local/0.2"
+    server_version = "claude-local/0.3"
 
     @property
     def router(self) -> Router:
@@ -81,7 +211,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlsplit(self.path).path
         if path in ("/", "/health", "/health/liveliness"):
-            return self._json(200, {"status": "ok", "local": True})
+            return self._json(200, {"status": "ok", "local": True, "tool_probe": "passed"})
         if path in ("/v1/models", "/models"):
             seen = set()
             data = []
@@ -94,9 +224,7 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(404, {"type": "error", "error": {"type": "not_found_error", "message": "local gateway route not found"}})
 
     def _backend_connection(self, route: dict):
-        parsed = urlsplit(route["url"])
-        conn_cls = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
-        return conn_cls(parsed.hostname, parsed.port, timeout=route.get("timeout", 3600))
+        return backend_connection(route)
 
     def _forward_headers(self, resp: http.client.HTTPResponse, content_length: str | None):
         self.send_response(resp.status, resp.reason)
@@ -127,6 +255,7 @@ class Handler(BaseHTTPRequestHandler):
 
         route = self.router.resolve(str(body.get("model", "")))
         body["model"] = route["backend_alias"]
+        apply_local_tool_policy(body)
         raw = json.dumps(body, separators=(",", ":")).encode()
         headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP_HEADERS}
         headers["content-type"] = "application/json"
@@ -211,8 +340,12 @@ def main() -> int:
     args = ap.parse_args()
     with open(args.config, encoding="utf-8") as f:
         config = json.load(f)
+    router = Router(config)
+    # Hard startup gate: do not advertise health and do not launch Claude Code
+    # until the exact loaded backends can produce structured tool calls.
+    probe_all_routes(router)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
-    server.router = Router(config)  # type: ignore[attr-defined]
+    server.router = router  # type: ignore[attr-defined]
     server.verbose = args.verbose  # type: ignore[attr-defined]
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     print(f"claude-local gateway listening on http://{args.host}:{args.port}", flush=True)
