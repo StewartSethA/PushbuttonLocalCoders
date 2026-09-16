@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """Pushbutton runtime policy: context, concurrency, SLA and harmless admission.
 
-The policy is deliberately conservative. Unknown backends start at C1; measured
-capacity may raise concurrency, but never beyond the serving framework's known
-hard limit.  A decode rate below MIN_DECODE_TOK_S is always surfaced as slow.
+Unknown configurations start at C1. Measured capacity may raise concurrency but
+never beyond the actual launched instance/framework ceiling. A decode rate below
+MIN_DECODE_TOK_S is always surfaced as slow.
 """
 from __future__ import annotations
-
 from dataclasses import dataclass
 
 MIN_DECODE_TOK_S = 25.0
 SLOW_SEVERE_TOK_S = 15.0
 DEFAULT_CONTEXT = 65536
+GENERIC_CONTEXT_CEILING = 4_194_304
 
 
 @dataclass(frozen=True)
@@ -23,24 +23,29 @@ class BackendLimits:
     notes: str = ""
 
 
-# These are Pushbutton launch-policy ceilings, not claims that every artifact can
-# actually reach them. The artifact/model memory envelope may reduce either one.
+# Generic framework entries are intentionally broad: the model and launched
+# instance provide the real context/concurrency ceilings. Specialized recipes are
+# narrower where Pushbutton controls a known configuration.
 BACKEND_LIMITS: dict[str, BackendLimits] = {
-    "llama.cpp": BackendLimits(262144, 8, True, notes="parallel slots; exact safe count depends on KV/state budget"),
-    "llamampere": BackendLimits(262144, 1, True, notes="3090 tuned recipe defaults to a single long-context slot"),
-    "volta-llama": BackendLimits(262144, 1, True, notes="conservative until measured on the selected Volta artifact"),
-    "vllm-qwen38-3090": BackendLimits(262144, 8, True, notes="continuous batching; memory envelope may force C1"),
-    "vllm-flashnext-3090": BackendLimits(262144, 8, True, notes="continuous batching; TP layout and KV pool constrain capacity"),
-    "sglang-v100": BackendLimits(262144, 8, True, notes="continuous batching; four-GPU recipe may still be context-bound"),
+    "llama.cpp": BackendLimits(GENERIC_CONTEXT_CEILING, 128, True, notes="parallel slots; launched --parallel and KV budget are the real ceiling"),
+    "vllm": BackendLimits(GENERIC_CONTEXT_CEILING, 1024, True, notes="continuous batching; max-num-seqs/KV pool and model context are the real ceiling"),
+    "sglang": BackendLimits(GENERIC_CONTEXT_CEILING, 1024, True, notes="continuous batching; launch settings and memory pool are the real ceiling"),
+    "ollama": BackendLimits(GENERIC_CONTEXT_CEILING, 64, True, notes="runtime model/context settings remain authoritative"),
+    "mlx": BackendLimits(GENERIC_CONTEXT_CEILING, 64, True, notes="Apple unified-memory/runtime settings remain authoritative"),
+    "llamampere": BackendLimits(262144, 1, True, notes="3090 tuned recipe currently launches one long-context slot"),
+    "volta-llama": BackendLimits(262144, 1, True, notes="current recipe is conservative C1"),
+    "vllm-qwen38-3090": BackendLimits(262144, 8, True, notes="continuous batching; exact launched image/KV pool may reduce this"),
+    "vllm-flashnext-3090": BackendLimits(262144, 8, True, notes="TP layout and KV pool constrain actual capacity"),
+    "sglang-v100": BackendLimits(262144, 8, True, notes="four-GPU recipe; memory envelope may reduce concurrency"),
     "ninfer-3090": BackendLimits(262144, 8, True, notes="native max-concurrency is fixed at engine startup"),
-    "resident": BackendLimits(262144, 1, False, notes="unknown resident endpoint: C1 until proven"),
+    "resident": BackendLimits(65536, 1, False, notes="unknown resident endpoint: C1/64K until declared or proven"),
 }
 
 
 def backend_limits(backend: str, declared_context: int | None = None, declared_concurrency: int | None = None) -> BackendLimits:
-    base = BACKEND_LIMITS.get(backend, BackendLimits(262144, 1, False, notes="unknown backend: conservative C1"))
-    ctx = min(base.max_context, declared_context) if declared_context else base.max_context
-    conc = min(base.max_concurrency, declared_concurrency) if declared_concurrency else base.max_concurrency
+    base = BACKEND_LIMITS.get(backend, BackendLimits(65536, 1, False, notes="unknown backend: conservative C1/64K"))
+    ctx = min(base.max_context, int(declared_context)) if declared_context else base.max_context
+    conc = min(base.max_concurrency, int(declared_concurrency)) if declared_concurrency else base.max_concurrency
     return BackendLimits(ctx, max(1, conc), base.dynamic_batching, base.queue_safe, base.notes)
 
 
@@ -51,7 +56,7 @@ def clamp_context(requested: int | None, *, model_context: int | None = None, ba
     requested = int(requested or DEFAULT_CONTEXT)
     if requested <= lim:
         return requested, None
-    return lim, f"requested context {requested:,} exceeds safe limit {lim:,}; clamped"
+    return lim, f"requested context {requested:,} exceeds safe model/framework/instance limit {lim:,}; clamped"
 
 
 def speed_label(tg: float | None, *, measured: bool) -> tuple[str, str | None]:
@@ -67,16 +72,18 @@ def speed_label(tg: float | None, *, measured: bool) -> tuple[str, str | None]:
 
 def proven_concurrency(*, backend: str, requested_context: int, framework_max: int | None = None,
                        measured_envelopes: list[dict] | None = None, conservative_default: int = 1) -> int:
-    """Largest concurrency proven safe at this context, capped by framework max.
+    """Largest proven-safe concurrency at this context, capped by launch/framework max.
 
-    Each envelope may contain concurrency, max_context and safe=True.  A proof at
-    a larger context is valid for a smaller request; a proof at a smaller context
-    is not promoted upward. Unknown configurations remain C1.
+    A proof at a larger context is valid for a smaller request; a proof at a
+    smaller context is not promoted upward. Unknown configurations remain C1.
     """
     hard = backend_limits(backend, declared_concurrency=framework_max).max_concurrency
     best = max(1, min(conservative_default, hard))
     for e in measured_envelopes or []:
         if not e.get("safe", True):
+            continue
+        evidence=str(e.get("evidence") or "MEASURED").upper()
+        if evidence not in {"MEASURED","PROVEN"}:
             continue
         try:
             c = int(e.get("concurrency") or 1)
