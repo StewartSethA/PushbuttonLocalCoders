@@ -6,7 +6,7 @@ model/framework context ceilings, queues rather than oversubscribing proven C1
 profiles, and records normal-use PP/TG/TTFT without storing prompt/output text.
 """
 from __future__ import annotations
-import argparse, datetime as dt, http.client, json, os, pathlib, subprocess, sys, threading, time, urllib.parse
+import argparse, datetime as dt, http.client, json, os, pathlib, subprocess, sys, threading, time, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT=pathlib.Path(__file__).resolve().parent
@@ -19,6 +19,7 @@ STATE=pathlib.Path(os.environ.get('PUSHBUTTON_RUNTIME_STATE',pathlib.Path.home()
 REGISTRY=STATE/'instances.json'
 HOP={'connection','keep-alive','proxy-authenticate','proxy-authorization','te','trailers','transfer-encoding','upgrade'}
 AUTO_NAMES={'pushbutton/auto','pushbutton/coder','pushbutton/best','auto','local-model'}
+SERVED_CACHE={}
 
 
 def now_iso():return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
@@ -75,25 +76,25 @@ class Runtime:
                 candidates=self._candidates(model,context)
                 if not candidates:
                     if queued_id:self.queued[queued_id]=max(0,self.queued.get(queued_id,1)-1)
-                    return None,'NO_COMPATIBLE_INSTANCE'
+                    return None,'NO_COMPATIBLE_INSTANCE',0
                 # Prefer any instance with immediate proven capacity.
                 chosen=next((x for x in candidates if x.active<x.capacity(context)),candidates[0])
                 cap=chosen.capacity(context)
                 if chosen.active<cap:
                     if queued_id:self.queued[queued_id]=max(0,self.queued.get(queued_id,1)-1)
-                    self.active[chosen.id]=self.active.get(chosen.id,0)+1
-                    return chosen,'ADMIT'
+                    admitted=self.active.get(chosen.id,0)+1;self.active[chosen.id]=admitted
+                    return chosen,'ADMIT',admitted
                 total_q=sum(self.queued.get(x.id,0) for x in candidates)
                 if total_q>=self.queue_limit:
                     if queued_id:self.queued[queued_id]=max(0,self.queued.get(queued_id,1)-1)
-                    return None,'REJECT_BUSY'
+                    return None,'REJECT_BUSY',0
                 if queued_id!=chosen.id:
                     if queued_id:self.queued[queued_id]=max(0,self.queued.get(queued_id,1)-1)
                     queued_id=chosen.id; self.queued[queued_id]=self.queued.get(queued_id,0)+1
                 remain=deadline-time.monotonic()
                 if remain<=0:
                     self.queued[queued_id]=max(0,self.queued.get(queued_id,1)-1)
-                    return None,'QUEUE_TIMEOUT'
+                    return None,'QUEUE_TIMEOUT',0
                 self.lock.wait(timeout=min(1.0,remain))
 
     def release(self,inst):
@@ -112,11 +113,20 @@ def endpoint_parts(endpoint):
 def upstream_path(base,path):
     if base and path.startswith(base+'/'):return path
     return base+path if base else path
-
+def resolve_served_model(inst):
+    """Map Pushbutton's stable logical name to the ID exposed by this backend."""
+    if inst.served_model:return str(inst.served_model)
+    if inst.id in SERVED_CACHE:return SERVED_CACHE[inst.id]
+    served=None
+    try:
+        with urllib.request.urlopen(inst.endpoint.rstrip('/')+'/models',timeout=1.5) as r:o=json.load(r)
+        served=str((o.get('data') or [{}])[0].get('id') or '') or None
+    except Exception:pass
+    served=served or inst.model;SERVED_CACHE[inst.id]=served;return served
 def content_event(obj):
     usage=obj.get('usage') or {}; chars=0; seen=False
     for ch in obj.get('choices') or []:
-        d=ch.get('delta') or {}; txt=d.get('content') or ch.get('text')
+        d=ch.get('delta') or {}; msg=ch.get('message') or {}; txt=d.get('content') or ch.get('text') or msg.get('content')
         if txt:chars+=len(str(txt)); seen=True
     return seen,chars,usage
 
@@ -151,15 +161,16 @@ class Handler(BaseHTTPRequestHandler):
         try:obj=json.loads(body)
         except Exception:return self.json_error(400,'request body must be JSON')
         model=str(obj.get('model') or 'pushbutton/auto'); prompt_tokens=estimate_tokens(obj); out_budget=int(obj.get('max_tokens') or obj.get('max_completion_tokens') or 4096); needed=prompt_tokens+out_budget
-        inst,decision=RUNTIME.acquire(model,needed)
+        inst,decision,admitted_concurrency=RUNTIME.acquire(model,needed)
         if not inst:
             code=429 if decision in {'REJECT_BUSY','QUEUE_TIMEOUT'} else 503
             return self.json_error(code,f'{decision}: no resident configuration can safely serve model={model!r} at about {needed:,} tokens')
-        try:self.forward(inst,obj,body,prompt_tokens)
+        try:self.forward(inst,obj,prompt_tokens,admitted_concurrency)
         finally:RUNTIME.release(inst)
 
-    def forward(self,inst,obj,body,prompt_est):
+    def forward(self,inst,obj,prompt_est,admitted_concurrency):
         host,port,base=endpoint_parts(inst.endpoint); conn=http.client.HTTPConnection(host,port,timeout=3600); start=time.perf_counter(); first=None; usage={}; chars=0
+        upstream_obj=dict(obj);upstream_obj['model']=resolve_served_model(inst);body=json.dumps(upstream_obj,separators=(',',':')).encode()
         try:
             conn.request('POST',upstream_path(base,self.path),body=body,headers=self.headers_for_upstream(len(body))); r=conn.getresponse()
         except Exception as exc:
@@ -190,12 +201,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header('Content-Length',str(len(data))); self.send_header('Connection','close'); self.end_headers(); self.wfile.write(data)
         end=time.perf_counter(); conn.close(); self.close_connection=True
         if self.path.endswith('/chat/completions') or self.path.endswith('/completions'):
-            try:self.record(inst,start,first,end,usage,prompt_est,chars,r.status)
+            try:self.record(inst,start,first,end,usage,prompt_est,chars,r.status,admitted_concurrency)
             except Exception as exc:self.log_message('metric recording skipped: %s',exc)
 
-    def record(self,inst,start,first,end,usage,prompt_est,chars,status):
+    def record(self,inst,start,first,end,usage,prompt_est,chars,status,admitted_concurrency):
         pt=usage.get('prompt_tokens') or usage.get('input_tokens') or prompt_est; ct=usage.get('completion_tokens') or usage.get('output_tokens') or max(1,round(chars/4)); ttft=(first-start) if first else None
-        obs={'schema_version':1,'timestamp_utc':now_iso(),'model':inst.model,'backend':inst.backend,'artifact':inst.artifact,'context':inst.context_limit(),'prompt_tokens':pt,'completion_tokens':ct,'pp':(pt/ttft if ttft else None),'tg':((ct-1)/(end-first) if first and end>first and ct>1 else None),'ttft':ttft,'elapsed_s':end-start,'concurrency':max(1,inst.active),'source':'normal-use','method':'broker','status_code':status}
+        obs={'schema_version':1,'timestamp_utc':now_iso(),'model':inst.model,'backend':inst.backend,'artifact':inst.artifact,'context':inst.context_limit(),'prompt_tokens':pt,'completion_tokens':ct,'pp':(pt/ttft if ttft else None),'tg':((ct-1)/(end-first) if first and end>first and ct>1 else None),'ttft':ttft,'elapsed_s':end-start,'concurrency':max(1,int(admitted_concurrency)),'source':'normal-use','method':'broker','status_code':status}
         metrics.save_observation(obs); metrics.queue_observation(obs); metrics.maybe_upload()
 
 
