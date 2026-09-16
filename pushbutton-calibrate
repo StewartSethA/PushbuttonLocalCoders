@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""Harmless idle concurrency calibrator for Pushbutton resident instances.
+
+The calibrator never changes model weights, framework settings, or VRAM
+allocations. It only exercises concurrency that was already provisioned at
+startup. A broker maintenance lease prevents live work from being routed to the
+instance during each bounded test. C>1 is promoted only when every test succeeds
+and p10 decode throughput per client remains at or above the Pushbutton floor.
+"""
+from __future__ import annotations
+import argparse, http.client, json, os, pathlib, statistics, sys, threading, time, urllib.error, urllib.parse, urllib.request
+
+ROOT=pathlib.Path(__file__).resolve().parent
+sys.path.insert(0,str(ROOT/'lib'))
+import pushbutton_policy as policy
+import pushbutton_registry as registry_store
+
+STATE=pathlib.Path(os.environ.get('PUSHBUTTON_RUNTIME_STATE',pathlib.Path.home()/'.local/share/pushbutton/runtime'))
+REGISTRY=STATE/'instances.json'
+DEFAULT_OUTPUT_TOKENS=128
+
+
+def say(s):print('[pushbutton-calibrate] '+s,file=sys.stderr,flush=True)
+def get_json(url,timeout=1.5):
+    try:
+        with urllib.request.urlopen(url,timeout=timeout) as r:return json.load(r)
+    except Exception:return None
+def post_json(url,obj,timeout=5):
+    data=json.dumps(obj,separators=(',',':')).encode()
+    req=urllib.request.Request(url,data=data,headers={'Content-Type':'application/json'})
+    try:
+        with urllib.request.urlopen(req,timeout=timeout) as r:return r.status,json.load(r)
+    except urllib.error.HTTPError as e:
+        try:return e.code,json.loads(e.read())
+        except Exception:return e.code,{'ok':False,'reason':str(e)}
+    except Exception as e:return 0,{'ok':False,'reason':str(e)}
+def endpoint_parts(endpoint):
+    u=urllib.parse.urlparse(endpoint);return u.hostname or '127.0.0.1',u.port or 80,(u.path or '').rstrip('/')
+def concurrency_levels(slots):
+    slots=max(1,int(slots or 1));out=[];c=2
+    while c<=slots:
+        out.append(c);c*=2
+    if slots>1 and slots not in out:out.append(slots)
+    return sorted(set(out))
+def calibration_depths(max_context):
+    max_context=max(1024,int(max_context or 65536))
+    vals=[4096,16384,65536,131072,max_context]
+    return sorted(set(min(max_context,x) for x in vals if min(max_context,x)>=1024))
+def _attempt_key(a):
+    return int(a.get('target_context') or 0),int(a.get('concurrency') or 1)
+def already_proven(inst,target_context,concurrency):
+    for e in inst.get('measured_envelopes') or []:
+        if not e.get('safe',True):continue
+        if str(e.get('evidence') or '').upper() not in {'MEASURED','PROVEN'}:continue
+        try:
+            if int(e.get('concurrency') or 1)>=concurrency and int(e.get('max_context') or 0)>=target_context:
+                tg=policy.envelope_client_tg(e)
+                if concurrency<=1 or (tg is not None and tg>=policy.MIN_DECODE_TOK_S):return True
+        except Exception:pass
+    return False
+def recent_failed(inst,target_context,concurrency,now=None,retry_s=21600):
+    now=time.time() if now is None else now
+    for a in inst.get('calibration_attempts') or []:
+        try:
+            if int(a.get('target_context') or 0)!=target_context:continue
+            ac=int(a.get('concurrency') or 1)
+            if ac>concurrency:continue
+            if a.get('safe') is True:continue
+            ts=float(a.get('epoch') or 0)
+            # SLA failures are configuration facts; transient transport failures retry later.
+            if a.get('reason')=='SLOW':return True
+            if now-ts<retry_s:return True
+        except Exception:pass
+    return False
+def next_plan(inst,now=None):
+    """Return the next (context, concurrency) pair worth calibrating."""
+    if not inst.get('calibration_safe'):return None
+    slots=int(inst.get('provisioned_slots') or inst.get('framework_max_concurrency') or 1)
+    if slots<=1:return None
+    for ctx in calibration_depths(inst.get('max_context') or 65536):
+        for c in concurrency_levels(slots):
+            if already_proven(inst,ctx,c):continue
+            if recent_failed(inst,ctx,c,now=now):continue
+            return ctx,c
+    return None
+def percentile10(values):
+    v=sorted(float(x) for x in values)
+    if not v:return None
+    return v[max(0,min(len(v)-1,int((len(v)-1)*.10)))]
+def evaluate_results(results,target_context,concurrency):
+    ok=[r for r in results if r.get('ok') and r.get('tg') is not None]
+    if len(ok)!=len(results) or not ok:
+        return {'safe':False,'reason':'ERROR','target_context':target_context,'concurrency':concurrency,'samples':len(ok)}
+    p10=percentile10([r['tg'] for r in ok])
+    actual=min(int(r.get('prompt_tokens') or 0)+int(r.get('completion_tokens') or 0) for r in ok)
+    completion_min=min(int(r.get('completion_tokens') or 0) for r in ok)
+    safe=bool(p10 is not None and p10>=policy.MIN_DECODE_TOK_S and completion_min>=32)
+    return {
+        'safe':safe,'reason':'PASS' if safe else 'SLOW','target_context':int(target_context),
+        'max_context':max(1024,actual),'concurrency':int(concurrency),'samples':len(ok),
+        'tg_per_client_p10':p10,'tg_per_client_median':statistics.median(float(r['tg']) for r in ok),
+        'completion_tokens_min':completion_min,
+    }
+def synthetic_prompt(target_context,output_tokens,worker,round_no):
+    # "x " is close to one token on the supported coding tokenizers. We leave
+    # >1K tokens of margin and use backend-reported usage for the promoted depth.
+    n=max(256,int(target_context)-int(output_tokens)-1024)
+    return f"Pushbutton concurrency calibration worker {worker} round {round_no}. Continue briefly.\n"+("x "*n)
+def content_event(obj):
+    usage=obj.get('usage') or {};chars=0;seen=False
+    for ch in obj.get('choices') or []:
+        d=ch.get('delta') or {};m=ch.get('message') or {};txt=d.get('content') or ch.get('text') or m.get('content')
+        if txt:chars+=len(str(txt));seen=True
+    return seen,chars,usage
+def one_request(endpoint,served_model,target_context,output_tokens,worker,round_no,start_barrier):
+    host,port,base=endpoint_parts(endpoint);conn=http.client.HTTPConnection(host,port,timeout=1800)
+    prompt=synthetic_prompt(target_context,output_tokens,worker,round_no)
+    obj={'model':served_model,'messages':[{'role':'user','content':prompt}],'max_tokens':output_tokens,'temperature':0,'stream':True,'stream_options':{'include_usage':True}}
+    body=json.dumps(obj,separators=(',',':')).encode();path=(base+'/chat/completions') if base else '/v1/chat/completions'
+    try:start_barrier.wait(timeout=30)
+    except Exception:return {'ok':False,'error':'barrier'}
+    start=time.perf_counter();first=None;usage={};chars=0
+    try:
+        conn.request('POST',path,body=body,headers={'Content-Type':'application/json','Content-Length':str(len(body))})
+        r=conn.getresponse()
+        if not (200<=r.status<300):
+            data=r.read(4096);return {'ok':False,'status':r.status,'error':data.decode(errors='replace')[:200]}
+        ctype=(r.getheader('Content-Type') or '').lower()
+        if 'text/event-stream' in ctype:
+            while True:
+                line=r.readline()
+                if not line:break
+                if not line.startswith(b'data:'):continue
+                d=line[5:].strip()
+                if not d or d==b'[DONE]':continue
+                try:o=json.loads(d)
+                except Exception:continue
+                seen,add,u=content_event(o);chars+=add
+                if seen and first is None:first=time.perf_counter()
+                if u:usage=u
+        else:
+            data=r.read()
+            try:o=json.loads(data);usage=o.get('usage') or {};seen,add,_=content_event(o);chars+=add
+            except Exception:chars=len(data)
+            first=None
+        end=time.perf_counter()
+    except Exception as e:
+        return {'ok':False,'error':str(e)}
+    finally:
+        try:conn.close()
+        except Exception:pass
+    pt=int(usage.get('prompt_tokens') or usage.get('input_tokens') or max(1,len(prompt)//4))
+    ct=int(usage.get('completion_tokens') or usage.get('output_tokens') or max(1,round(chars/4)))
+    if first and end>first and ct>1:tg=(ct-1)/(end-first)
+    else:tg=ct/max(.001,end-start)  # conservative fallback includes prefill
+    return {'ok':True,'tg':tg,'prompt_tokens':pt,'completion_tokens':ct,'elapsed_s':end-start}
+def run_round(endpoint,served_model,target_context,concurrency,output_tokens,round_no):
+    barrier=threading.Barrier(concurrency);results=[None]*concurrency;threads=[]
+    def worker(i):results[i]=one_request(endpoint,served_model,target_context,output_tokens,i,round_no,barrier)
+    for i in range(concurrency):
+        t=threading.Thread(target=worker,args=(i,),daemon=True);threads.append(t);t.start()
+    for t in threads:t.join(timeout=1900)
+    return [r if isinstance(r,dict) else {'ok':False,'error':'timeout'} for r in results]
+def run_calibration(inst,target_context,concurrency,rounds,output_tokens):
+    results=[]
+    for r in range(rounds):results.extend(run_round(inst['endpoint'],str(inst.get('served_model') or inst.get('model')),target_context,concurrency,output_tokens,r))
+    return evaluate_results(results,target_context,concurrency)
+def record_result(instance_id,result,registry):
+    now=time.time()
+    def mutate(obj):
+        for inst in obj.setdefault('instances',[]):
+            if str(inst.get('id'))!=str(instance_id):continue
+            attempt={k:result.get(k) for k in ('safe','reason','target_context','max_context','concurrency','samples','tg_per_client_p10','tg_per_client_median') if result.get(k) is not None}
+            attempt['epoch']=now
+            attempts=inst.setdefault('calibration_attempts',[])
+            attempts=[a for a in attempts if _attempt_key(a)!=(int(result.get('target_context') or 0),int(result.get('concurrency') or 1))]
+            attempts.append(attempt);inst['calibration_attempts']=attempts[-64:];inst['last_calibration_epoch']=now
+            if result.get('safe'):
+                env={
+                    'concurrency':int(result['concurrency']),'max_context':int(result['max_context']),'safe':True,
+                    'evidence':'MEASURED','tg_per_client_p10':float(result['tg_per_client_p10']),
+                    'tg_per_client':float(result['tg_per_client_median']),'samples':int(result.get('samples') or 0),
+                    'source':'idle-calibrator','measured_epoch':now,
+                }
+                rows=inst.setdefault('measured_envelopes',[])
+                rows=[e for e in rows if not (int(e.get('concurrency') or 1)==env['concurrency'] and int(e.get('max_context') or 0)<=env['max_context'] and str(e.get('source') or '')=='idle-calibrator')]
+                rows.append(env);inst['measured_envelopes']=rows
+            return True
+        return False
+    return registry_store.update(mutate,registry)
+def choose_candidate(status,registry,idle_since,idle_seconds,now=None):
+    now=time.monotonic() if now is None else now
+    by_id={str(x.get('id')):x for x in registry_store.load(registry).get('instances',[])}
+    candidates=[]
+    for s in status.get('instances',[]):
+        iid=str(s.get('id'));inst=by_id.get(iid)
+        if not inst or s.get('maintenance') or int(s.get('active') or 0)>0 or int(s.get('queued') or 0)>0:
+            idle_since.pop(iid,None);continue
+        idle_since.setdefault(iid,now)
+        if now-idle_since[iid]<idle_seconds:continue
+        plan=next_plan(inst)
+        if plan:candidates.append((int(s.get('capacity') or 1),-(int(inst.get('provisioned_slots') or 1)),iid,inst,plan))
+    if not candidates:return None
+    candidates.sort();return candidates[0][3],candidates[0][4]
+
+
+def main():
+    ap=argparse.ArgumentParser(prog='pushbutton-calibrate')
+    ap.add_argument('--broker',default='http://127.0.0.1:19780');ap.add_argument('--registry',type=pathlib.Path,default=REGISTRY)
+    ap.add_argument('--interval',type=float,default=5.0);ap.add_argument('--idle-seconds',type=float,default=60.0)
+    ap.add_argument('--rounds',type=int,default=2);ap.add_argument('--output-tokens',type=int,default=DEFAULT_OUTPUT_TOKENS);ap.add_argument('--once',action='store_true')
+    a=ap.parse_args();idle_since={};cooldown_until=0.0
+    try:lock_cm=registry_store.named_lock('calibrator-singleton',timeout_s=.05,poll_s=.01);lock_cm.__enter__()
+    except Exception:
+        say('another calibrator owns the singleton lock; exiting harmlessly');return
+    try:
+        while True:
+            now=time.monotonic()
+            if now>=cooldown_until:
+                status=get_json(a.broker.rstrip('/')+'/pushbutton/status',1.5)
+                pick=choose_candidate(status or {},a.registry,idle_since,a.idle_seconds,now=now) if status else None
+                if pick:
+                    inst,(ctx,c)=pick;iid=str(inst['id'])
+                    code,lease=post_json(a.broker.rstrip('/')+'/pushbutton/maintenance/acquire',{'id':iid},5)
+                    if code==200 and lease.get('ok'):
+                        say(f'calibrating {iid}: C{c} at target context {ctx:,}; live work is temporarily routed/queued elsewhere')
+                        try:result=run_calibration(inst,ctx,c,max(1,a.rounds),max(64,a.output_tokens))
+                        finally:post_json(a.broker.rstrip('/')+'/pushbutton/maintenance/release',{'id':iid},5)
+                        record_result(iid,result,a.registry)
+                        if result.get('safe'):
+                            say(f"promoted C{c} through {int(result['max_context']):,} tokens: p10/client={float(result['tg_per_client_p10']):.1f} tok/s")
+                        else:
+                            say(f"C{c} at {ctx:,} not promoted ({result.get('reason')}): p10/client={result.get('tg_per_client_p10')}")
+                        idle_since[iid]=time.monotonic();cooldown_until=time.monotonic()+60.0
+            if a.once:return
+            time.sleep(max(.5,a.interval))
+    finally:
+        try:lock_cm.__exit__(None,None,None)
+        except Exception:pass
+
+if __name__=='__main__':main()

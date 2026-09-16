@@ -2,8 +2,9 @@
 """Stable OpenAI-compatible broker for resident Pushbutton model instances.
 
 Clients use one endpoint. The broker routes/reuses resident instances, respects
-model/framework context ceilings, queues rather than oversubscribing proven C1
-profiles, and records normal-use PP/TG/TTFT without storing prompt/output text.
+model/framework context ceilings, queues rather than oversubscribing proven
+capacity, coordinates harmless idle calibration, and records normal-use
+PP/TG/TTFT without storing prompt/output text.
 """
 from __future__ import annotations
 import argparse, datetime as dt, http.client, json, os, pathlib, subprocess, sys, threading, time, urllib.parse, urllib.request
@@ -45,7 +46,7 @@ def estimate_tokens(obj):
 class Runtime:
     def __init__(self,registry: pathlib.Path,queue_limit=64,queue_timeout=900):
         self.registry=registry; self.queue_limit=queue_limit; self.queue_timeout=queue_timeout
-        self.lock=threading.Condition(); self.active={}; self.queued={}; self.failed_until={}; self._mtime=None; self._instances=[]
+        self.lock=threading.Condition(); self.active={}; self.queued={}; self.failed_until={}; self.maintenance=set(); self._mtime=None; self._instances=[]
 
     def load(self):
         try:mt=self.registry.stat().st_mtime_ns
@@ -64,17 +65,41 @@ class Runtime:
 
     def models(self):return self.load()
 
-    def _candidates(self,model,context):
+    def _all_candidates(self,model,context):
         rows=self.load()
         if model.lower() in AUTO_NAMES:return pool.auto_candidates(rows,context)
         return sorted([x for x in rows if pool.compatible(x,model,context)],key=lambda x:pool.rank_instance(x,context))
+
+    def _candidates(self,model,context):
+        return [x for x in self._all_candidates(model,context) if x.id not in self.maintenance]
+
+    def _queue_wait(self,chosen,queued_id,deadline):
+        total_q=sum(self.queued.values())
+        if total_q>=self.queue_limit:
+            if queued_id:self.queued[queued_id]=max(0,self.queued.get(queued_id,1)-1)
+            return queued_id,'REJECT_BUSY'
+        if queued_id!=chosen.id:
+            if queued_id:self.queued[queued_id]=max(0,self.queued.get(queued_id,1)-1)
+            queued_id=chosen.id; self.queued[queued_id]=self.queued.get(queued_id,0)+1
+        remain=deadline-time.monotonic()
+        if remain<=0:
+            self.queued[queued_id]=max(0,self.queued.get(queued_id,1)-1)
+            return queued_id,'QUEUE_TIMEOUT'
+        self.lock.wait(timeout=min(1.0,remain))
+        return queued_id,'WAIT'
 
     def acquire(self,model,context):
         deadline=time.monotonic()+self.queue_timeout; queued_id=None
         with self.lock:
             while True:
-                candidates=self._candidates(model,context)
+                all_candidates=self._all_candidates(model,context)
+                candidates=[x for x in all_candidates if x.id not in self.maintenance]
                 if not candidates:
+                    maintenance=[x for x in all_candidates if x.id in self.maintenance]
+                    if maintenance:
+                        queued_id,state=self._queue_wait(maintenance[0],queued_id,deadline)
+                        if state=='WAIT':continue
+                        return None,state,0
                     if queued_id:self.queued[queued_id]=max(0,self.queued.get(queued_id,1)-1)
                     return None,'NO_COMPATIBLE_INSTANCE',0
                 # Prefer any instance with immediate proven capacity.
@@ -84,18 +109,9 @@ class Runtime:
                     if queued_id:self.queued[queued_id]=max(0,self.queued.get(queued_id,1)-1)
                     admitted=self.active.get(chosen.id,0)+1;self.active[chosen.id]=admitted
                     return chosen,'ADMIT',admitted
-                total_q=sum(self.queued.get(x.id,0) for x in candidates)
-                if total_q>=self.queue_limit:
-                    if queued_id:self.queued[queued_id]=max(0,self.queued.get(queued_id,1)-1)
-                    return None,'REJECT_BUSY',0
-                if queued_id!=chosen.id:
-                    if queued_id:self.queued[queued_id]=max(0,self.queued.get(queued_id,1)-1)
-                    queued_id=chosen.id; self.queued[queued_id]=self.queued.get(queued_id,0)+1
-                remain=deadline-time.monotonic()
-                if remain<=0:
-                    self.queued[queued_id]=max(0,self.queued.get(queued_id,1)-1)
-                    return None,'QUEUE_TIMEOUT',0
-                self.lock.wait(timeout=min(1.0,remain))
+                queued_id,state=self._queue_wait(chosen,queued_id,deadline)
+                if state=='WAIT':continue
+                return None,state,0
 
     def release(self,inst):
         with self.lock:
@@ -103,6 +119,23 @@ class Runtime:
 
     def fail_temporarily(self,inst,seconds=15):
         with self.lock:self.failed_until[inst.id]=time.time()+seconds; self.lock.notify_all()
+
+    def acquire_maintenance(self,instance_id):
+        """Atomically lease one completely idle instance to the local calibrator."""
+        with self.lock:
+            rows={x.id:x for x in self.load()}
+            if instance_id not in rows:return False,'UNKNOWN_INSTANCE'
+            if instance_id in self.maintenance:return True,'ALREADY_HELD'
+            if self.active.get(instance_id,0)>0:return False,'ACTIVE'
+            if self.queued.get(instance_id,0)>0:return False,'QUEUED'
+            self.maintenance.add(instance_id);self.lock.notify_all()
+            return True,'ACQUIRED'
+
+    def release_maintenance(self,instance_id):
+        with self.lock:
+            held=instance_id in self.maintenance
+            self.maintenance.discard(instance_id);self.lock.notify_all()
+            return held
 
 
 RUNTIME: Runtime|None=None
@@ -134,12 +167,15 @@ def content_event(obj):
 class Handler(BaseHTTPRequestHandler):
     protocol_version='HTTP/1.1'; server_version='PushbuttonBroker/1'
     def log_message(self,fmt,*args):sys.stderr.write('[pushbutton-broker] '+fmt%args+'\n')
-    def json_error(self,status,msg):
-        b=json.dumps({'error':{'message':msg,'type':'pushbutton_runtime'}}).encode(); self.send_response(status); self.send_header('Content-Type','application/json'); self.send_header('Content-Length',str(len(b))); self.send_header('Connection','close'); self.end_headers(); self.wfile.write(b); self.close_connection=True
+    def json_reply(self,status,obj):
+        b=json.dumps(obj).encode();self.send_response(status);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(b)));self.send_header('Connection','close');self.end_headers();self.wfile.write(b);self.close_connection=True
+    def json_error(self,status,msg):self.json_reply(status,{'error':{'message':msg,'type':'pushbutton_runtime'}})
     def headers_for_upstream(self,n=None):
         h={k:v for k,v in self.headers.items() if k.lower() not in HOP and k.lower() not in {'host','content-length'}}
         if n is not None:h['Content-Length']=str(n)
         return h
+    def local_control_allowed(self):
+        return self.client_address[0] in {'127.0.0.1','::1','localhost'}
 
     def do_GET(self):
         if self.path.rstrip('/')=='/v1/models':
@@ -148,18 +184,32 @@ class Handler(BaseHTTPRequestHandler):
                 for name in [x.model,*x.aliases]:
                     if name not in seen:data.append({'id':name,'object':'model','owned_by':'pushbutton'}); seen.add(name)
             data.insert(0,{'id':'pushbutton/auto','object':'model','owned_by':'pushbutton'})
-            b=json.dumps({'object':'list','data':data}).encode(); self.send_response(200); self.send_header('Content-Type','application/json'); self.send_header('Content-Length',str(len(b))); self.end_headers(); self.wfile.write(b); return
+            return self.json_reply(200,{'object':'list','data':data})
         if self.path.rstrip('/')=='/pushbutton/status':
             out=[]
             for x in RUNTIME.models():
-                label,warn=x.speed(); out.append({'id':x.id,'model':x.model,'backend':x.backend,'active':x.active,'queued':x.queued,'capacity':x.capacity(x.context_limit()),'context_limit':x.context_limit(),'speed':label,'tg':x.tg,'warning':warn})
-            b=json.dumps({'instances':out},indent=2).encode(); self.send_response(200); self.send_header('Content-Type','application/json'); self.send_header('Content-Length',str(len(b))); self.end_headers(); self.wfile.write(b); return
+                label,warn=x.speed();out.append({
+                    'id':x.id,'model':x.model,'backend':x.backend,'active':x.active,'queued':x.queued,
+                    'capacity':x.capacity(x.context_limit()),'framework_max_concurrency':x.framework_max_concurrency or 1,
+                    'context_limit':x.context_limit(),'maintenance':x.id in RUNTIME.maintenance,
+                    'speed':label,'tg':x.tg,'warning':warn})
+            return self.json_reply(200,{'instances':out})
         self.json_error(404,'unknown broker endpoint')
 
     def do_POST(self):
         n=int(self.headers.get('Content-Length') or 0); body=self.rfile.read(n) if n else b'{}'
         try:obj=json.loads(body)
         except Exception:return self.json_error(400,'request body must be JSON')
+        path=self.path.rstrip('/')
+        if path in {'/pushbutton/maintenance/acquire','/pushbutton/maintenance/release'}:
+            if not self.local_control_allowed():return self.json_error(403,'maintenance control is loopback-only')
+            iid=str(obj.get('id') or '')
+            if not iid:return self.json_error(400,'instance id is required')
+            if path.endswith('/acquire'):
+                ok,reason=RUNTIME.acquire_maintenance(iid)
+                return self.json_reply(200 if ok else 409,{'ok':ok,'reason':reason,'id':iid})
+            held=RUNTIME.release_maintenance(iid)
+            return self.json_reply(200,{'ok':True,'released':held,'id':iid})
         model=str(obj.get('model') or 'pushbutton/auto'); prompt_tokens=estimate_tokens(obj); out_budget=int(obj.get('max_tokens') or obj.get('max_completion_tokens') or 4096); needed=prompt_tokens+out_budget
         inst,decision,admitted_concurrency=RUNTIME.acquire(model,needed)
         if not inst:
@@ -210,30 +260,40 @@ class Handler(BaseHTTPRequestHandler):
         metrics.save_observation(obs); metrics.queue_observation(obs); metrics.maybe_upload()
 
 
-def start_scaler(host,port):
-    """Start one best-effort scaler; its file lock makes duplicate starts harmless."""
-    script=ROOT/'pushbutton-scaler'
+def start_background(script_name,host,port,registry,log_name):
+    """Start one best-effort runtime worker; each worker owns its own singleton lock."""
+    script=ROOT/script_name
     if not script.exists():return None
-    log=STATE/'logs/scaler.log';log.parent.mkdir(parents=True,exist_ok=True);f=log.open('ab',buffering=0)
+    log=STATE/f'logs/{log_name}.log';log.parent.mkdir(parents=True,exist_ok=True);f=log.open('ab',buffering=0)
+    connect_host='127.0.0.1' if host in {'0.0.0.0','::',''} else host
     try:
-        return subprocess.Popen([sys.executable,str(script),'--broker',f'http://{host}:{port}'],stdout=f,stderr=subprocess.STDOUT,start_new_session=True,env=os.environ.copy())
+        return subprocess.Popen(
+            [sys.executable,str(script),'--broker',f'http://{connect_host}:{port}','--registry',str(registry)],
+            stdout=f,stderr=subprocess.STDOUT,start_new_session=True,env=os.environ.copy())
     except Exception as exc:
-        print(f'[pushbutton-broker] scaler disabled harmlessly: {exc}',file=sys.stderr);return None
+        print(f'[pushbutton-broker] {script_name} disabled harmlessly: {exc}',file=sys.stderr);return None
 
 
 def main():
     global RUNTIME
-    ap=argparse.ArgumentParser(prog='pushbutton-broker'); ap.add_argument('--host',default='127.0.0.1'); ap.add_argument('--port',type=int,default=19780); ap.add_argument('--registry',type=pathlib.Path,default=REGISTRY); ap.add_argument('--queue-limit',type=int,default=64); ap.add_argument('--queue-timeout',type=int,default=900); ap.add_argument('--no-scaler',action='store_true'); a=ap.parse_args()
+    ap=argparse.ArgumentParser(prog='pushbutton-broker')
+    ap.add_argument('--host',default='127.0.0.1');ap.add_argument('--port',type=int,default=19780)
+    ap.add_argument('--registry',type=pathlib.Path,default=REGISTRY);ap.add_argument('--queue-limit',type=int,default=64)
+    ap.add_argument('--queue-timeout',type=int,default=900);ap.add_argument('--no-scaler',action='store_true');ap.add_argument('--no-calibrator',action='store_true')
+    a=ap.parse_args()
     a.registry.parent.mkdir(parents=True,exist_ok=True)
     if not a.registry.exists():a.registry.write_text('{"instances":[]}\n')
-    RUNTIME=Runtime(a.registry,a.queue_limit,a.queue_timeout); s=ThreadingHTTPServer((a.host,a.port),Handler); scaler=None if a.no_scaler else start_scaler(a.host,a.port)
+    RUNTIME=Runtime(a.registry,a.queue_limit,a.queue_timeout);s=ThreadingHTTPServer((a.host,a.port),Handler);workers=[]
+    if not a.no_scaler:workers.append(start_background('pushbutton-scaler',a.host,a.port,a.registry,'scaler'))
+    if not a.no_calibrator:workers.append(start_background('pushbutton-calibrate',a.host,a.port,a.registry,'calibrator'))
     print(f'[pushbutton-broker] http://{a.host}:{a.port}/v1  registry={a.registry}',file=sys.stderr,flush=True)
     try:s.serve_forever()
     except KeyboardInterrupt:pass
     finally:
         s.server_close();metrics.maybe_upload(force=True)
-        if scaler and scaler.poll() is None:
-            try:scaler.terminate()
-            except Exception:pass
+        for w in workers:
+            if w and w.poll() is None:
+                try:w.terminate()
+                except Exception:pass
 
 if __name__=='__main__':main()

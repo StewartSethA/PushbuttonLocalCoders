@@ -5,6 +5,7 @@ on:
       - "pushbutton"
       - "pushbutton-instance"
       - "pushbutton-scaler"
+      - "pushbutton-calibrate"
       - "coder-local"
       - "qwen-local"
       - "opencode-local"
@@ -31,6 +32,7 @@ on:
       - "tests/test_pool.py"
       - "tests/test_registry.py"
       - "tests/test_broker.py"
+      - "tests/test_calibration.py"
       - ".github/workflows/coder-frontends-tests.yml"
 permissions:
   contents: read
@@ -42,13 +44,13 @@ jobs:
       - name: Syntax and data validation
         run: |
           bash -n coder-local install-coder-local.sh
-          python3 -m py_compile lib/coder_local_plan.py lib/coder_local_lb.py lib/pushbutton_metrics.py lib/pushbutton_policy.py lib/pushbutton_pool.py lib/pushbutton_registry.py pushbutton pushbutton-instance pushbutton-scaler pushbutton-select pushbutton-observe pushbutton-proxy pushbutton-broker
+          python3 -m py_compile lib/coder_local_plan.py lib/coder_local_lb.py lib/pushbutton_metrics.py lib/pushbutton_policy.py lib/pushbutton_pool.py lib/pushbutton_registry.py pushbutton pushbutton-instance pushbutton-scaler pushbutton-calibrate pushbutton-select pushbutton-observe pushbutton-proxy pushbutton-broker
           python3 -m json.tool configs/qwen-local-defaults.json >/dev/null
           python3 -m json.tool configs/placement.example.json >/dev/null
           python3 -m json.tool configs/model-catalog.json >/dev/null
           python3 -m json.tool benchmarks/aggregate.json >/dev/null
       - name: Unit and broker integration tests
-        run: python3 -m unittest -v tests/test_coder_local.py tests/test_selector.py tests/test_metrics.py tests/test_policy.py tests/test_pool.py tests/test_registry.py tests/test_broker.py
+        run: python3 -m unittest -v tests/test_coder_local.py tests/test_selector.py tests/test_metrics.py tests/test_policy.py tests/test_pool.py tests/test_registry.py tests/test_calibration.py tests/test_broker.py
       - name: Planner self-test
         run: ./coder-local --self-test
       - name: Selector smoke
@@ -58,6 +60,7 @@ jobs:
           python3 pushbutton --help >/dev/null
           python3 pushbutton-instance --help >/dev/null
           python3 pushbutton-scaler --help >/dev/null
+          python3 pushbutton-calibrate --help >/dev/null
           python3 pushbutton-observe --help >/dev/null
           python3 pushbutton-proxy --help >/dev/null
           python3 pushbutton-broker --help >/dev/null
