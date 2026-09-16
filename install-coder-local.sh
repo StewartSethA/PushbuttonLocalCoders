@@ -22,7 +22,8 @@ else
 fi
 chmod +x \
   "$DEST/pushbutton" "$DEST/pushbutton-instance" "$DEST/pushbutton-broker" "$DEST/pushbutton-proxy" \
-  "$DEST/coder-local" "$DEST/qwen-local" "$DEST/opencode-local" "$DEST/deepseek-local" "$DEST/mini-swe-local" \
+  "$DEST/claude-local" "$DEST/claude-local-safe" "$DEST/coder-local" "$DEST/qwen-local" \
+  "$DEST/opencode-local" "$DEST/deepseek-local" "$DEST/mini-swe-local" \
   "$DEST/pushbutton-backend" "$DEST/pushbutton-bench" "$DEST/pushbutton-select" "$DEST/pushbutton-observe"
 
 install_wrapper(){
@@ -34,6 +35,7 @@ install_wrapper(){
 }
 
 qwen_defaults="$(printf '%q' "$DEST/configs/qwen-local-defaults.json")"
+claude_body="$(printf '%q' "$DEST/claude-local-safe")"
 qwen_body="env QWEN_CODE_SYSTEM_DEFAULTS_PATH=$qwen_defaults $(printf '%q' "$DEST/qwen-local")"
 opencode_body="$(printf '%q' "$DEST/opencode-local")"
 deepseek_body="$(printf '%q' "$DEST/deepseek-local")"
@@ -49,6 +51,7 @@ observe_body="$(printf '%q' "$DEST/pushbutton-observe")"
 
 for spec in \
  "$HOME/.local/bin/pushbutton|$pushbutton_body" \
+ "$HOME/.local/bin/claude-local|$claude_body" \
  "$HOME/.local/bin/pushbutton-instance|$instance_body" \
  "$HOME/.local/bin/pushbutton-broker|$broker_body" \
  "$HOME/.local/bin/pushbutton-proxy|$proxy_body" \
@@ -65,6 +68,7 @@ done
 
 if ((SYSTEM)); then
   install_wrapper /usr/local/bin/pushbutton "$pushbutton_body"
+  install_wrapper /usr/local/bin/claude-local "$claude_body"
   install_wrapper /usr/local/bin/pushbutton-instance "$instance_body"
   install_wrapper /usr/local/bin/pushbutton-broker "$broker_body"
   install_wrapper /usr/local/bin/pushbutton-proxy "$proxy_body"
@@ -79,6 +83,7 @@ if ((SYSTEM)); then
 fi
 
 printf '[pushbutton] Installed unified runtime: pushbutton\n'
+printf '[pushbutton] Installed Claude Code local frontend: claude-local (llama.cpp/HF GGUF; Ollama-isolated; JSON tool calls)\n'
 printf '[pushbutton] Expert frontends/tools remain available: qwen-local, opencode-local, deepseek-local, mini-swe-local, pushbutton-select, pushbutton-bench, pushbutton-observe\n'
 
 export QWEN_CODE_SYSTEM_DEFAULTS_PATH="$DEST/configs/qwen-local-defaults.json"
