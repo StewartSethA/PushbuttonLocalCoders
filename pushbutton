@@ -14,6 +14,7 @@ sys.path.insert(0,str(ROOT/'lib'))
 import claude_local_plan as plan
 import pushbutton_metrics as metrics
 import pushbutton_policy as policy
+import pushbutton_registry as registry_store
 
 CONFIG_DIR=pathlib.Path(os.environ.get('PUSHBUTTON_CONFIG_DIR',pathlib.Path.home()/'.config/pushbutton-local'))
 CONFIG=CONFIG_DIR/'runtime.json'
@@ -132,20 +133,18 @@ def hf_spec(model,artifact):
     if m.get('gguf_repo') and artifact:return f"{m['gguf_repo']}:{artifact}"
     return None
 
-def registry():return read_json(REGISTRY,{'instances':[]})
-def save_registry(obj):write_json(REGISTRY,obj)
+def registry():return registry_store.load(REGISTRY)
 def healthy_resident(model,context):
-    obj=registry();changed=False
+    obj=registry()
     for x in obj.get('instances',[]):
         if not x.get('endpoint'):continue
-        if not endpoint_ok(x['endpoint']):
-            x['healthy']=False;changed=True;continue
-        x['healthy']=True
+        alive=endpoint_ok(x['endpoint'])
+        if not alive:
+            if x.get('healthy',True):registry_store.mark_health(str(x.get('id')),False,REGISTRY)
+            continue
+        if not x.get('healthy',True):registry_store.mark_health(str(x.get('id')),True,REGISTRY)
         names={canon(x.get('model','')),*[canon(a) for a in x.get('aliases',[])]}
-        if canon(model) in names and int(x.get('max_context') or 0)>=context:
-            if changed:save_registry(obj)
-            return x
-    if changed:save_registry(obj)
+        if canon(model) in names and int(x.get('max_context') or 0)>=context:return x
     return None
 
 def start_detached(cmd,log,name):
@@ -185,8 +184,8 @@ def commission(model,context,row):
     else:raise SystemExit(f'backend {backend!r} is catalogued but does not yet have an automatic local launcher')
     proc=start_detached(cmd,logs/f'{model.replace(":","-")}-{backend}-{port}.log',f'{model} / {backend}')
     if not wait_endpoint(proc,endpoint):raise SystemExit(f'backend failed to become ready; inspect {logs}')
-    inst={'id':f'{model}-{backend}-{port}','model':model,'aliases':[model],'backend':backend,'artifact':artifact,'endpoint':endpoint,'pid':proc.pid,'max_context':context,'framework_max_concurrency':1,'measured_envelopes':[{'concurrency':1,'max_context':context,'safe':True}],'tg':row.get('tg'),'tg_measured':row.get('evidence')=='MEASURED','healthy':True,'gpu':gpu}
-    obj=registry();obj.setdefault('instances',[]).append(inst);save_registry(obj);return inst
+    inst={'id':f'{model}-{backend}-{port}','model':model,'aliases':[model],'backend':backend,'artifact':artifact,'endpoint':endpoint,'pid':proc.pid,'max_context':context,'framework_max_concurrency':1,'measured_envelopes':[{'concurrency':1,'max_context':context,'safe':True,'evidence':'PROVEN'}],'tg':row.get('tg'),'tg_measured':row.get('evidence')=='MEASURED','healthy':True,'gpu':gpu,'required_mib':row.get('req')}
+    registry_store.append_instance(inst,REGISTRY);return inst
 
 def ensure_qwen():
     if shutil.which('qwen'):return shutil.which('qwen')
@@ -217,15 +216,19 @@ def main():
     cfg={} if a.reconfigure else read_json(CONFIG,{})
     if a.status:return show_status(cfg)
     cfg=configure(cfg,a);model=cfg['model'];ctx=int(cfg['context'])
-    resident=healthy_resident(model,ctx)
-    if resident:say(f"reusing {resident['model']} at {resident['endpoint']}")
-    else:
-        rows=selector_views(model,ctx);row=choose_candidate(rows,a.allow_slow)
-        if not row:raise SystemExit(f'no fitting local configuration found for {model} at {ctx:,} context')
-        label,msg=policy.speed_label(row.get('tg'),measured=row.get('evidence')=='MEASURED')
-        if label in {'SLOW','VERY_SLOW'}:warn(msg or f'{model} is expected to decode below {policy.MIN_DECODE_TOK_S:.0f} tok/s')
-        say(f"selected {model} / {row['backend']} / {row['artifact']} on GPU {row.get('gpu')} — TG {row.get('tg') or '?'} tok/s ({row.get('evidence')})")
-        resident=commission(model,ctx,row)
+    # Global cold-start single-flight prevents simultaneous CLIs from racing the
+    # same free VRAM before either backend has had time to allocate it. Recheck
+    # the registry after acquiring the lock so followers simply reuse the winner.
+    with registry_store.named_lock('commission-global',timeout_s=7200):
+        resident=healthy_resident(model,ctx)
+        if resident:say(f"reusing {resident['model']} at {resident['endpoint']}")
+        else:
+            rows=selector_views(model,ctx);row=choose_candidate(rows,a.allow_slow)
+            if not row:raise SystemExit(f'no fitting local configuration found for {model} at {ctx:,} context')
+            label,msg=policy.speed_label(row.get('tg'),measured=row.get('evidence')=='MEASURED')
+            if label in {'SLOW','VERY_SLOW'}:warn(msg or f'{model} is expected to decode below {policy.MIN_DECODE_TOK_S:.0f} tok/s')
+            say(f"selected {model} / {row['backend']} / {row['artifact']} on GPU {row.get('gpu')} — TG {row.get('tg') or '?'} tok/s ({row.get('evidence')})")
+            resident=commission(model,ctx,row)
     broker_port=ensure_broker(cfg);say(f'broker ready: http://127.0.0.1:{broker_port}/v1')
     frontend=cfg.get('frontend','qwen')
     if frontend=='none':print(f'http://127.0.0.1:{broker_port}/v1');return
