@@ -11,12 +11,18 @@ CACHE_DIR="${CLAUDE_LOCAL_CACHE:-$HOME/.cache/pushbutton/llama}"
 LOCK_FILE="${CLAUDE_LOCAL_LOCK_FILE:-$STATE_DIR/startup.lock}"
 CTX="${CLAUDE_LOCAL_CONTEXT:-262144}"
 CLIENT_CTX="${CLAUDE_LOCAL_CLIENT_CONTEXT:-200000}"
+CLIENT_CTX_EXPLICIT=0
+[[ -z "${CLAUDE_LOCAL_CLIENT_CONTEXT+x}" ]] || CLIENT_CTX_EXPLICIT=1
 PORT_BASE="${CODER_LOCAL_PORT_BASE:-20180}"
 PLACEMENT_CONFIG="${PUSHBUTTON_PLACEMENT_CONFIG:-$HOME/.config/pushbutton-local/placement.json}"
 FRONTEND="${CODER_LOCAL_FRONTEND:-}"
 AGENTS=""
 RESUME=0
 PLAN_ONLY=0
+SELECT=0
+SELECT_ARGS=()
+MENU_FRONTEND=coder-local
+SELECT_PLACEMENT=0
 MODELS=()
 FRONTEND_ARGS=()
 PIDS=()
@@ -59,6 +65,7 @@ Worker semantics:
   N models + --agents N   -> explicit N-worker heterogeneous team
 
 Options:
+  --select                      choose models interactively before provisioning
   --frontend qwen
   --agents N
   --resume
@@ -290,13 +297,14 @@ self_test(){ python3 "$PLAN_PY" --self-test; bash -n "$0"; echo "coder-local she
 while (($#));do
  case "$1" in
   -h|--help) usage;exit 0;;
-  --frontend) [[ $# -ge 2 ]]||die "--frontend needs a value";FRONTEND="$2";shift 2;;
+  --select) SELECT=1;shift;;
+  --frontend) [[ $# -ge 2 ]]||die "--frontend needs a value";FRONTEND="$2";MENU_FRONTEND="$2-local";shift 2;;
   --agents) [[ $# -ge 2 ]]||die "--agents needs a value";AGENTS="$2";shift 2;;
-  --resume) RESUME=1;shift;;
-  --placement-config) [[ $# -ge 2 ]]||die "--placement-config needs a file";PLACEMENT_CONFIG="$2";shift 2;;
+  --resume) RESUME=1;SELECT_ARGS+=("$1");shift;;
+  --placement-config) [[ $# -ge 2 ]]||die "--placement-config needs a file";PLACEMENT_CONFIG="$2";SELECT_PLACEMENT=1;shift 2;;
   --plan-only) PLAN_ONLY=1;shift;;
-  --local-context) CTX="$2";shift 2;; --local-client-context) CLIENT_CTX="$2";shift 2;;
-  --local-cache) CACHE_DIR="$2";shift 2;; --local-port-base) PORT_BASE="$2";shift 2;;
+  --local-context) CTX="$2";shift 2;; --local-client-context) CLIENT_CTX="$2";CLIENT_CTX_EXPLICIT=1;shift 2;;
+  --local-cache) CACHE_DIR="$2";SELECT_ARGS+=("$1" "$2");shift 2;; --local-port-base) PORT_BASE="$2";SELECT_ARGS+=("$1" "$2");shift 2;;
   --self-test) self_test;exit 0;;
   --) shift;FRONTEND_ARGS+=("$@");break;;
   -*) die "unknown coder-local option '$1'; put frontend-specific args after --";;
@@ -304,7 +312,29 @@ while (($#));do
  esac
 done
 [[ "$FRONTEND" == qwen ]] || die "frontend '$FRONTEND' is not installed in this revision"
-((${#MODELS[@]}>=1))||die "supply at least one model"
+if ((SELECT)) || ((${#MODELS[@]} == 0)); then
+  if [[ ! -t 0 || ! -t 1 ]]; then
+    usage >&2
+    die "supply a MODEL, or run coder-local --select in an interactive terminal"
+  fi
+  have python3 || die "python3 is required for the interactive selector"
+  [[ -f "$ROOT/pushbutton-select" ]] || die "missing $ROOT/pushbutton-select; reinstall coder-local"
+  selector_frontend="$MENU_FRONTEND"
+  [[ "$(basename "$0")" == qwen-local ]] && selector_frontend=qwen-local
+  [[ -z "${CODER_LOCAL_MENU_FRONTEND:-}" ]] || selector_frontend="$CODER_LOCAL_MENU_FRONTEND"
+  selector_args=(--frontend "$selector_frontend" --menu --context "$CTX")
+  ((CLIENT_CTX_EXPLICIT == 0)) || selector_args+=(--client-context "$CLIENT_CTX")
+  ((PLAN_ONLY == 0)) || selector_args+=(--plan-only)
+  [[ -z "$AGENTS" ]] || selector_args+=(--agents "$AGENTS")
+  ((SELECT_PLACEMENT == 0)) || selector_args+=(--placement-config "$PLACEMENT_CONFIG")
+  selector_args+=("${MODELS[@]}")
+  if ((${#FRONTEND_ARGS[@]})); then SELECT_ARGS+=(-- "${FRONTEND_ARGS[@]}"); fi
+  for arg in "${SELECT_ARGS[@]}"; do selector_args+=("--launch-arg=$arg"); done
+  unset CODER_LOCAL_STARTUP_ONLY CODER_LOCAL_MENU_FRONTEND
+  exec python3 "$ROOT/pushbutton-select" "${selector_args[@]}"
+fi
+# Wrapper frontends use this preflight before installing their own clients.
+[[ "${CODER_LOCAL_STARTUP_ONLY:-0}" != 1 || $PLAN_ONLY -eq 1 ]] || exit 125
 [[ -z "$AGENTS" ]]||[[ "$AGENTS" =~ ^[1-8]$ ]]||die "--agents must be 1..8"
 [[ "$CTX" =~ ^[0-9]+$ && "$CLIENT_CTX" =~ ^[0-9]+$ ]]||die "context values must be integers"
 ((CLIENT_CTX<=CTX))||die "client context exceeds physical context"

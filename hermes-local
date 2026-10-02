@@ -13,6 +13,8 @@ CACHE_DIR="${CLAUDE_LOCAL_CACHE:-$HOME/.cache/pushbutton/llama}"
 LOCK_FILE="${CLAUDE_LOCAL_LOCK_FILE:-$HOME/.local/share/pushbutton/claude-local/startup.lock}"
 CTX="${CLAUDE_LOCAL_CONTEXT:-262144}"
 CLIENT_CTX="${CLAUDE_LOCAL_CLIENT_CONTEXT:-200000}"
+CLIENT_CTX_EXPLICIT=0
+[[ -z "${CLAUDE_LOCAL_CLIENT_CONTEXT+x}" ]] || CLIENT_CTX_EXPLICIT=1
 PORT_BASE="${HERMES_LOCAL_PORT_BASE:-19180}"
 BOT_PREFIX="${HERMES_LOCAL_BOT_PREFIX:-pushbutton}"
 WEB_SEARCH_BACKEND="${HERMES_LOCAL_WEB_SEARCH_BACKEND:-exa}"
@@ -20,6 +22,8 @@ WEB_EXTRACT_BACKEND="${HERMES_LOCAL_WEB_EXTRACT_BACKEND:-firecrawl}"
 UI=desktop
 RESUME=0
 KEEP_SERVERS=0
+SELECT=0
+SELECT_ARGS=()
 MODELS=()
 PIDS=()
 STARTUP_LOCK_FD=""
@@ -51,6 +55,7 @@ Hermes frontends:
   --resume               Resume latest manager session for TUI/CLI
 
 Harness options:
+  --select              choose models interactively before provisioning
   --local-cache DIR
   --local-context N
   --local-client-context N
@@ -442,27 +447,41 @@ launch_hermes() {
     esac
 }
 
-[[ -f "$PLAN_PY" ]] || die "missing $PLAN_PY"
 while (($#)); do
     case "$1" in
         -h|--help) usage; exit 0 ;;
-        --desktop) UI=desktop; shift ;;
-        --tui) UI=tui; shift ;;
-        --cli) UI=cli; shift ;;
-        --resume) RESUME=1; shift ;;
-        --local-cache) [[ $# -ge 2 ]] || die "--local-cache needs a directory"; CACHE_DIR="$2"; shift 2 ;;
+        --select) SELECT=1; shift ;;
+        --desktop) UI=desktop; SELECT_ARGS+=("$1"); shift ;;
+        --tui) UI=tui; SELECT_ARGS+=("$1"); shift ;;
+        --cli) UI=cli; SELECT_ARGS+=("$1"); shift ;;
+        --resume) RESUME=1; SELECT_ARGS+=("$1"); shift ;;
+        --local-cache) [[ $# -ge 2 ]] || die "--local-cache needs a directory"; CACHE_DIR="$2"; SELECT_ARGS+=("$1" "$2"); shift 2 ;;
         --local-context) [[ $# -ge 2 ]] || die "--local-context needs a value"; CTX="$2"; shift 2 ;;
-        --local-client-context) [[ $# -ge 2 ]] || die "--local-client-context needs a value"; CLIENT_CTX="$2"; shift 2 ;;
-        --local-port-base) [[ $# -ge 2 ]] || die "--local-port-base needs a value"; PORT_BASE="$2"; shift 2 ;;
-        --bot-prefix) [[ $# -ge 2 ]] || die "--bot-prefix needs a name"; BOT_PREFIX="$2"; shift 2 ;;
-        --web-search-backend) [[ $# -ge 2 ]] || die "--web-search-backend needs a name"; WEB_SEARCH_BACKEND="$2"; shift 2 ;;
-        --web-extract-backend) [[ $# -ge 2 ]] || die "--web-extract-backend needs a name"; WEB_EXTRACT_BACKEND="$2"; shift 2 ;;
-        --local-keep-servers) KEEP_SERVERS=1; shift ;;
+        --local-client-context) [[ $# -ge 2 ]] || die "--local-client-context needs a value"; CLIENT_CTX="$2"; CLIENT_CTX_EXPLICIT=1; shift 2 ;;
+        --local-port-base) [[ $# -ge 2 ]] || die "--local-port-base needs a value"; PORT_BASE="$2"; SELECT_ARGS+=("$1" "$2"); shift 2 ;;
+        --bot-prefix) [[ $# -ge 2 ]] || die "--bot-prefix needs a name"; BOT_PREFIX="$2"; SELECT_ARGS+=("$1" "$2"); shift 2 ;;
+        --web-search-backend) [[ $# -ge 2 ]] || die "--web-search-backend needs a name"; WEB_SEARCH_BACKEND="$2"; SELECT_ARGS+=("$1" "$2"); shift 2 ;;
+        --web-extract-backend) [[ $# -ge 2 ]] || die "--web-extract-backend needs a name"; WEB_EXTRACT_BACKEND="$2"; SELECT_ARGS+=("$1" "$2"); shift 2 ;;
+        --local-keep-servers) KEEP_SERVERS=1; SELECT_ARGS+=("$1"); shift ;;
         -*) die "unknown option: $1" ;;
         *) MODELS+=("$1"); shift ;;
     esac
 done
 
+if ((SELECT)) || ((${#MODELS[@]} == 0)); then
+    if [[ ! -t 0 || ! -t 1 ]]; then
+        usage >&2
+        die "supply a MODEL, or run hermes-local --select in an interactive terminal"
+    fi
+    have_cmd python3 || die "python3 is required for the interactive selector"
+    [[ -f "$ROOT/pushbutton-select" ]] || die "missing $ROOT/pushbutton-select; reinstall hermes-local"
+    selector_args=(--frontend hermes-local --menu --context "$CTX")
+    ((CLIENT_CTX_EXPLICIT == 0)) || selector_args+=(--client-context "$CLIENT_CTX")
+    selector_args+=("${MODELS[@]}")
+    for arg in "${SELECT_ARGS[@]}"; do selector_args+=("--launch-arg=$arg"); done
+    exec python3 "$ROOT/pushbutton-select" "${selector_args[@]}"
+fi
+[[ -f "$PLAN_PY" ]] || die "missing $PLAN_PY"
 [[ "$CTX" =~ ^[0-9]+$ && "$CLIENT_CTX" =~ ^[0-9]+$ ]] || die "context values must be integers"
 (( CLIENT_CTX <= CTX )) || die "client context ($CLIENT_CTX) exceeds physical context ($CTX)"
 ((${#MODELS[@]} <= 4)) || die "at most four model selectors may be supplied"

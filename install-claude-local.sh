@@ -7,6 +7,7 @@ REF="${PUSHBUTTON_REF:-main}"
 INSTALL_ROOT="${PUSHBUTTON_DIR:-$HOME/.local/share/pushbutton}"
 DEST="$INSTALL_ROOT/PushbuttonLocalCoders"
 SYSTEM_INSTALL=0
+SELECT=0
 
 say() { printf '\033[1;34m[pushbutton]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[pushbutton]\033[0m %s\n' "$*" >&2; }
@@ -14,9 +15,16 @@ die() { printf '\033[1;31m[pushbutton]\033[0m %s\n' "$*" >&2; exit 1; }
 
 # Bootstrap-only option. This is consumed here rather than passed through to
 # Claude Code. It may be used by itself (install only) or before model args.
-if [[ "${1:-}" == "--system" ]]; then
-    SYSTEM_INSTALL=1
-    shift
+while (($#)); do
+    case "$1" in
+        --system) SYSTEM_INSTALL=1; shift;;
+        --select) SELECT=1; shift;;
+        -h|--help) echo "Usage: install-claude-local.sh [--system] [--select] [MODEL ...] [Claude Code flags...]"; exit 0;;
+        *) break;;
+    esac
+done
+if ((SELECT)) && [[ ! -t 0 || ! -t 1 ]]; then
+    die "run --select in an interactive terminal, or supply a MODEL without --select. Piped installs without arguments only install and print help."
 fi
 
 ensure_git() {
@@ -54,14 +62,19 @@ install_command_shims() {
     # Always keep the per-user command available. --system additionally places
     # the same wrapper in /usr/local/bin.
     write_shim "$HOME/.local/bin/claude-local"
+    ln -sfn "$DEST/pushbutton-select" "$HOME/.local/bin/pushbutton-select"
     if (( SYSTEM_INSTALL )); then
         write_shim /usr/local/bin/claude-local
+        sudo ln -sfn "$DEST/pushbutton-select" /usr/local/bin/pushbutton-select
         say "Installed system command: /usr/local/bin/claude-local"
     else
         say "Installed user command: $HOME/.local/bin/claude-local"
     fi
 }
 
+if [[ $# -eq 0 && ( ! -t 0 || ! -t 1 ) ]] && ! command -v git >/dev/null 2>&1; then
+    die "git is required to install launcher assets; install git and rerun. No tools or models were installed."
+fi
 ensure_git
 mkdir -p "$INSTALL_ROOT"
 
@@ -80,12 +93,16 @@ fi
 
 [[ -x "$DEST/claude-local" ]] || chmod +x "$DEST/claude-local"
 [[ -x "$DEST/lib/claude_local_entry.sh" ]] || chmod +x "$DEST/lib/claude_local_entry.sh"
+chmod +x "$DEST/pushbutton-select"
+for asset in lib/pushbutton_metrics.py lib/coder_local_plan.py lib/claude_local_plan.py configs/backend-registry.json; do
+    [[ -f "$DEST/$asset" ]] || die "missing selector asset: $asset"
+done
 install_command_shims
 
-# With no remaining arguments, install/update the command and print help. With
-# arguments, run the hardened entry wrapper immediately so the curl one-liner
-# doubles as a fresh-machine test.
+if ((SELECT)); then exec "$DEST/lib/claude_local_entry.sh" --select "$@"; fi
+# A piped no-argument install must never read from an implicit controlling TTY.
 if [[ $# -eq 0 ]]; then
+    if [[ -t 0 && -t 1 ]]; then exec "$DEST/lib/claude_local_entry.sh"; fi
     exec "$DEST/lib/claude_local_entry.sh" --help
 fi
 

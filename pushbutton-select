@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Interactive model/backend selector with live hardware and benchmark guidance."""
 from __future__ import annotations
-import argparse, json, os, pathlib, re, socket, subprocess, sys, urllib.request
+import argparse, json, os, pathlib, re, shlex, subprocess, sys
+from dataclasses import asdict, replace
 
 ROOT=pathlib.Path(__file__).resolve().parent
 sys.path.insert(0,str(ROOT/'lib'))
 import claude_local_plan as plan
+import coder_local_plan as workers
 import pushbutton_metrics as metrics
 
 UPSTREAM={
@@ -18,7 +20,7 @@ ALIASES={'qwen38':'qwen3.8:27b','qwen3.8-27b':'qwen3.8:27b','q38':'qwen3.8:27b'}
 RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; BOLD='\033[1m'; RESET='\033[0m'
 def color(s,c): return f'{c}{s}{RESET}' if sys.stdout.isatty() else s
 
-def canon(x:str)->str:return ALIASES.get(x.lower(),x.lower())
+def canon(x:str)->str:return plan.canonical_model(ALIASES.get(x.lower(),x.lower()))
 def parse_mem(s:str|None)->int|None:
  if not s:return None
  m=re.fullmatch(r'\s*(\d+(?:\.\d+)?)\s*([GM]?)I?B?\s*',s,re.I)
@@ -35,36 +37,6 @@ def gpu_inventory():
  try:return plan.inventory()
  except Exception:return []
 
-def gpu_for(index:int|None):
- inv=gpu_inventory()
- if index is None:return inv[0] if len(inv)==1 else None
- return next((g for g in inv if g.index==index),None)
-
-def free_port(start=20180):
- for p in range(start,min(65535,start+400)):
-  s=socket.socket()
-  try:s.bind(('127.0.0.1',p));return p
-  except OSError:pass
-  finally:s.close()
- raise RuntimeError('no free local port found')
-
-def known_endpoints():
- state=pathlib.Path(os.environ.get('CLAUDE_LOCAL_STATE',pathlib.Path.home()/'.local/share/pushbutton/claude-local'))
- rows=[]
- for p in state.glob('coder-backends.*.tsv') if state.exists() else []:
-  try:
-   for line in p.read_text().splitlines():
-    x=line.split('\t')
-    if len(x)<4:continue
-    worker,mid,port,hf=x[:4]; port=int(port)
-    try:
-     with urllib.request.urlopen(f'http://127.0.0.1:{port}/v1/models',timeout=.25) as r: obj=json.load(r)
-     served=((obj.get('data') or [{}])[0]).get('id') or mid
-     rows.append({'source':p.name,'worker':worker,'model_id':served,'port':port,'artifact':hf})
-    except Exception:pass
-  except Exception:pass
- return rows
-
 def model_menu():
  names=list(plan.PROFILES)
  print('\nAvailable model families:')
@@ -72,69 +44,91 @@ def model_menu():
   profiles=plan.PROFILES[m]; q=profiles[0].quality if profiles else '-'
   print(f' {i:>2}. {m:<26} best planner quality {q}')
  while True:
-  s=input('Choose model [1]: ').strip() or '1'
+  s=input('Choose model(s), space-separated numbers/names [1]: ').strip() or '1'
   try:
-   n=int(s)
-   if 1<=n<=len(names):return names[n-1]
-  except ValueError:
-   try:return plan.canonical_model(s)
-   except Exception:pass
-  print('Please enter a number or model name.')
+   selected=[names[int(x)-1] if x.isdigit() and 1<=int(x)<=len(names) else x for x in s.split()]
+   for x in selected:workers.parse_model_spec(x)
+   return selected
+  except (ValueError, IndexError):
+   print('Please enter valid numbers or model names (optional @gpu=0+1,vram=30G).')
 
-def ask_caps(gpu):
+def ask_caps():
  total,avail=ram_info()
- print('\nResource ceilings (blank = use detected availability).')
- rs=input(f'Host RAM ceiling [{avail/1024:.1f}G available]: ' if avail else 'Host RAM ceiling [auto]: ').strip()
- default_v=f'{gpu.free_mib/1024:.1f}G' if gpu else 'auto'
- vs=input(f'VRAM ceiling [{default_v}]: ').strip()
- return parse_mem(rs) if rs else avail, parse_mem(vs) if vs else (gpu.free_mib if gpu else None)
+ print('\nResource ceilings: VRAM lease is per GPU, capped by currently free memory.')
+ while True:
+  try:
+   rs=input(f'Advisory host RAM ceiling [{fmt_mib(avail)} available]: ').strip()
+   vs=input('Per-GPU VRAM lease [auto = currently free VRAM]: ').strip()
+   ram_cap=parse_mem(rs) if rs else avail
+   cap=workers.parse_memory_mib(vs)
+   if ram_cap is not None and ram_cap<=0:raise ValueError('RAM ceiling must be positive')
+   return ram_cap,cap
+  except ValueError as exc:print(exc)
 
-def estimate_llama_rates(gpu,req):
- if not gpu or not req:return None,None
- bw=max(150,getattr(gpu,'speed_score',200))
- weight_gib=max(4.0,(req/1024)*.88)
- tg=max(1.0,.76*bw/weight_gib)
- pp=tg*28.0
- return pp,tg
-
-def measured_summary(model,backend,gpu_name,context):
- rows=metrics.observations(model,backend,gpu_name,context)
+def measured_summary(model,backend,gpu_name,context,artifact=None):
+ rows=metrics.observations(model,backend,artifact=artifact,gpu_name=gpu_name,context=context)
+ # Do not mix published reference samples into local measurements.
+ local=[r for r in rows if r.get('evidence_origin')=='local' and r.get('context')==context and gpu_name]
+ rows=local or [r for r in rows if r.get('evidence_origin')!='local']
  s=metrics.summarize_observations(rows)
  return rows,s
 
-def rows_for(model,gpu,cap,ram_cap,context):
+def evidence_label(obs,sm):
+ if not sm.get('pp') and not sm.get('tg'):return 'UNKNOWN'
+ return 'LOCAL MEASURED' if obs and all(r.get('evidence_origin')=='local' for r in obs) else 'UPSTREAM REFERENCE'
+
+def rows_for(model,gpu,cap,ram_cap,context,gpus=None):
  rows=[]; gpu_name=gpu.name if gpu else None
+ gpus=gpus if gpus is not None else ([gpu] if gpu else [])
+ effective=[replace(g,free_mib=min(g.free_mib,cap)) if cap is not None else g for g in gpus]
+ registry=json.loads((ROOT/'configs/backend-registry.json').read_text())['backends']
+ baseline_gpus=[g for g in effective if 'sm'+g.compute_cap.replace('.','') in registry['llama.cpp']['gpu_arch']]
+ capacity=sum(g.free_mib for g in baseline_gpus)
  if model in plan.PROFILES:
   for p in plan.PROFILES[model]:
-   req=plan.scaled_required_mib(p,context); ram_req=max(2048,int(req*.12))
-   status='FIT'
-   if cap is not None and req>cap:status='BLOCK'
-   if ram_cap is not None and ram_req>ram_cap:status='BLOCK'
-   obs,sm=measured_summary(model,'llama.cpp',gpu_name,context)
-   pp=(sm.get('pp') or {}).get('median'); tg=(sm.get('tg') or {}).get('median'); evidence='MEASURED' if pp or tg else 'ESTIMATED'
-   if evidence=='ESTIMATED':pp,tg=estimate_llama_rates(gpu,req)
-   rows.append({'model':model,'backend':'llama.cpp','artifact':p.quant,'req':req,'ram_req':ram_req,'quality':str(p.quality),'pp':pp,'tg':tg,'status':status,'note':'quant-selectable GGUF lane','evidence':evidence,'spread':sm,'local':any(r.get('source')=='local' for r in obs)})
+   req=plan.scaled_required_mib(p,context)
+   status=('FIT' if req<=capacity else 'BLOCK') if baseline_gpus else ('UNAVAILABLE' if effective else 'UNKNOWN')
+   obs,sm=measured_summary(model,'llama.cpp',gpu_name,context,p.quant)
+   pp=(sm.get('pp') or {}).get('median'); tg=(sm.get('tg') or {}).get('median')
+   rows.append({'model':model,'backend':'llama.cpp','artifact':p.quant,'req':req,'ram_req':None,'quality':str(p.quality),'pp':pp,'tg':tg,'status':status,'note':'baseline; conservative VRAM planning envelope, not measured allocation; host RAM minimum unknown; '+p.note,'evidence':evidence_label(obs,sm),'spread':sm})
  for (m,b),d in UPSTREAM.items():
   if m!=model:continue
   hard=d.get('hard_min_mib'); tested=d.get('tested_card_mib'); ram_req=d.get('host_ram_mib')
-  if cap is None:status='FIT' if tested else 'UNVERIFIED'
+  if cap is None:status='UNVERIFIED'
   elif hard is not None and hard>cap:status='BLOCK'
-  elif tested is not None and cap>=tested:status='FIT'
+  elif tested is not None and cap>=tested:status='UNVERIFIED'
   else:status='UNVERIFIED'
   if ram_cap is not None and ram_req is not None and ram_req>ram_cap:status='BLOCK'
+  eligibility,_=adapter_eligibility(registry[b],effective,context,ram_cap)
+  if eligibility=='UNAVAILABLE':status=eligibility
   obs,sm=measured_summary(model,b,gpu_name,context)
   pp=(sm.get('pp') or {}).get('median'); tg=(sm.get('tg') or {}).get('median')
-  evidence='MEASURED' if pp or tg else 'ESTIMATED'
-  rows.append({'model':model,'backend':b,'artifact':d['artifact'],'req':hard,'ram_req':ram_req,'quality':d.get('quality','n/a'),'pp':pp,'tg':tg,'status':status,'note':d['note'],'evidence':evidence,'spread':sm,'local':any(r.get('source')=='local' for r in obs)})
- rank={'FIT':0,'UNVERIFIED':1,'BLOCK':2}
- rows.sort(key=lambda r:(rank[r['status']],0 if r['evidence']=='MEASURED' else 1,-(r['tg'] or -1),-(int(r['quality']) if str(r['quality']).isdigit() else -1)))
+  evidence=evidence_label(obs,sm)
+  rows.append({'model':model,'backend':b,'artifact':d['artifact'],'req':hard,'ram_req':ram_req,'quality':d.get('quality','n/a'),'pp':pp,'tg':tg,'status':status,'note':d['note'],'evidence':evidence,'spread':sm,'local':any(r.get('evidence_origin')=='local' for r in obs)})
+ for backend,d in registry.items():
+  if model not in d['models'] or backend=='llama.cpp' or (model,backend) in UPSTREAM:continue
+  status,note=adapter_eligibility(d,effective,context,ram_cap)
+  obs,sm=measured_summary(model,backend,gpu_name,context)
+  rows.append({'model':model,'backend':backend,'artifact':d.get('artifact','recipe-specific'),'req':None,'ram_req':None,'quality':'n/a','pp':(sm.get('pp') or {}).get('median'),'tg':(sm.get('tg') or {}).get('median'),'status':status,'note':f"experimental; {note}; {d['notes']} Source: {d['source']}",'evidence':evidence_label(obs,sm),'spread':sm})
+ for r in rows:
+  metadata=registry.get(r['backend'],{})
+  r['support']=metadata.get('status','baseline')
+  r['frontend_integrated']=r['backend']=='llama.cpp'
+  r['constraints']=metadata.get('constraints',{})
+  if r['backend']!='llama.cpp':
+   eligible=[g for g in gpus if 'sm'+g.compute_cap.replace('.','') in metadata['gpu_arch']]
+   command=[str(ROOT/'pushbutton-bench'),model,'--backend',r['backend'],'--context',str(min(context,r['constraints'].get('max_context',context))),'--suite','standard']
+   if eligible:command+=['--gpus',','.join(str(g.index) for g in eligible[:r['constraints'].get('gpu_count',1)])]
+   r['validation_argv']=command
+ rank={'FIT':0,'UNKNOWN':1,'UNVERIFIED':1,'UNAVAILABLE':2,'BLOCK':2}
+ rows.sort(key=lambda r:(rank[r['status']],-(int(r['quality']) if str(r['quality']).isdigit() else -1)))
  return rows
 
 def fmt_mib(v):return '-' if v is None else f'{v/1024:.1f}G'
 def fmt_rate(v):return '-' if v is None else f'{v:.0f}'
 def ev_label(r):
- s='MEASURED' if r['evidence']=='MEASURED' else 'ESTIMATED'
- return color(s,GREEN if s=='MEASURED' else RED)
+ s=r['evidence']
+ return color(s,GREEN) if s=='LOCAL MEASURED' else s
 
 def print_hw(gpu,ram_cap,vram_cap):
  total,avail=ram_info(); print('')
@@ -142,77 +136,193 @@ def print_hw(gpu,ram_cap,vram_cap):
   used=max(0,gpu.total_mib-gpu.free_mib)
   print(f"GPU {gpu.index}: {gpu.name}  {gpu.free_mib/1024:.1f}G free / {gpu.total_mib/1024:.1f}G total  ({used/1024:.1f}G occupied)")
   if vram_cap and vram_cap>gpu.free_mib: print(color(f'WARNING: requested VRAM ceiling {fmt_mib(vram_cap)} exceeds currently free VRAM {fmt_mib(gpu.free_mib)}.',YELLOW),file=sys.stderr)
- elif gpu_inventory(): print('Multiple GPUs detected; use --gpu or select one interactively for card-specific guidance.')
  if total: print(f'Host RAM: {avail/1024:.1f}G available / {total/1024:.1f}G total  planning ceiling={fmt_mib(ram_cap)}')
 
 def print_table(rows,gpu,cap,ram_cap):
  print_hw(gpu,ram_cap,cap)
- print(f"{'#':>2} {'status':<10} {'backend':<19} {'quant/artifact':<28} {'VRAM':>7} {'RAM':>7} {'qual':>6} {'PP':>7} {'TG':>7} {'evidence':<10}")
+ print(f"{'#':>2} {'status':<10} {'backend':<19} {'quant/artifact':<28} {'VRAM*':>7} {'RAM*':>7} {'qual':>6} {'PP':>7} {'TG':>7} {'evidence':<10}")
  print('-'*116)
  for i,r in enumerate(rows,1):
   print(f"{i:>2} {r['status']:<10} {r['backend']:<19} {r['artifact'][:28]:<28} {fmt_mib(r['req']):>7} {fmt_mib(r['ram_req']):>7} {r['quality']:>6} {fmt_rate(r['pp']):>7} {fmt_rate(r['tg']):>7} {ev_label(r):<10}")
- print('\nPP/TG are tok/s. Green MEASURED rows come from local or repo aggregate observations; red ESTIMATED rows are planning estimates only.')
+ print('\nPP/TG are tok/s: LOCAL MEASURED and UPSTREAM REFERENCE are separate evidence.')
+ print('UNKNOWN means no matching evidence; benchmark before making speed claims. FIT is a memory plan, not GPU validation.')
+ print('* llama.cpp VRAM is a conservative planning envelope, not measured allocation; host RAM minimum unknown.')
+ for r in rows:
+  if r['backend']!='llama.cpp':print(f"  {r['backend']}: {r['note']}")
 
-def preview(row,gpu,cap,context):
- eps=known_endpoints(); same=[e for e in eps if row['model'].split(':')[0] in str(e['model_id']).lower() or row['model'].replace(':','-') in str(e['model_id']).lower()]
- print('\nPlacement preview:')
- if same:
-  e=same[0]; print(color(f"  REUSE resident endpoint http://127.0.0.1:{e['port']}/v1 ({e['model_id']})",GREEN)); return
- port=free_port(); print(f"  GPU: {gpu.index if gpu else 'auto'}   backend: {row['backend']}   artifact: {row['artifact']}")
- print(f"  VRAM plan: {fmt_mib(row['req'])} within lease {fmt_mib(cap)}   context: {context:,}   proposed port: {port}")
- print('  Existing listeners are not overwritten; launchers choose a free loopback port.')
- if row['status']=='UNVERIFIED': print(color('  WARNING: memory compatibility is not proven for this specialized backend/profile.',YELLOW),file=sys.stderr)
+def adapter_eligibility(metadata,gpus,context,ram_cap):
+ constraints=metadata.get('constraints',{})
+ if not gpus:return 'UNKNOWN','no GPU inventory; eligibility and memory unknown'
+ eligible=[g for g in gpus if 'sm'+g.compute_cap.replace('.','') in metadata['gpu_arch']]
+ count=constraints.get('gpu_count',1)
+ card=constraints.get('tested_card_mib',0)
+ if len(eligible)<count:return 'UNAVAILABLE',f'requires {count} GPUs with architecture {metadata["gpu_arch"]}'
+ name=constraints.get('tested_gpu_name','')
+ recipe_cards=[g for g in eligible if g.total_mib>=card and name.lower() in g.name.lower()]
+ if len(recipe_cards)<count:
+  return 'UNAVAILABLE','published GPU model/card capacity configuration unavailable; smaller-card fit is not proven'
+ if context>constraints.get('max_context',context):
+  return 'UNAVAILABLE','context exceeds this adapter profile limit'
+ return 'UNKNOWN',f'architecture eligible, but free VRAM/topology/calibration/runtime must be validated; host RAM minimum unknown; constraints={json.dumps(constraints)}'
+
+CODER_FRONTENDS=('qwen-local','coder-local','opencode-local','deepseek-local','mini-swe-local')
+FRONTENDS=CODER_FRONTENDS+('claude-local','hermes-local')
+
+def joint_preview(models,frontend,agents,gpus,context,cap=None,gpu_indices=None,placement_config=None):
+ if context<1:raise ValueError('context must be positive')
+ if not gpus:raise ValueError('No supported NVIDIA GPUs detected; no provisioning attempted.')
+ supported=json.loads((ROOT/'configs/backend-registry.json').read_text())['backends']['llama.cpp']['gpu_arch']
+ unsupported=[g for g in gpus if 'sm'+g.compute_cap.replace('.','') not in supported]
+ gpus=[g for g in gpus if g not in unsupported]
+ if not gpus:
+  raise ValueError('GPU architecture is unknown or unsupported by the baseline registry; no provisioning attempted.')
+ if frontend in CODER_FRONTENDS:
+  defaults=workers.load_placement_config(placement_config or workers.DEFAULT_PLACEMENT_CONFIG)
+  requests=[workers.parse_model_spec(m,defaults) for m in models]
+  requests=[replace(r,gpu_indices=r.gpu_indices if r.gpu_indices is not None else gpu_indices,
+                    vram_limit_mib=r.vram_limit_mib if r.vram_limit_mib is not None else cap) for r in requests]
+  result=workers.build_plan(requests,agents,gpus,context)
+  # Pin each independent worker to its previewed GPU set and lease.
+  launch_models=[]
+  for w in result['workers']:
+   spec=w['model']+'@gpu='+w['cuda_visible_devices'].replace(',','+')
+   if w['vram_limit_mib_per_gpu'] is not None:spec+=f",vram={w['vram_limit_mib_per_gpu']}MiB"
+   launch_models.append(spec)
+ else:
+  if agents is not None:raise ValueError('Claude/Hermes use shared roles, not independent --agents replicas')
+  if cap is not None or gpu_indices is not None or any('@' in m for m in models):
+   raise ValueError('GPU pins/leases are supported by coder frontends only; Claude/Hermes use their role planner')
+  launch_models=[canon(m) for m in models]
+  result=plan.plan(launch_models,gpus,context)
+ result['unused_gpus'] += [asdict(g) for g in unsupported]
+ return result,launch_models
+
+def launch_command(frontend,models,result,context,client_context,launch_args):
+ # The wrapper supplies an argv list; only recognized launchers are executable.
+ target=ROOT/frontend
+ if frontend=='claude-local':target=ROOT/'lib/claude_local_entry.sh'
+ if frontend in ('qwen-local','coder-local'):target=ROOT/'coder-local'
+ command=[str(target)]
+ if frontend in ('qwen-local','coder-local'):command+=['--frontend','qwen']
+ command+=models
+ if frontend in CODER_FRONTENDS:command+=['--agents',str(result['agents'])]
+ command+=['--local-context',str(context),'--local-client-context',str(client_context),*launch_args]
+ return command
+
+def welcome(ap):
+ while True:
+  print('\nWelcome to Pushbutton Local Coders — nothing is provisioned until you confirm.')
+  print('  1. Choose model(s) and launch\n  2. Inspect models / hardware / Flash-Next backends\n  3. Preview a plan (no launch)\n  4. Help\n  5. Quit')
+  action=input('Action [4]: ').strip() or '4'
+  if action in ('1','2','3'):return action
+  if action=='4':ap.print_help()
+  elif action in ('5','q','quit'):return '5'
+  else:print('Please choose 1–5.')
+
+def positive_input(prompt,default,maximum=None):
+ while True:
+  try:
+   value=int(input(f'{prompt} [{default}]: ').strip() or default)
+   if value>0 and (maximum is None or value<=maximum):return value
+  except ValueError:pass
+  print('Please enter a positive number'+(f' up to {maximum}.' if maximum else '.'))
 
 def main():
  ap=argparse.ArgumentParser(prog='pushbutton-select')
- ap.add_argument('model',nargs='?')
+ ap.add_argument('models',nargs='*',help='model names or coder model@gpu=0+1,vram=30G selectors')
  ap.add_argument('--gpu',type=int)
+ ap.add_argument('--gpus',help='exact GPU set for each coder worker; prefer per-model pins for multiple workers')
+ ap.add_argument('--frontend',choices=FRONTENDS,default='qwen-local')
+ ap.add_argument('--agents',type=int,help='independent coder workers (1–8); Claude/Hermes instead share model roles')
+ ap.add_argument('--placement-config',default=workers.DEFAULT_PLACEMENT_CONFIG)
+ ap.add_argument('--client-context',type=int)
+ ap.add_argument('--launch-arg',action='append',default=[],help='frontend argument to preserve; use --launch-arg=VALUE')
+ ap.add_argument('--menu',action='store_true')
  ap.add_argument('--vram-limit'); ap.add_argument('--ram-limit')
  ap.add_argument('--context',type=int,default=262144)
  ap.add_argument('--json',action='store_true'); ap.add_argument('--no-interactive',action='store_true')
+ ap.add_argument('--plan-only','--print-only',action='store_true',help='preview only; never launch')
  ap.add_argument('--telemetry-opt-in',action='store_true'); ap.add_argument('--telemetry-off',action='store_true'); ap.add_argument('--telemetry-upload-url')
  a=ap.parse_args()
+ for arg in a.launch_arg:
+  if arg=='--':break
+  if arg.split('=',1)[0] in ('--local-context','--local-client-context','--agents','--frontend','--placement-config','--select','--smart'):
+   raise ValueError(f'{arg} changes the plan; use selector options instead of --launch-arg')
+ interactive=sys.stdin.isatty() and sys.stdout.isatty() and not (a.no_interactive or a.json or a.plan_only)
  if a.telemetry_opt_in:
-  p=metrics.set_telemetry(True,a.telemetry_upload_url); print(f'Opt-in telemetry enabled in {p}. Only compact benchmark metadata is queued; prompts/text are excluded.')
+  p=metrics.set_telemetry(True,a.telemetry_upload_url); print(f'Opt-in telemetry enabled in {p}. Only compact benchmark metadata is queued; prompts/text are excluded.',file=sys.stderr)
  if a.telemetry_off:
-  p=metrics.set_telemetry(False); print(f'Telemetry disabled in {p}.')
- inv=gpu_inventory(); gpu=gpu_for(a.gpu)
- if a.gpu is None and len(inv)>1 and not a.no_interactive and sys.stdin.isatty():
-  print('Detected GPUs:')
-  for g in inv:print(f' {g.index}: {g.name}  free {g.free_mib/1024:.1f}G/{g.total_mib/1024:.1f}G')
-  try:gpu=gpu_for(int(input(f'Choose GPU [{inv[0].index}]: ').strip() or inv[0].index))
-  except Exception:gpu=inv[0]
+  p=metrics.set_telemetry(False); print(f'Telemetry disabled in {p}.',file=sys.stderr)
+ action=None
+ if not a.models and not interactive:
+  guidance='No model supplied. Run your frontend with --select in a terminal, or pass explicit model(s). No provisioning attempted.'
+  if a.json:print(json.dumps({'models':[],'plan':None,'launch_argv':None,'guidance':guidance}))
+  else:ap.print_help(); print('\n'+guidance)
+  return 0
+ if interactive and (a.menu or not a.models):
+  action=welcome(ap)
+  if action=='5':return 0
+ inv=gpu_inventory(); gpu=next((g for g in inv if g.index==a.gpu),None) if a.gpu is not None else (inv[0] if len(inv)==1 else None)
+ if a.gpu is not None and gpu is None:raise ValueError(f'GPU {a.gpu} is not visible')
  ram_cap=parse_mem(a.ram_limit); cap=parse_mem(a.vram_limit)
- if not a.no_interactive and sys.stdin.isatty() and not a.model and not a.ram_limit and not a.vram_limit:
-  ram_cap,cap=ask_caps(gpu)
- model=canon(a.model) if a.model else (model_menu() if not a.no_interactive and sys.stdin.isatty() else 'qwen3.8:27b')
- if model not in plan.PROFILES and not any(m==model for m,_ in UPSTREAM):raise SystemExit(f'unknown selector model {model}')
- if cap is None and gpu:cap=gpu.free_mib
+ if cap is not None and cap<=0:raise ValueError('VRAM lease must be positive')
+ for g in inv:print_hw(g,ram_cap,cap) if not a.json else None
+ if not inv and not a.json:print('No supported NVIDIA GPUs detected. Hardware fit and speed are unknown.')
+ models=a.models or model_menu()
+ if interactive and action in ('1','3'):
+  a.context=positive_input('Physical context',a.context)
+  if a.frontend in CODER_FRONTENDS:
+   a.agents=positive_input('Independent workers',a.agents or len(models),8)
+   if not a.ram_limit and not a.vram_limit:ram_cap,cap=ask_caps()
+ client_context=min(200000,a.context) if a.client_context is None else a.client_context
+ if not 0<client_context<=a.context:raise ValueError('client context must be positive and no larger than physical context')
  if ram_cap is None:_,ram_cap=ram_info()
- rs=rows_for(model,gpu,cap,ram_cap,a.context)
- if a.json:
-  print(json.dumps({'model':model,'gpu':None if gpu is None else gpu.__dict__,'ram_limit_mib':ram_cap,'vram_limit_mib':cap,'rows':rs,'resident':known_endpoints()},indent=2));return
- print_table(rs,gpu,cap,ram_cap)
- usable=[(i,r) for i,r in enumerate(rs,1) if r['status']=='FIT']
- if not usable:raise SystemExit('No proven configuration fits the current ceilings.')
- default=usable[0][0]
- choice=default
- if sys.stdin.isatty() and not a.no_interactive:
-  try:choice=int(input(f'\nSelect configuration [{default}]: ').strip() or default)
-  except Exception:choice=default
- if not (1<=choice<=len(rs)):raise SystemExit('selection out of range')
- r=rs[choice-1]
- if r['status']=='BLOCK':raise SystemExit('selected configuration exceeds a requested resource ceiling')
- preview(r,gpu,cap,a.context)
- gpu_clause=f'@gpu={gpu.index}' if gpu else ''
- vram_clause=((',' if gpu_clause else '@')+f'vram={cap}MiB') if cap else ''
- if r['backend']=='llama.cpp':print(f"\nRecommended launch:\n  qwen-local '{model}{gpu_clause}{vram_clause}' --agents 1 --local-context {a.context}")
+ tables={workers.parse_model_spec(m).model:rows_for(workers.parse_model_spec(m).model,gpu,cap,ram_cap,a.context,[gpu] if gpu else inv) for m in models}
+ if not a.json:
+  for model,rs in tables.items():
+   print(f'\n{model} — available profiles (single-model guidance; joint plan below is authoritative)')
+   print_table(rs,gpu,cap,ram_cap)
+   for r in rs:
+    if r['backend']!='llama.cpp':
+     print('  Optional benchmark/validation ONLY (not integrated with frontend; review prerequisites): '+shlex.join(r['validation_argv']))
+ if action=='2':return 0
+ error=None; result=None; command=None
+ try:
+  indices=workers.parse_gpu_indices(a.gpus) if a.gpus else ((a.gpu,) if a.gpu is not None else None)
+  result,launch_models=joint_preview(models,a.frontend,a.agents,inv,a.context,cap,indices,a.placement_config)
+  command=launch_command(a.frontend,launch_models,result,a.context,client_context,a.launch_arg)
+  if a.frontend in CODER_FRONTENDS:
+   # Keep the same config source for the launcher's own validation.
+   command[1:1]=['--placement-config',a.placement_config]
+ except ValueError as exc:error=str(exc)
+ obj={'models':models,'frontend':a.frontend,'context':a.context,'client_context':client_context,'ram_limit_mib':ram_cap,'host_ram_fit':'unknown; no proven minimum','vram_limit_mib_per_gpu':cap,'inventory':[asdict(g) for g in inv],'rows':tables,'plan':result,'launch_argv':command,'error':error}
+ if a.json:print(json.dumps(obj,indent=2))
+ elif error:print(f'\nCannot launch: {error}',file=sys.stderr)
  else:
-  gp=f' --gpus {gpu.index}' if gpu else ''
-  print(f"\nRecommended validation first:\n  pushbutton-bench {model} --backend {r['backend']}{gp} --context {a.context} --suite standard")
-  print('After a local benchmark, this selector will prefer the local measured PP/TG distribution over repo/upstream values.')
- cfg=metrics.telemetry_config()
- if cfg.get('enabled'):
-  try:n,msg=metrics.upload_pending(); print(f'\nTelemetry: {msg}')
-  except Exception as exc:print(f'\nTelemetry upload deferred: {exc}',file=sys.stderr)
-if __name__=='__main__':main()
+  print('\nJoint placement preview — baseline llama.cpp; planned memory, NOT measured allocation:')
+  for w in result.get('workers',result.get('servers',[])):
+   print(f"  {w['model']} {w['profile']['quant']}: GPUs {w['cuda_visible_devices']}, envelope {fmt_mib(w['required_mib'])}, free lease capacity {fmt_mib(w['allocated_mib'])}, per-GPU lease {fmt_mib(w.get('vram_limit_mib_per_gpu'))}")
+  if 'roles' in result:print('  Shared roles: '+json.dumps(result['roles']))
+  print('  Spare GPUs: '+str([g['index'] for g in result['unused_gpus']]))
+  print(f'  Physical context: {a.context}; client context: {client_context}')
+  print('  Host RAM minimum unknown; RAM ceiling is advisory, not enforcement.')
+  print('  Resident endpoints are not automatically reused. Launchers choose free ports and recheck placement.')
+  print('\nRecommended launch:\n  '+shlex.join(command))
+ if error:return 2
+ if interactive and action!='3':
+  answer=input('\nDownload/build/launch this baseline plan? [y/N]: ').strip().lower()
+  if answer in ('y','yes'):return subprocess.call(command)
+  print('Cancelled; no provisioning attempted.')
+ return 0
+
+def run():
+ try:return main()
+ except (EOFError,KeyboardInterrupt):
+  print('\nCancelled; no provisioning attempted.',file=sys.stderr)
+  return 0
+ except (ValueError,OSError) as exc:
+  print(f'pushbutton-select: {exc}',file=sys.stderr)
+  return 2
+
+if __name__=='__main__':
+ raise SystemExit(run())

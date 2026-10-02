@@ -15,12 +15,16 @@ CACHE_DIR="${CLAUDE_LOCAL_CACHE:-$HOME/.cache/pushbutton/llama}"
 LOCK_FILE="${CLAUDE_LOCAL_LOCK_FILE:-$HOME/.local/share/pushbutton/claude-local/startup.lock}"
 CTX="${CLAUDE_LOCAL_CONTEXT:-262144}"
 CLIENT_CTX="${CLAUDE_LOCAL_CLIENT_CONTEXT:-200000}"
+CLIENT_CTX_EXPLICIT=0
+[[ -z "${CLAUDE_LOCAL_CLIENT_CONTEXT+x}" ]] || CLIENT_CTX_EXPLICIT=1
 PORT_BASE="${CLAUDE_LOCAL_PORT_BASE:-18180}"
 ALLOW_OFFLOAD=0
 KEEP_SERVERS=0
 ENABLE_TEAMS=1
 DRY_RUN=0
 VERBOSE=0
+SELECT=0
+SELECT_ARGS=()
 MODELS=()
 CLAUDE_ARGS=()
 PIDS=()
@@ -48,6 +52,7 @@ Model order:
 Built-ins: nemotron-3.5-lightning qwen3.6:35b qwen3.8:27b glm-5.3-flash
 
 Harness options (put before ordinary Claude Code flags):
+  --select                   choose models interactively before provisioning
   --local-cache DIR          llama.cpp/Hugging Face model cache
   --local-context N          physical backend context (default 262144)
   --local-client-context N   Claude Code budget (default 200000)
@@ -487,7 +492,6 @@ doctor() {
     have_cmd claude && claude --version || warn "Claude Code unavailable (installed on first run)"
 }
 
-require_files
 case "${1:-}" in
   help|-h|--help) usage; exit 0;;
   install) shift; install_base_deps; install_claude_code; install_command "${1:-}"; exit 0;;
@@ -497,21 +501,40 @@ esac
 
 while (($#)); do
     case "$1" in
+      -h|--help) usage; exit 0;;
+      --select) SELECT=1; shift;;
       --) shift; CLAUDE_ARGS+=("$@"); break;;
-      --local-cache) [[ $# -ge 2 ]] || die "--local-cache needs a directory"; CACHE_DIR="$2"; shift 2;;
+      --local-cache) [[ $# -ge 2 ]] || die "--local-cache needs a directory"; CACHE_DIR="$2"; SELECT_ARGS+=("$1" "$2"); shift 2;;
       --local-context) CTX="$2"; shift 2;;
-      --local-client-context) CLIENT_CTX="$2"; shift 2;;
-      --local-port-base) PORT_BASE="$2"; shift 2;;
-      --local-no-teams) ENABLE_TEAMS=0; shift;;
-      --local-keep-servers) KEEP_SERVERS=1; shift;;
-      --local-allow-offload) ALLOW_OFFLOAD=1; shift;;
-      --local-dry-run) DRY_RUN=1; shift;;
-      --local-verbose) VERBOSE=1; shift;;
+      --local-client-context) CLIENT_CTX="$2"; CLIENT_CTX_EXPLICIT=1; shift 2;;
+      --local-port-base) PORT_BASE="$2"; SELECT_ARGS+=("$1" "$2"); shift 2;;
+      --local-no-teams) ENABLE_TEAMS=0; SELECT_ARGS+=("$1"); shift;;
+      --local-keep-servers) KEEP_SERVERS=1; SELECT_ARGS+=("$1"); shift;;
+      --local-allow-offload) ALLOW_OFFLOAD=1; SELECT_ARGS+=("$1"); shift;;
+      --local-dry-run) DRY_RUN=1; SELECT_ARGS+=("$1"); shift;;
+      --local-verbose) VERBOSE=1; SELECT_ARGS+=("$1"); shift;;
       -*) CLAUDE_ARGS+=("$@"); break;;
       *) MODELS+=("$1"); shift;;
     esac
 done
 
+if ((SELECT)) || ((${#MODELS[@]} == 0)); then
+    if [[ ! -t 0 || ! -t 1 ]]; then
+        usage >&2
+        die "supply a MODEL, or run claude-local --select in an interactive terminal"
+    fi
+    have_cmd python3 || die "python3 is required for the interactive selector"
+    [[ -f "$ROOT/pushbutton-select" ]] || die "missing $ROOT/pushbutton-select; reinstall claude-local"
+    selector_args=(--frontend claude-local --menu --context "$CTX")
+    ((CLIENT_CTX_EXPLICIT == 0)) || selector_args+=(--client-context "$CLIENT_CTX")
+    selector_args+=("${MODELS[@]}")
+    if ((${#CLAUDE_ARGS[@]})); then SELECT_ARGS+=(-- "${CLAUDE_ARGS[@]}"); fi
+    for arg in "${SELECT_ARGS[@]}"; do selector_args+=("--launch-arg=$arg"); done
+    unset CLAUDE_LOCAL_STARTUP_ONLY
+    exec python3 "$ROOT/pushbutton-select" "${selector_args[@]}"
+fi
+[[ "${CLAUDE_LOCAL_STARTUP_ONLY:-0}" != 1 ]] || exit 125
+require_files
 [[ "$CTX" =~ ^[0-9]+$ && "$CLIENT_CTX" =~ ^[0-9]+$ ]] || die "context values must be integers"
 (( CLIENT_CTX <= CTX )) || die "client context ($CLIENT_CTX) exceeds physical context ($CTX)"
 if [[ $DRY_RUN -eq 0 ]]; then install_base_deps; ensure_nvidia_driver; else have_cmd nvidia-smi || die "nvidia-smi required for dry run"; fi

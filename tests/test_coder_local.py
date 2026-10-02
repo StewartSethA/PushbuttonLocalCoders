@@ -1,4 +1,4 @@
-import json, pathlib, sys, tempfile, unittest
+import json, os, pathlib, subprocess, sys, tempfile, unittest
 ROOT=pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'lib'))
 import coder_local_plan as p
@@ -37,7 +37,7 @@ class CoderPlanTests(unittest.TestCase):
    p.build_plan(self.reqs('qwen3.8:27b@gpu=0,vram=12G'),1,p.synthetic_3090(1),262144)
 
  def test_persistent_config_and_inline_override(self):
-  with tempfile.TemporaryDirectory() as td:
+  with tempfile.TemporaryDirectory(dir=ROOT) as td:
    path=pathlib.Path(td)/'placement.json'
    path.write_text(json.dumps({'models':{'qwen3.8:27b':{'gpus':[1],'vram_limit':'16G'}}}))
    defaults=p.load_placement_config(str(path))
@@ -45,5 +45,31 @@ class CoderPlanTests(unittest.TestCase):
    self.assertEqual(r.gpu_indices,(1,)); self.assertEqual(r.vram_limit_mib,16384)
    r2=p.parse_model_spec('qwen3.8:27b@gpu=0,vram=15G',defaults)
    self.assertEqual(r2.gpu_indices,(0,)); self.assertEqual(r2.vram_limit_mib,15360)
+
+class CoderStartupRegressionTests(unittest.TestCase):
+ def startup(self,*args):
+  with tempfile.TemporaryDirectory(dir=ROOT) as td:
+   env=dict(os.environ,CLAUDE_LOCAL_STATE=td,CLAUDE_LOCAL_CACHE=td)
+   result=subprocess.run(['/bin/bash',str(ROOT/'coder-local'),*args],input='',
+                        text=True,capture_output=True,env=env,timeout=5)
+   self.assertEqual(list(pathlib.Path(td).iterdir()),[])
+   self.assertNotIn('nvidia-smi is required',result.stderr)
+   return result
+
+ def test_non_tty_noargs_and_help_exit_before_hardware(self):
+  result=self.startup()
+  self.assertNotEqual(result.returncode,0)
+  self.assertIn('Usage:',result.stderr)
+  self.assertIn('interactive terminal',result.stderr)
+  result=self.startup('--frontend','qwen','--help')
+  self.assertEqual(result.returncode,0,result.stderr)
+  self.assertIn('--select',result.stdout)
+
+ def test_no_model_plan_only_has_nonblocking_guidance(self):
+  result=self.startup('--plan-only')
+  self.assertNotEqual(result.returncode,0)
+  self.assertIn('Usage:',result.stderr)
+  self.assertIn('supply a MODEL',result.stderr)
+  self.assertNotIn('Installing',result.stdout)
 
 if __name__=='__main__': unittest.main()

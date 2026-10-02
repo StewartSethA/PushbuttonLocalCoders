@@ -5,9 +5,19 @@ REF="${PUSHBUTTON_REF:-main}"
 ROOT="${PUSHBUTTON_DIR:-$HOME/.local/share/pushbutton}"
 DEST="$ROOT/PushbuttonLocalCoders"
 SYSTEM=0
-[[ "${1:-}" == --system ]] && { SYSTEM=1; shift; }
 SELECT=0
-[[ "${1:-}" == --select ]] && { SELECT=1; shift; }
+while (($#)); do
+  case "$1" in
+    --system) SYSTEM=1; shift;;
+    --select) SELECT=1; shift;;
+    -h|--help) echo "Usage: install-coder-local.sh [--system] [--select] [MODEL ...] [options]"; exit 0;;
+    *) break;;
+  esac
+done
+if ((SELECT)) && [[ ! -t 0 || ! -t 1 ]]; then
+  echo "Run --select in an interactive terminal, or supply a MODEL without --select. Piped installs without arguments only install and print help." >&2
+  exit 1
+fi
 command -v git >/dev/null || { echo "git is required" >&2; exit 1; }
 mkdir -p "$ROOT"
 if [[ -d "$DEST/.git" ]]; then
@@ -64,7 +74,7 @@ printf '[pushbutton] Installed backend tools: pushbutton-backend, pushbutton-ben
 printf '[pushbutton] Qwen Code web MCP: Exa search + fetch enabled by default\n'
 
 export QWEN_CODE_SYSTEM_DEFAULTS_PATH="$DEST/configs/qwen-local-defaults.json"
-if ((SELECT)); then exec "$DEST/pushbutton-select" "$@"; fi
+if ((SELECT)); then exec "$DEST/coder-local" --frontend qwen --select "$@"; fi
 if (($#)); then exec "$DEST/coder-local" --frontend qwen "$@"; fi
-if [[ -t 0 && -t 1 ]]; then exec "$DEST/pushbutton-select"; fi
+if [[ -t 0 && -t 1 ]]; then exec "$DEST/coder-local" --frontend qwen; fi
 exec "$DEST/coder-local" --frontend qwen --help
