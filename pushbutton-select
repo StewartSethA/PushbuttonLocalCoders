@@ -202,7 +202,7 @@ def launch_command(frontend,models,result,context,client_context,launch_args):
  target=ROOT/frontend
  if frontend=='claude-local':target=ROOT/'lib/claude_local_entry.sh'
  if frontend in ('qwen-local','coder-local'):target=ROOT/'coder-local'
- command=[str(target)]
+ command=['bash',str(target)] if frontend=='claude-local' else [str(target)]
  if frontend in ('qwen-local','coder-local'):command+=['--frontend','qwen']
  command+=models
  if frontend in CODER_FRONTENDS:command+=['--agents',str(result['agents'])]
@@ -286,7 +286,7 @@ def main():
     if r['backend']!='llama.cpp':
      print('  Optional benchmark/validation ONLY (not integrated with frontend; review prerequisites): '+shlex.join(r['validation_argv']))
  if action=='2':return 0
- error=None; result=None; command=None
+ error=None; result=None; command=None; launch_env={}
  try:
   indices=workers.parse_gpu_indices(a.gpus) if a.gpus else ((a.gpu,) if a.gpu is not None else None)
   result,launch_models=joint_preview(models,a.frontend,a.agents,inv,a.context,cap,indices,a.placement_config)
@@ -294,8 +294,11 @@ def main():
   if a.frontend in CODER_FRONTENDS:
    # Keep the same config source for the launcher's own validation.
    command[1:1]=['--placement-config',a.placement_config]
+  else:
+   launch_env['PUSHBUTTON_SELECTOR_GPU_INDICES']=','.join(
+    str(g['index']) for server in result['servers'] for g in server['gpus'])
  except ValueError as exc:error=str(exc)
- obj={'models':models,'frontend':a.frontend,'context':a.context,'client_context':client_context,'ram_limit_mib':ram_cap,'host_ram_fit':'unknown; no proven minimum','vram_limit_mib_per_gpu':cap,'inventory':[asdict(g) for g in inv],'rows':tables,'plan':result,'launch_argv':command,'error':error}
+ obj={'models':models,'frontend':a.frontend,'context':a.context,'client_context':client_context,'ram_limit_mib':ram_cap,'host_ram_fit':'unknown; no proven minimum','vram_limit_mib_per_gpu':cap,'inventory':[asdict(g) for g in inv],'rows':tables,'plan':result,'launch_argv':command,'launch_env':launch_env,'error':error}
  if a.json:print(json.dumps(obj,indent=2))
  elif error:print(f'\nCannot launch: {error}',file=sys.stderr)
  else:
@@ -303,15 +306,17 @@ def main():
   for w in result.get('workers',result.get('servers',[])):
    print(f"  {w['model']} {w['profile']['quant']}: GPUs {w['cuda_visible_devices']}, envelope {fmt_mib(w['required_mib'])}, free lease capacity {fmt_mib(w['allocated_mib'])}, per-GPU lease {fmt_mib(w.get('vram_limit_mib_per_gpu'))}")
   if 'roles' in result:print('  Shared roles: '+json.dumps(result['roles']))
+  if launch_env:print('  Launch GPU pool: '+launch_env['PUSHBUTTON_SELECTOR_GPU_INDICES']+' (role planner rechecks this pool only)')
   print('  Spare GPUs: '+str([g['index'] for g in result['unused_gpus']]))
   print(f'  Physical context: {a.context}; client context: {client_context}')
   print('  Host RAM minimum unknown; RAM ceiling is advisory, not enforcement.')
   print('  Resident endpoints are not automatically reused. Launchers choose free ports and recheck placement.')
-  print('\nRecommended launch:\n  '+shlex.join(command))
+  printable=['env',*(f'{key}={value}' for key,value in launch_env.items()),*command] if launch_env else command
+  print('\nRecommended launch:\n  '+shlex.join(printable))
  if error:return 2
  if interactive and action!='3':
   answer=input('\nDownload/build/launch this baseline plan? [y/N]: ').strip().lower()
-  if answer in ('y','yes'):return subprocess.call(command)
+  if answer in ('y','yes'):return subprocess.call(command,env={**os.environ,**launch_env})
   print('Cancelled; no provisioning attempted.')
  return 0
 

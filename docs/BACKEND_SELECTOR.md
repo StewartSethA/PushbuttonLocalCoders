@@ -38,7 +38,7 @@ pushbutton-select --frontend hermes-local qwen3.8:27b qwen3.6:35b --print-only
 
 `--plan-only` / `--print-only`, `--json`, and `--no-interactive` never launch.
 JSON includes inventory, tables, the complete joint plan, `launch_argv` (an argv
-array), and a planning error if unavailable. With no models it returns structured
+array), `launch_env` (the Claude/Hermes preview GPU pool), and a planning error if unavailable. With no models it returns structured
 guidance instead of choosing a default. `--gpu` / `--gpus` constrain coder workers;
 for multiple workers prefer separate per-model pins. Leases are capped by free,
 not total, VRAM. Claude/Hermes use their existing role planner (up to four
@@ -53,6 +53,8 @@ The default client context is `min(200000, physical context)`; an explicitly
 larger client context is rejected. Interactive launch requires explicit `y`/`yes`
 confirmation before downloading/building/launching. Commands execute as argv
 lists, never `eval`. The launcher rechecks placement against live availability.
+Claude/Hermes replan within the previewed GPU pool; they cannot silently choose
+an unsupported or spare GPU excluded from that pool.
 
 The table reports baseline `FIT` / `BLOCK` (planning only), or `UNKNOWN` /
 `UNAVAILABLE` for experimental eligibility; legacy specialized rows may show

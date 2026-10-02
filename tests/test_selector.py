@@ -147,6 +147,38 @@ class SelectorTests(unittest.TestCase):
                 self.assertEqual(len(obj['plan']['servers']), 1)
                 self.assertIn('roles', obj['plan'])
                 self.assertNotIn('--agents', obj['launch_argv'])
+                self.assertEqual(obj['launch_env']['PUSHBUTTON_SELECTOR_GPU_INDICES'], '0')
+                if frontend == 'claude-local':
+                    self.assertEqual(obj['launch_argv'][:2], ['bash', str(ROOT / 'lib/claude_local_entry.sh')])
+
+    def test_role_launch_rechecks_only_preview_gpu_pool(self):
+        gpus = selector.workers.synthetic_3090(1) + [
+            selector.plan.GPU(1, 'Unsupported GPU', 65536, 65536, '6.1')]
+        for frontend in ('claude-local', 'hermes-local'):
+            with self.subTest(frontend=frontend):
+                code, _, _, launch, _ = self.run_sel(
+                    'qwen3.8:27b', '--frontend', frontend, tty=True,
+                    inputs=['yes'], gpus=gpus)
+                self.assertEqual(code, 0)
+                self.assertEqual(launch.call_args.kwargs['env']['PUSHBUTTON_SELECTOR_GPU_INDICES'], '0')
+        out = io.StringIO()
+        with mock.patch.object(sys, 'argv', ['planner', 'plan', 'qwen3.8:27b']), \
+             mock.patch.object(selector.plan, 'inventory', return_value=gpus), \
+             mock.patch.dict(os.environ, {'PUSHBUTTON_SELECTOR_GPU_INDICES': '0'}), \
+             contextlib.redirect_stdout(out):
+            self.assertEqual(selector.plan.main(), 0)
+        self.assertEqual(json.loads(out.getvalue())['servers'][0]['cuda_visible_devices'], '0')
+
+    def test_role_replan_rejects_missing_or_invalid_preview_pool(self):
+        for pool in ('99', '', 'invalid'):
+            with self.subTest(pool=pool):
+                err = io.StringIO()
+                with mock.patch.object(sys, 'argv', ['planner', 'plan', 'qwen3.8:27b']), \
+                     mock.patch.object(selector.plan, 'inventory', return_value=selector.workers.synthetic_3090(1)), \
+                     mock.patch.dict(os.environ, {'PUSHBUTTON_SELECTOR_GPU_INDICES': pool}), \
+                     contextlib.redirect_stderr(err):
+                    self.assertEqual(selector.plan.main(), 2)
+                self.assertIn('selector GPU pool', err.getvalue())
 
     def test_insufficient_vram_overlap_and_no_gpu_do_not_launch(self):
         cases = [
