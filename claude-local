@@ -522,6 +522,10 @@ while (($#)); do
     esac
 done
 
+if ! have_cmd python3; then
+    [[ $DRY_RUN -eq 0 ]] || die "python3 required for dry run"
+    install_base_deps
+fi
 python3 "$BUDGET_PY" --requested "$CTX" --client "$CLIENT_CTX" -- "${CLAUDE_ARGS[@]}" || exit $?
 if [[ $DRY_RUN -eq 0 ]]; then install_base_deps; ensure_nvidia_driver; else have_cmd nvidia-smi || die "nvidia-smi required for dry run"; fi
 mkdir -p "$STATE_DIR" "$CACHE_DIR"; PLAN_FILE="$STATE_DIR/plan.$$.json"

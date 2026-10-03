@@ -245,6 +245,22 @@ class ContextPolicyTests(unittest.TestCase):
             self.assertIn("Context policy error", result.stderr)
             self.assertNotIn("Installing", result.stdout)
 
+    def test_missing_python_bootstraps_before_policy_without_gpu(self):
+        launcher = (ROOT / "claude-local").read_text()
+        functions = launcher.split("\nrequire_files\n", 1)[0]
+        startup = launcher[launcher.index("\nif ! have_cmd python3; then"):launcher.index('\nmkdir -p "$STATE_DIR" "$CACHE_DIR"; PLAN_FILE=')]
+        with tempfile.TemporaryDirectory() as tmp:
+            script = pathlib.Path(tmp) / "bootstrap.sh"
+            script.write_text(functions + """
+have_cmd() { [[ "$1" != python3 ]]; }
+install_base_deps() { printf 'deps\\n'; }
+python3() { printf 'policy\\n'; }
+ensure_nvidia_driver() { printf 'driver\\n'; }
+""" + startup)
+            result = subprocess.run(["bash", str(script)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.splitlines(), ["deps", "policy", "deps", "driver"])
+
 
 class GatewayBudgetHTTPTests(unittest.TestCase):
     def setUp(self):
