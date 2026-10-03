@@ -51,6 +51,7 @@ download_model_with_aria2c() (
         --max-concurrent-downloads=4 --max-connection-per-server=3 --split=3 \
         --min-split-size=5M --allow-overwrite=true --auto-file-renaming=false \
         --file-allocation=prealloc --continue=true --summary-interval=1 \
+        --check-integrity=true \
         --max-tries=5 --retry-wait=10 --connect-timeout=30 --timeout=60 \
         --console-log-level=warn >&2 || return
     python3 "$PUSHBUTTON_DOWNLOAD_PY" verify "$work/manifest.json" || return
@@ -69,8 +70,15 @@ download_model_with_hf_cli() (
         trap 'rm -rf -- "$work"' EXIT
         _pushbutton_prepare_download "$hf_spec" "$cache_dir" "$work" || return
     fi
+    python3 "$PUSHBUTTON_DOWNLOAD_PY" pending "$work/manifest.json" "$work/files" || return
     local cli dir repo revision file venv
-    if command -v hf >/dev/null 2>&1; then
+    if [[ ! -s "$work/files" ]]; then
+        python3 "$PUSHBUTTON_DOWNLOAD_PY" verify "$work/manifest.json" || return
+        if [[ $own_work == 1 ]]; then
+            python3 "$PUSHBUTTON_DOWNLOAD_PY" field "$work/manifest.json" model_path
+        fi
+        return 0
+    elif command -v hf >/dev/null 2>&1; then
         cli="$(command -v hf)"
     else
         venv="${STATE_DIR:-${CLAUDE_LOCAL_STATE:-$HOME/.local/share/pushbutton/claude-local}}/download-venv"

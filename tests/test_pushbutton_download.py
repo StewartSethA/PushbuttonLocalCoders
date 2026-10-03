@@ -91,6 +91,37 @@ class MetadataTests(unittest.TestCase):
                 download.reuse_blobs(directory, [{"name": "model.gguf", "size": 16, "sha256": digest}])
             self.assertEqual(blob.stat().st_ino, (directory / "model.gguf").stat().st_ino)
 
+    def test_checksum_and_private_url_file(self):
+        metadata = {"sha": REVISION, "siblings": [
+            {"rfilename": "Q4_K.gguf", "size": 16, "lfs": {"sha256": "b" * 64}}]}
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(download.urllib.request, "urlopen",
+                                  return_value=io.BytesIO(json.dumps(metadata).encode())), \
+                contextlib.redirect_stderr(io.StringIO()):
+            download.prepare("owner/repo:Q4_K", tmp, tmp)
+            urls = pathlib.Path(tmp) / "urls"
+            self.assertIn("checksum=sha-256=" + "b" * 64, urls.read_text())
+            self.assertEqual(urls.stat().st_mode & 0o777, 0o600)
+
+    def test_custom_and_xdg_token_paths(self):
+        for custom in (True, False):
+            with self.subTest(custom=custom), tempfile.TemporaryDirectory() as tmp:
+                token = pathlib.Path(tmp) / "huggingface" / "token"
+                token.parent.mkdir()
+                token.write_text("example-auth-value")
+                env = {"XDG_CACHE_HOME": tmp}
+                if custom:
+                    env["HF_TOKEN_PATH"] = "$XDG_CACHE_HOME/huggingface/token"
+                with mock.patch.dict(os.environ, env, clear=True), \
+                        mock.patch.object(download.urllib.request, "urlopen",
+                                          return_value=io.BytesIO(json.dumps(METADATA).encode())) as api, \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    download.prepare("owner/repo:UD-Q4_K_XL", tmp, tmp)
+                self.assertEqual(api.call_args.args[0].get_header("Authorization"),
+                                 "Bearer " + "example-auth-value")
+                self.assertIn("header=Authorization: " + "Bearer " + "example-auth-value",
+                              (pathlib.Path(tmp) / "urls").read_text())
+
     def test_symlink_escape_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = pathlib.Path(tmp) / "cache"
@@ -132,6 +163,7 @@ for f in manifest['files']:
     path=pathlib.Path(manifest['directory'])/f['name']
     path.write_bytes(b'x'*f['size'])
     pathlib.Path(str(path)+'.aria2').unlink(missing_ok=True)
+    if os.environ.get('TEST_ARIA_PARTIAL_FAILURE'): sys.exit(1)
 print('[parallel chunks] 45% ETA: 3m42s',file=sys.stderr)
 """)
         self.executable("hf", f"""#!{sys.executable}
@@ -182,6 +214,14 @@ print('huggingface_hub: 100%',file=sys.stderr)
         self.assertIn("Parallel download failed", proc.stderr)
         self.assertEqual(self.calls.read_text().count("hf "), 2)
         self.assertIn("100%", proc.stderr)
+
+    def test_fallback_skips_completed_shards(self):
+        self.env["TEST_ARIA_PARTIAL_FAILURE"] = "1"
+        proc = self.fast()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        hf_calls = [line for line in self.calls.read_text().splitlines() if line.startswith("hf ")]
+        self.assertEqual(len(hf_calls), 1)
+        self.assertIn("00002-of-00002.gguf", hf_calls[0])
 
     def test_no_parallel_and_unavailable_fallback(self):
         proc = self.fast("PUSHBUTTON_NO_PARALLEL=1; ")

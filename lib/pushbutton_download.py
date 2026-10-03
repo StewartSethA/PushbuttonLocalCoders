@@ -115,8 +115,10 @@ def prepare(spec, cache, work):
         raise ValueError("Model folder must not contain control characters")
     token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
     if not token:
-        token_file = pathlib.Path(os.environ.get("HF_TOKEN_PATH", str(
-            pathlib.Path(os.environ.get("HF_HOME", "~/.cache/huggingface")).expanduser() / "token")))
+        hf_home = os.environ.get("HF_HOME", str(
+            pathlib.Path(os.environ.get("XDG_CACHE_HOME", "~/.cache")) / "huggingface"))
+        token_file = pathlib.Path(os.path.expandvars(os.environ.get(
+            "HF_TOKEN_PATH", str(pathlib.Path(hf_home) / "token")))).expanduser()
         if token_file.is_file():
             token = token_file.read_text().strip()
     if token and any(ord(c) < 32 for c in token):
@@ -141,6 +143,7 @@ def prepare(spec, cache, work):
     work = pathlib.Path(work)
     (work / "manifest.json").write_text(json.dumps(manifest))
     with (work / "urls").open("w") as urls, (work / "files").open("w") as names:
+        (work / "urls").chmod(0o600)
         for item in pending:
             name = item["name"]
             target = directory / name
@@ -149,6 +152,9 @@ def prepare(spec, cache, work):
                 print(f"[pushbutton] Resuming {display_name(name)} (partial download found)", file=sys.stderr)
             urls.write(f"https://huggingface.co/{repo}/resolve/{revision}/{urllib.parse.quote(name)}\n")
             urls.write(f"  dir={target.parent}\n  out={target.name}\n")
+            digest = item.get("sha256")
+            if isinstance(digest, str) and re.fullmatch(r"[a-fA-F0-9]{64}", digest):
+                urls.write(f"  checksum=sha-256={digest}\n")
             if token:
                 urls.write("  header=Authorization: " + "Bearer " + token + "\n")
             names.write(name + "\n")
@@ -188,6 +194,11 @@ def main():
         verify(manifest)
     elif action == "space":
         validate_space(manifest)
+    elif action == "pending":
+        directory = pathlib.Path(manifest["directory"])
+        pathlib.Path(args[1]).write_text("".join(
+            item["name"] + "\n" for item in manifest["files"]
+            if not complete(directory / item["name"], item["size"])))
     elif action == "log":
         log_download(manifest, int(args[1]), args[2])
     else:

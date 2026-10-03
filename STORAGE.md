@@ -18,6 +18,7 @@ function is loaded, its policy is checked too.
 
 aria2c downloads up to four files concurrently, using up to three connections
 per file, preallocation, per-chunk retries, and live percentage/speed/ETA output.
+Hugging Face LFS SHA-256 checksums, when available, are checked by aria2c.
 Partial files and their `.aria2` control files stay in the model folder after a
 failure or interruption. **Keep both files and re-run the same launcher** to
 resume; a partial-download message identifies them. New upstream revisions use a
@@ -28,7 +29,8 @@ with live progress, one file at a time. Its private environment, when needed, is
 stored under `$CLAUDE_LOCAL_STATE/download-venv` (default:
 `~/.local/share/pushbutton/claude-local/download-venv`). Hugging Face authentication
 uses `HF_TOKEN` or the saved Hugging Face token. The fallback uses its own resume
-metadata and may restart an aria2 partial file; space is checked again to allow
+metadata and may restart an aria2 partial file, but skips completed shards;
+space is checked again to allow
 for temporary copies. `--no-parallel` disables aria2c and automatic installation.
 
 Successful downloads append JSON records to `$CACHE_DIR/.download-log`, including
