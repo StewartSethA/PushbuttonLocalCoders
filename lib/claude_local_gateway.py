@@ -14,12 +14,18 @@ connection cleanly so Claude Code can apply its own request-level retry policy.
 from __future__ import annotations
 
 import argparse
+from collections import OrderedDict
+import hashlib
 import http.client
 import json
 import signal
 import sys
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
+
+from claude_local_budget import BudgetError, input_tokens, positive_integer, request_budget_error
 
 HOP_HEADERS = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -39,7 +45,11 @@ class Router:
     def __init__(self, config: dict):
         self.roles: dict[str, dict] = config["roles"]
         self.alias_map: dict[str, dict] = {}
+        self.token_counts: OrderedDict[tuple, tuple[float, int]] = OrderedDict()
+        self.count_lock = threading.Lock()
         for role, route in self.roles.items():
+            positive_integer(route.get("context_capacity"), "route context_capacity")
+            positive_integer(route.get("prompt_reserve"), "route prompt_reserve")
             self.alias_map[route["model_id"].lower()] = route
             self.alias_map[role] = route
 
@@ -54,6 +64,27 @@ class Router:
         # family. Keep those local and predictable by routing to the daily
         # driver rather than ever falling through to a cloud API.
         return self.roles["sonnet"]
+
+    def count_key(self, route: dict, raw: bytes) -> tuple:
+        # Retain only digests/counts, never prompts. Exact-payload reuse also
+        # avoids rendering/tokenizing again when Claude just counted a request.
+        return route["url"], hashlib.sha256(raw).digest()
+
+    def cached_count(self, key: tuple) -> int | None:
+        with self.count_lock:
+            entry = self.token_counts.get(key)
+            if entry and time.monotonic() - entry[0] < 30:
+                self.token_counts.move_to_end(key)
+                return entry[1]
+            self.token_counts.pop(key, None)
+        return None
+
+    def remember_count(self, key: tuple, count: int):
+        with self.count_lock:
+            self.token_counts[key] = (time.monotonic(), count)
+            self.token_counts.move_to_end(key)
+            while len(self.token_counts) > 128:
+                self.token_counts.popitem(last=False)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -125,12 +156,45 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             return self._json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": f"bad JSON: {exc}"}})
 
+        if not isinstance(body, dict):
+            return self._json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": "request must be a JSON object"}})
         route = self.router.resolve(str(body.get("model", "")))
         body["model"] = route["backend_alias"]
         raw = json.dumps(body, separators=(",", ":")).encode()
         headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP_HEADERS}
         headers["content-type"] = "application/json"
         headers["content-length"] = str(len(raw))
+
+        if path == "/v1/messages":
+            try:
+                positive_integer(body.get("max_tokens"), "max_tokens")
+            except BudgetError as exc:
+                return self._json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": str(exc)}})
+        # Native llama.cpp count_tokens performs the same Anthropic conversion,
+        # tool/system rendering and template tokenization as inference. Never
+        # approximate with text-only /tokenize.
+        count_key = self.router.count_key(route, raw)
+        prompt_tokens = self.router.cached_count(count_key)
+        if prompt_tokens is None:
+            conn = self._backend_connection(route)
+            try:
+                conn.request("POST", "/v1/messages/count_tokens", body=raw, headers=headers)
+                resp = conn.getresponse()
+                result = json.loads(resp.read())
+                if resp.status != 200:
+                    # Includes 400: not a transient inference/network failure.
+                    return self._json(resp.status, result)
+                prompt_tokens = input_tokens(result)
+                self.router.remember_count(count_key, prompt_tokens)
+            except Exception:
+                return self._json(503, {"type": "error", "error": {"type": "api_error", "message": "Local tokenizer preflight unavailable; inference was not attempted. Check the backend /v1/messages/count_tokens endpoint."}})
+            finally:
+                conn.close()
+        if path == "/v1/messages/count_tokens":
+            return self._json(200, {"input_tokens": prompt_tokens})
+        error = request_budget_error(body, prompt_tokens, route)
+        if error:
+            return self._json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": error}})
 
         # One transparent retry is useful for an immediately reset local
         # connection or transient 5xx. We only retry before response headers /
@@ -169,12 +233,17 @@ class Handler(BaseHTTPRequestHandler):
                 if first:
                     self.wfile.write(first)
                     self.wfile.flush()
+                sent = len(first)
                 while True:
                     chunk = resp.read1(65536)
                     if not chunk:
                         break
                     self.wfile.write(chunk)
                     self.wfile.flush()
+                    sent += len(chunk)
+                if content_length and sent < int(content_length):
+                    self.log_message("backend closed before advertised response length; closing without replay")
+                    self.close_connection = True
                 return
             except (BrokenPipeError, ConnectionResetError) as exc:
                 last_exc = exc
