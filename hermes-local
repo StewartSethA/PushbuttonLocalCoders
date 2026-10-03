@@ -7,6 +7,7 @@ command -v readlink >/dev/null 2>&1 && SELF="$(readlink -f "$SELF" 2>/dev/null |
 ROOT="$(cd "$(dirname "$SELF")" && pwd)"
 PLAN_PY="$ROOT/lib/claude_local_plan.py"
 HOSTCC_SH="$ROOT/lib/claude_local_hostcc.sh"
+source "$ROOT/lib/pushbutton_folders.sh"
 
 STATE_DIR="${CLAUDE_LOCAL_STATE:-$HOME/.local/share/pushbutton/claude-local}"
 CACHE_DIR="${CLAUDE_LOCAL_CACHE:-$HOME/.cache/pushbutton/llama}"
@@ -20,6 +21,8 @@ WEB_EXTRACT_BACKEND="${HERMES_LOCAL_WEB_EXTRACT_BACKEND:-firecrawl}"
 UI=desktop
 RESUME=0
 KEEP_SERVERS=0
+QUIET=0
+FOLDERS_ONLY=0
 MODELS=()
 PIDS=()
 STARTUP_LOCK_FD=""
@@ -52,6 +55,8 @@ Hermes frontends:
 
 Harness options:
   --local-cache DIR
+  --folders, --system-info   Show storage paths and disk usage, then exit
+  --quiet                   Suppress the startup folder banner
   --local-context N
   --local-client-context N
   --local-port-base N
@@ -319,6 +324,8 @@ start_backends() {
             for pair in "${pairs[@]}"; do envcmd+=("$pair"); done
         fi
         say "Starting $id on GPU(s) [$gpus], $hf, ctx=$CTX${note:+ — $note}"
+        printf '[hermes-local] Follow %s logs in another terminal:\n  tail -n 50 -F -- %q\n' "$id" "$log" >&2
+        validate_download_space "$CACHE_DIR" "$hf" "${hf##*:}" || exit 2
         "${envcmd[@]}" "${cmd[@]}" > >(tee -a "$log" >&2) 2>&1 & pid=$!; PIDS+=("$pid")
         while ! curl -fsS "http://127.0.0.1:$port/health" >/dev/null 2>&1; do
             kill -0 "$pid" 2>/dev/null || { failed=1; break; }
@@ -450,7 +457,9 @@ while (($#)); do
         --tui) UI=tui; shift ;;
         --cli) UI=cli; shift ;;
         --resume) RESUME=1; shift ;;
-        --local-cache) [[ $# -ge 2 ]] || die "--local-cache needs a directory"; CACHE_DIR="$2"; shift 2 ;;
+        --local-cache) [[ $# -ge 2 ]] || die "--local-cache needs a directory"; export CLAUDE_LOCAL_CACHE="$2"; shift 2 ;;
+        --folders|--system-info) FOLDERS_ONLY=1; shift ;;
+        --quiet) QUIET=1; shift ;;
         --local-context) [[ $# -ge 2 ]] || die "--local-context needs a value"; CTX="$2"; shift 2 ;;
         --local-client-context) [[ $# -ge 2 ]] || die "--local-client-context needs a value"; CLIENT_CTX="$2"; shift 2 ;;
         --local-port-base) [[ $# -ge 2 ]] || die "--local-port-base needs a value"; PORT_BASE="$2"; shift 2 ;;
@@ -463,6 +472,16 @@ while (($#)); do
     esac
 done
 
+if ((FOLDERS_ONLY)); then
+    load_folder_config
+    check_folders_exist
+    print_folder_summary 1
+    printf '  Hermes profiles: %s/.hermes/profiles\n' "$HOME"
+    exit 0
+fi
+initialize_folders "$QUIET"
+((QUIET)) || say "Hermes profiles and sessions: $HOME/.hermes (managed by Hermes)"
+LOCK_FILE="${CLAUDE_LOCAL_LOCK_FILE:-$STATE_DIR/startup.lock}"
 [[ "$CTX" =~ ^[0-9]+$ && "$CLIENT_CTX" =~ ^[0-9]+$ ]] || die "context values must be integers"
 (( CLIENT_CTX <= CTX )) || die "client context ($CLIENT_CTX) exceeds physical context ($CTX)"
 ((${#MODELS[@]} <= 4)) || die "at most four model selectors may be supplied"
@@ -477,6 +496,7 @@ plan_args=(plan --context "$CTX")
 if ((${#MODELS[@]})); then plan_args+=("${MODELS[@]}"); else plan_args+=(--smart); fi
 python3 "$PLAN_PY" "${plan_args[@]}" > "$PLAN_FILE"
 print_plan
+validate_plan_download_space "$PLAN_FILE" "$CACHE_DIR" || exit 2
 prepare_host_compiler
 activate_cuda
 ensure_llamacpp

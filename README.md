@@ -33,6 +33,53 @@ curl -fL https://raw.githubusercontent.com/StewartSethA/PushbuttonLocalCoders/ma
 
 ---
 
+## Data Storage
+
+| Environment variable | Default | Contents |
+| --- | --- | --- |
+| `PUSHBUTTON_DIR` | `~/.local/share/pushbutton` | Repository in `PushbuttonLocalCoders/` |
+| `CLAUDE_LOCAL_STATE` | `~/.local/share/pushbutton/claude-local` | Logs, CUDA, llama.cpp builds, templates, Qwen state |
+| `CLAUDE_LOCAL_CACHE` | `~/.cache/pushbutton/llama` | Model weights (space critical) |
+| `PUSHBUTTON_CONFIG_DIR` | `~/.config/pushbutton-local` | `folders.json`, placement configuration |
+
+Installers and first startup offer folder customization in a terminal. Piped
+installs use defaults without prompting and still save `folders.json`. Environment
+overrides take precedence over saved paths; `--local-cache DIR` takes highest cache
+precedence. Startup choices are saved for later sessions. State, cache, and config
+paths must not overlap.
+
+```bash
+claude-local --folders    # paths, used space, free space
+qwen-local --system-info  # same report; no GPU or model download required
+hermes-local --folders
+```
+
+Normal startup prints storage paths (`--quiet` suppresses that banner) and each
+backend prints a safely quoted `tail -n 50 -F -- ...` log-follow command.
+Before model downloads, exact Hugging Face file metadata is checked against
+remaining disk space plus a 10 GiB reserve. Unknown sizes or insufficient space
+stop startup with status 2 rather than retrying a doomed download. VRAM planning
+is separate from this disk-space check.
+
+For a two-GPU setup with a separate model disk:
+
+```bash
+export CLAUDE_LOCAL_CACHE=/mnt/nvme/pushbutton-models
+qwen-local 'qwen3.8:27b@gpu=0,vram=16G' 'qwen3.6:35b@gpu=1,vram=16G' --agents 2
+```
+
+For multiple users, each can set `CLAUDE_LOCAL_CACHE=/srv/models/pushbutton`
+while keeping private state/config directories. Use a trusted group-writable
+cache and serialize downloads; different users' startup locks do not coordinate.
+Do not make state or config world-writable.
+
+To move data, stop all backends, copy the entire cache (including blobs and
+symlinks) to the new disk, set `CLAUDE_LOCAL_CACHE` or edit `folders.json`, and
+verify with `--folders` before removing the old copy. See [STORAGE.md](STORAGE.md)
+for the schema, migration steps, and troubleshooting. Third-party frontend
+installations may retain their own data: Claude Code in `~/.claude` and Hermes
+profiles/sessions in `~/.hermes`.
+
 ## Frontends: change the command, keep the model idea
 
 ### Claude Code

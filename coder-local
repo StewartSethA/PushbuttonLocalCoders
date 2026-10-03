@@ -6,17 +6,21 @@ command -v readlink >/dev/null 2>&1 && SELF="$(readlink -f "$SELF" 2>/dev/null |
 ROOT="$(cd "$(dirname "$SELF")" && pwd)"
 PLAN_PY="$ROOT/lib/coder_local_plan.py"
 HOSTCC_SH="$ROOT/lib/claude_local_hostcc.sh"
+source "$ROOT/lib/pushbutton_folders.sh"
 STATE_DIR="${CLAUDE_LOCAL_STATE:-$HOME/.local/share/pushbutton/claude-local}"
 CACHE_DIR="${CLAUDE_LOCAL_CACHE:-$HOME/.cache/pushbutton/llama}"
 LOCK_FILE="${CLAUDE_LOCAL_LOCK_FILE:-$STATE_DIR/startup.lock}"
 CTX="${CLAUDE_LOCAL_CONTEXT:-262144}"
 CLIENT_CTX="${CLAUDE_LOCAL_CLIENT_CONTEXT:-200000}"
 PORT_BASE="${CODER_LOCAL_PORT_BASE:-20180}"
-PLACEMENT_CONFIG="${PUSHBUTTON_PLACEMENT_CONFIG:-$HOME/.config/pushbutton-local/placement.json}"
+PLACEMENT_CONFIG="${PUSHBUTTON_PLACEMENT_CONFIG:-}"
+PLACEMENT_CONFIG_EXPLICIT=0
 FRONTEND="${CODER_LOCAL_FRONTEND:-}"
 AGENTS=""
 RESUME=0
 PLAN_ONLY=0
+QUIET=0
+FOLDERS_ONLY=0
 MODELS=()
 FRONTEND_ARGS=()
 PIDS=()
@@ -67,6 +71,8 @@ Options:
   --local-context N
   --local-client-context N
   --local-cache DIR
+  --folders, --system-info       show storage paths and disk usage, then exit
+  --quiet                       suppress the startup folder banner
   --local-port-base N
   --self-test
   -h, --help
@@ -223,6 +229,8 @@ start_backends(){
    local -a envcmd=(env "CUDA_VISIBLE_DEVICES=$gpus" "LLAMA_CACHE=$CACHE_DIR" "GGML_CUDA_ENABLE_UNIFIED_MEMORY=0")
    if [[ -n "$envpairs" ]]; then local -a pairs; IFS=';' read -ra pairs<<<"$envpairs"; local pair; for pair in "${pairs[@]}";do envcmd+=("$pair");done;fi
    say "Starting agent $worker: $hf on GPU(s) [$gpus]${vramcap:+ with ${vramcap} MiB/GPU lease}${note:+ — $note}"
+   printf '[coder-local] Follow agent %s logs in another terminal:\n  tail -n 50 -F -- %q\n' "$worker" "$log" >&2
+   validate_download_space "$CACHE_DIR" "$hf" "${hf##*:}" || exit 2
    "${envcmd[@]}" "${cmd[@]}" > >(tee -a "$log" >&2) 2>&1 & pid=$!; PIDS+=("$pid")
    until curl -fsS "http://127.0.0.1:$port/health" >/dev/null 2>&1; do
      kill -0 "$pid" 2>/dev/null || { failed=1;break;}; sleep 1; waited=$((waited+1)); ((waited%30==0))&&say "Still loading agent $worker (${waited}s)..."
@@ -293,16 +301,27 @@ while (($#));do
   --frontend) [[ $# -ge 2 ]]||die "--frontend needs a value";FRONTEND="$2";shift 2;;
   --agents) [[ $# -ge 2 ]]||die "--agents needs a value";AGENTS="$2";shift 2;;
   --resume) RESUME=1;shift;;
-  --placement-config) [[ $# -ge 2 ]]||die "--placement-config needs a file";PLACEMENT_CONFIG="$2";shift 2;;
+  --placement-config) [[ $# -ge 2 ]]||die "--placement-config needs a file";PLACEMENT_CONFIG="$2";PLACEMENT_CONFIG_EXPLICIT=1;shift 2;;
   --plan-only) PLAN_ONLY=1;shift;;
   --local-context) CTX="$2";shift 2;; --local-client-context) CLIENT_CTX="$2";shift 2;;
-  --local-cache) CACHE_DIR="$2";shift 2;; --local-port-base) PORT_BASE="$2";shift 2;;
+  --local-cache) [[ $# -ge 2 ]]||die "--local-cache needs a directory";export CLAUDE_LOCAL_CACHE="$2";shift 2;; --local-port-base) PORT_BASE="$2";shift 2;;
+  --folders|--system-info) FOLDERS_ONLY=1;shift;;
+  --quiet) QUIET=1;shift;;
   --self-test) self_test;exit 0;;
   --) shift;FRONTEND_ARGS+=("$@");break;;
   -*) die "unknown coder-local option '$1'; put frontend-specific args after --";;
   *) MODELS+=("$1");shift;;
  esac
 done
+if ((FOLDERS_ONLY)); then
+  load_folder_config
+  check_folders_exist
+  print_folder_summary 1
+  exit 0
+fi
+initialize_folders "$QUIET"
+LOCK_FILE="${CLAUDE_LOCAL_LOCK_FILE:-$STATE_DIR/startup.lock}"
+[[ -n "$PLACEMENT_CONFIG" || $PLACEMENT_CONFIG_EXPLICIT == 1 ]] || PLACEMENT_CONFIG="$CONFIG_DIR/placement.json"
 [[ "$FRONTEND" == qwen ]] || die "frontend '$FRONTEND' is not installed in this revision"
 ((${#MODELS[@]}>=1))||die "supply at least one model"
 [[ -z "$AGENTS" ]]||[[ "$AGENTS" =~ ^[1-8]$ ]]||die "--agents must be 1..8"
@@ -318,6 +337,7 @@ if ((PLAN_ONLY)); then
   flock -u "$STARTUP_LOCK_FD"; eval "exec ${STARTUP_LOCK_FD}>&-"; STARTUP_LOCK_FD=""
   exit 0
 fi
+validate_plan_download_space "$PLAN_FILE" "$CACHE_DIR" || exit 2
 source "$HOSTCC_SH"; claude_local_prepare_hostcc; activate_cuda; ensure_llamacpp; grep -q '"template": "qwen-fixed"' "$PLAN_FILE" && fetch_qwen_template || true; start_backends
 flock -u "$STARTUP_LOCK_FD"; eval "exec ${STARTUP_LOCK_FD}>&-"; STARTUP_LOCK_FD=""
 launch_qwen

@@ -9,6 +9,10 @@ SYSTEM=0
 SELECT=0
 [[ "${1:-}" == --select ]] && { SELECT=1; shift; }
 command -v git >/dev/null || { echo "git is required" >&2; exit 1; }
+command -v python3 >/dev/null || { echo "python3 is required for folder configuration" >&2; exit 1; }
+ROOT="$(python3 -c 'import os,sys; print(os.path.realpath(os.path.expanduser(sys.argv[1])))' "$ROOT")"
+DEST="$ROOT/PushbuttonLocalCoders"
+printf '[pushbutton] Code will be installed at %s\n' "$DEST"
 mkdir -p "$ROOT"
 if [[ -d "$DEST/.git" ]]; then
   git -C "$DEST" fetch --depth=1 origin "$REF"
@@ -16,11 +20,21 @@ if [[ -d "$DEST/.git" ]]; then
 else
   git clone --depth=1 --branch "$REF" "$REPO_URL" "$DEST"
 fi
+source "$DEST/lib/pushbutton_folders.sh"
+PUSHBUTTON_CODE_DIR="$DEST"
+configure_folders
+printf '[pushbutton] Configuration saved at %s/folders.json\n' "$CONFIG_DIR"
 chmod +x "$DEST/coder-local" "$DEST/opencode-local" "$DEST/deepseek-local" "$DEST/mini-swe-local" "$DEST/pushbutton-backend" "$DEST/pushbutton-bench" "$DEST/pushbutton-select" "$DEST/pushbutton-observe"
 
 install_wrapper(){
   local target="$1" body="$2" tmp="$ROOT/.coder-shim.$$"
-  printf '#!/usr/bin/env bash\nexec %s "$@"\n' "$body" >"$tmp"
+  local config_default
+  config_default="$(printf '%q' "$CONFIG_DIR")"
+  if [[ "$CONFIG_DIR" == "$(python3 -c 'import os; print(os.path.realpath(os.path.expanduser("~/.config/pushbutton-local")))')" ]]; then
+    config_default='"$HOME/.config/pushbutton-local"'
+  fi
+  printf '#!/usr/bin/env bash\nDEFAULT_CONFIG_DIR=%s\nexport PUSHBUTTON_CONFIG_DIR="${PUSHBUTTON_CONFIG_DIR:-$DEFAULT_CONFIG_DIR}"\nexec %s "$@"\n' \
+    "$config_default" "$body" >"$tmp"
   chmod +x "$tmp"
   if [[ "$target" == /usr/local/bin/* ]]; then sudo install -m755 "$tmp" "$target"; else mkdir -p "$(dirname "$target")"; mv "$tmp" "$target"; fi
   rm -f "$tmp" 2>/dev/null || true

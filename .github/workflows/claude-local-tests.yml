@@ -5,6 +5,12 @@ on:
     paths:
       - "claude-local"
       - "install-claude-local.sh"
+      - "coder-local"
+      - "hermes-local"
+      - "install-coder-local.sh"
+      - "lib/pushbutton_folders.sh"
+      - "tests/test_folders.py"
+      - "tests/test_storage_launchers.py"
       - "lib/claude_local_*.py"
       - "lib/claude_local_*.sh"
       - "tests/test_claude_local.py"
@@ -17,6 +23,12 @@ on:
     paths:
       - "claude-local"
       - "install-claude-local.sh"
+      - "coder-local"
+      - "hermes-local"
+      - "install-coder-local.sh"
+      - "lib/pushbutton_folders.sh"
+      - "tests/test_folders.py"
+      - "tests/test_storage_launchers.py"
       - "lib/claude_local_*.py"
       - "lib/claude_local_*.sh"
       - "tests/test_claude_local.py"
@@ -36,7 +48,12 @@ jobs:
         run: bash -n ./claude-local ./install-claude-local.sh ./lib/claude_local_hostcc.sh ./lib/claude_local_entry.sh ./tests/test_backend_row_protocol.sh
       - name: Python syntax
         run: python3 -m py_compile lib/claude_local_plan.py lib/claude_local_gateway.py tests/test_claude_local.py tests/test_claude_local_scheduler.py
+      - name: Storage shell syntax
+        run: |
+          for file in lib/pushbutton_folders.sh lib/claude_local_entry.sh claude-local coder-local hermes-local install-claude-local.sh install-coder-local.sh; do
+            bash -n "$file" || exit
+          done
       - name: Backend row protocol
         run: bash ./tests/test_backend_row_protocol.sh
       - name: Unit tests
-        run: python3 -m unittest -v tests/test_claude_local.py tests/test_claude_local_scheduler.py
+        run: python3 -m unittest -v tests/test_claude_local.py tests/test_claude_local_scheduler.py tests/test_folders.py tests/test_storage_launchers.py
