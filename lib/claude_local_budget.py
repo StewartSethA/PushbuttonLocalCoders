@@ -11,7 +11,7 @@ import re
 import shutil
 import subprocess
 import sys
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener
 
 MIN_COMPACT_WINDOW = 100000
 MAX_COMPACT_WINDOW = 1000000
@@ -70,7 +70,7 @@ def context_policy(capacity: int, client: str = "", env: dict | None = None) -> 
 def request_json(url: str, body: dict | None = None) -> dict:
     data = None if body is None else json.dumps(body).encode()
     req = Request(url, data=data, headers={"content-type": "application/json"})
-    with urlopen(req, timeout=30) as response:
+    with build_opener(ProxyHandler({})).open(req, timeout=30) as response:
         result = json.load(response)
     if not isinstance(result, dict):
         raise BudgetError("backend returned a non-object response")
@@ -86,6 +86,8 @@ def effective_context(props: dict) -> int:
 
 
 def input_tokens(result: dict) -> int:
+    if not isinstance(result, dict):
+        raise BudgetError("Backend count_tokens returned a non-object response")
     n = result.get("input_tokens")
     if isinstance(n, bool) or not isinstance(n, int) or n < 0:
         raise BudgetError("Backend /v1/messages/count_tokens did not return a non-negative integer input_tokens")
@@ -137,13 +139,23 @@ def frontend_policy_env(args: list[str], env: dict) -> dict:
 
 
 def validate_managed_settings(path: Path = Path("/etc/claude-code/managed-settings.json")) -> None:
-    if not path.exists():
-        return
     try:
-        settings = json.loads(path.read_text())
-        managed_env = settings.get("env", {})
+        files = [path] if path.exists() else []
+        directory = path.with_suffix(".d")
+        if directory.exists():
+            files += sorted(p for p in directory.iterdir() if not p.name.startswith(".") and p.suffix == ".json")
+        settings = {}
+        managed_env = {}
+        for file in files:
+            data = json.loads(file.read_text())
+            if not isinstance(data, dict) or not isinstance(data.get("env", {}), dict):
+                raise BudgetError("invalid managed settings object/env")
+            settings.update(data)
+            managed_env.update(data.get("env", {}))
         if settings.get("autoCompactEnabled") is False:
             raise BudgetError("managed autoCompactEnabled=false disables compaction")
+        if settings.get("policyHelper"):
+            raise BudgetError("dynamic managed policyHelper cannot be verified before launch")
         protected = {"DISABLE_COMPACT", "DISABLE_AUTO_COMPACT", "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE",
                      "CLAUDE_CONFIG_DIR", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_USE_BEDROCK",
                      "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
@@ -232,9 +244,9 @@ def main() -> int:
                   f"client assumed window={p['client_context']}; auto-compaction window={p['compact_window']}; "
                   f"max output={p['max_output_tokens']}; prompt reserve={p['prompt_reserve']}; compaction headroom={p['compact_reserve']}")
             print("[claude-local] Compaction enabled with isolated Claude settings; native tokenizer preflight enforced on every role. Auto-compaction alone is not an overflow guarantee.")
-            print("[claude-local] Installed artifact/help compatibility checked; remotely managed policy cannot be inspected here. A conflicting managed policy must be resolved, not bypassed.")
+            print("[claude-local] Installed artifact/help compatibility checked; local managed policy conflicts are rejected. Cached/remote policy cannot be independently verified; resolve conflicts with your administrator.")
             if any(a.split("=", 1)[0] == "--model" for a in args.claude_args):
-                print("[claude-local] Frontend --model override: explicit compaction window and gateway route budgets remain enforced.")
+                print("[claude-local] Frontend --model override: recognized Claude IDs may ignore the configured custom-model assumed window; explicit compaction window and gateway route budgets remain enforced.")
             if any(a.split("=", 1)[0] in ("--resume", "--continue", "-r", "-c") for a in args.claude_args):
                 print("[claude-local] Resume warning: lowering the window does not compact an already oversized transcript; /compact may also fail. Use a new session with a saved handoff summary.")
     except (BudgetError, OSError, subprocess.SubprocessError) as exc:

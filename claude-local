@@ -50,8 +50,8 @@ Built-ins: nemotron-3.5-lightning qwen3.6:35b qwen3.8:27b glm-5.3-flash
 
 Harness options (put before ordinary Claude Code flags):
   --local-cache DIR          llama.cpp/Hugging Face model cache
-  --local-context N          physical backend context (default 262144)
-  --local-client-context N   assumed client window (derived, at most 200000)
+  --local-context N          requested backend context (default 262144)
+  --local-client-context N   assumed client window (default derived, <=200000)
   --local-port-base N        starting port for gateway/backends
   --local-no-teams           disable experimental Claude agent teams
   --local-keep-servers       leave model servers running after Claude exits
@@ -60,8 +60,8 @@ Harness options (put before ordinary Claude Code flags):
   --local-verbose            verbose local gateway logging
   --                         stop harness parsing; pass rest to Claude Code
 
-All ordinary Claude Code flags, including --resume/--continue/--permission-mode,
-are passed through unchanged.
+Ordinary Claude flags (including --resume/--continue/--permission-mode) pass
+through. Unsafe context, provider, or settings overrides are rejected.
 EOF
 }
 

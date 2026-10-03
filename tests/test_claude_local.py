@@ -175,6 +175,16 @@ class ContextPolicyTests(unittest.TestCase):
                     budgetmod.validate_managed_settings(path)
             path.write_text('{"autoCompactEnabled":true}')
             budgetmod.validate_managed_settings(path)
+            directory = path.with_suffix(".d")
+            directory.mkdir()
+            (directory / "10-disable.json").write_text('{"autoCompactEnabled":false}')
+            with self.assertRaises(budgetmod.BudgetError):
+                budgetmod.validate_managed_settings(path)
+            (directory / "20-enable.json").write_text('{"autoCompactEnabled":true}')
+            budgetmod.validate_managed_settings(path)
+            (directory / "30-provider.json").write_text('{"env":{"ANTHROPIC_BASE_URL":"https://example.invalid"}}')
+            with self.assertRaises(budgetmod.BudgetError):
+                budgetmod.validate_managed_settings(path)
 
     def test_installed_claude_feature_verification(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -242,6 +252,9 @@ class GatewayBudgetHTTPTests(unittest.TestCase):
         self.prompt_tokens = 100
         self.inference_status = 200
         self.count_status = 200
+        self.count_result = None
+        self.count_fail_once = False
+        self.inference_fail_once = False
         self.inference_mode = "json"
         test = self
 
@@ -251,15 +264,30 @@ class GatewayBudgetHTTPTests(unittest.TestCase):
             def log_message(self, *_):
                 pass
 
+            def do_GET(self):
+                raw = json.dumps({"total_slots": 1, "default_generation_settings": {"n_ctx": 131072}}).encode()
+                self.send_response(200)
+                self.send_header("content-length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers["content-length"])))
                 test.requests.append((self.path, body))
                 if self.path.endswith("/count_tokens"):
                     status = test.count_status
+                    if test.count_fail_once:
+                        status = 503
+                        test.count_fail_once = False
                     response = {"input_tokens": test.prompt_tokens} if status == 200 else {
                         "type": "error", "error": {"type": "invalid_request_error", "message": "prompt is too long"}}
+                    if test.count_result is not None:
+                        response = test.count_result
                 else:
                     status = test.inference_status
+                    if test.inference_fail_once:
+                        status = 503
+                        test.inference_fail_once = False
                     response = {"type": "message", "content": []} if status == 200 else {
                         "type": "error", "error": {"type": "invalid_request_error", "message": "request exceeds the available context size"}}
                     if test.inference_mode == "sse":
@@ -367,6 +395,19 @@ class GatewayBudgetHTTPTests(unittest.TestCase):
         self.assertEqual(self.request()[0], 400)
         self.assertEqual(len(self.requests), 1)
 
+    def test_invalid_native_counts_fail_closed(self):
+        for result in ({}, {"input_tokens": -1}, {"input_tokens": "100"}, {"input_tokens": True}):
+            self.count_result = result
+            self.assertEqual(self.request()[0], 503)
+        self.assertFalse(any(p == "/v1/messages" for p, _ in self.requests))
+
+    def test_transient_tokenizer_and_inference_5xx_retry_before_commit(self):
+        self.count_fail_once = True
+        self.inference_fail_once = True
+        self.assertEqual(self.request()[0], 200)
+        self.assertEqual([p for p, _ in self.requests],
+                         ["/v1/messages/count_tokens", "/v1/messages/count_tokens", "/v1/messages", "/v1/messages"])
+
     def test_count_endpoint_forwards_native_full_payload(self):
         self.prompt_tokens = 147023
         status, raw, body = self.request(path="/v1/messages/count_tokens")
@@ -397,6 +438,36 @@ class GatewayBudgetHTTPTests(unittest.TestCase):
         self.assertIn(b"message_start", raw)
         self.assertEqual(sum(p == "/v1/messages" for p, _ in self.requests), 2)
         self.assertEqual(sum(p == "/v1/messages/count_tokens" for p, _ in self.requests), 1)
+
+    def test_startup_cli_reports_effective_capacity_version_and_resume_warning(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            claude = tmp / "claude"
+            claude.write_text("#!/bin/sh\n# CLAUDE_CODE_AUTO_COMPACT_WINDOW CLAUDE_CODE_MAX_CONTEXT_TOKENS CLAUDE_CODE_MAX_OUTPUT_TOKENS\n"
+                              "if [ \"$1\" = --help ]; then echo '--autocompact --settings --setting-sources'; else echo '2.1.221 (mock Claude)'; fi\n")
+            claude.chmod(0o755)
+            plan = tmp / "plan.json"
+            plan.write_text(json.dumps({"role_ids": {r: "local" for r in ("haiku", "sonnet", "opus", "fable")}}))
+            backends = tmp / "backends.tsv"
+            backends.write_text(f"local\t{self.backend.server_port}\trepo:quant\n")
+            config = tmp / "gateway.json"
+            env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "DISABLE_"))}
+            env["PATH"] = str(tmp) + ":" + os.environ["PATH"]
+            args = [sys.executable, str(ROOT / "lib" / "claude_local_budget.py"), "--requested", "262144",
+                    "--check-claude", "--plan", str(plan), "--backends", str(backends), "--config", str(config),
+                    "--", "--resume", "SESSION", "--model", "claude-opus-5"]
+            result = subprocess.run(args, env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for text in ("2.1.221", "requested context=262144", "effective per-slot=131072",
+                         "window=114688", "auto-compaction window=106496", "max output=8192",
+                         "prompt reserve=8192", "Resume warning", "recognized Claude IDs"):
+                self.assertIn(text, result.stdout)
+            self.assertIn("Context mismatch", result.stderr)
+            cfg = json.loads(config.read_text())
+            self.assertEqual(cfg["budget"]["capacity"], 131072)
+            self.assertEqual(len(cfg["roles"]), 4)
+            self.assertEqual(len(self.requests), 1)
+            self.assertEqual(self.requests[0][0], "/v1/messages/count_tokens")
 
 
 if __name__ == "__main__":

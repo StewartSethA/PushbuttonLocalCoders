@@ -175,21 +175,31 @@ class Handler(BaseHTTPRequestHandler):
         # approximate with text-only /tokenize.
         count_key = self.router.count_key(route, raw)
         prompt_tokens = self.router.cached_count(count_key)
+        attempts = int(route.get("proxy_attempts", 2))
         if prompt_tokens is None:
-            conn = self._backend_connection(route)
-            try:
-                conn.request("POST", "/v1/messages/count_tokens", body=raw, headers=headers)
-                resp = conn.getresponse()
-                result = json.loads(resp.read())
-                if resp.status != 200:
-                    # Includes 400: not a transient inference/network failure.
-                    return self._json(resp.status, result)
-                prompt_tokens = input_tokens(result)
-                self.router.remember_count(count_key, prompt_tokens)
-            except Exception:
-                return self._json(503, {"type": "error", "error": {"type": "api_error", "message": "Local tokenizer preflight unavailable; inference was not attempted. Check the backend /v1/messages/count_tokens endpoint."}})
-            finally:
-                conn.close()
+            for attempt in range(1, attempts + 1):
+                conn = self._backend_connection(route)
+                try:
+                    conn.request("POST", "/v1/messages/count_tokens", body=raw, headers=headers)
+                    resp = conn.getresponse()
+                    if resp.status in (500, 502, 503, 504) and attempt < attempts:
+                        resp.read()
+                        continue
+                    result = json.loads(resp.read())
+                    if resp.status != 200:
+                        # Includes 400: not a transient inference/network failure.
+                        return self._json(resp.status, result)
+                    prompt_tokens = input_tokens(result)
+                    self.router.remember_count(count_key, prompt_tokens)
+                    break
+                except (OSError, http.client.HTTPException) as exc:
+                    if attempt < attempts:
+                        continue
+                    return self._json(503, {"type": "error", "error": {"type": "api_error", "message": f"Local tokenizer preflight unavailable ({type(exc).__name__}); inference was not attempted. Check the backend /v1/messages/count_tokens endpoint."}})
+                except (ValueError, TypeError) as exc:
+                    return self._json(503, {"type": "error", "error": {"type": "api_error", "message": f"Invalid native tokenizer response ({type(exc).__name__}); inference was not attempted. Check the backend /v1/messages/count_tokens endpoint."}})
+                finally:
+                    conn.close()
         if path == "/v1/messages/count_tokens":
             return self._json(200, {"input_tokens": prompt_tokens})
         error = request_budget_error(body, prompt_tokens, route)
@@ -199,7 +209,6 @@ class Handler(BaseHTTPRequestHandler):
         # One transparent retry is useful for an immediately reset local
         # connection or transient 5xx. We only retry before response headers /
         # bytes are committed to Claude Code.
-        attempts = int(route.get("proxy_attempts", 2))
         last_exc: Exception | None = None
         for attempt in range(1, attempts + 1):
             conn = self._backend_connection(route)
