@@ -15,6 +15,10 @@ CACHE_DIR="${CLAUDE_LOCAL_CACHE:-$HOME/.cache/pushbutton/llama}"
 LOCK_FILE="${CLAUDE_LOCAL_LOCK_FILE:-$HOME/.local/share/pushbutton/claude-local/startup.lock}"
 CTX="${CLAUDE_LOCAL_CONTEXT:-262144}"
 CLIENT_CTX="${CLAUDE_LOCAL_CLIENT_CONTEXT:-200000}"
+SLOTS="${CLAUDE_LOCAL_SLOTS:-1}"
+CLASSIFIER_MODEL=""
+CLASSIFIER_GPU=""
+CLASSIFIER_CTX=32768
 PORT_BASE="${CLAUDE_LOCAL_PORT_BASE:-18180}"
 ALLOW_OFFLOAD=0
 KEEP_SERVERS=0
@@ -51,6 +55,10 @@ Harness options (put before ordinary Claude Code flags):
   --local-cache DIR          llama.cpp/Hugging Face model cache
   --local-context N          physical backend context (default 262144)
   --local-client-context N   Claude Code budget (default 200000)
+  --local-slots N            inference slots per main backend (default 1)
+  --local-classifier-model M independent classifier model (may match main model)
+  --local-classifier-gpu N   reserve physical GPU index N for classifier
+  --local-classifier-context N classifier context (default 32768; one slot)
   --local-port-base N        starting port for gateway/backends
   --local-no-teams           disable experimental Claude agent teams
   --local-keep-servers       leave model servers running after Claude exits
@@ -312,7 +320,7 @@ import json,sys
 sep='\x1f'
 for s in json.load(open(sys.argv[1]))['servers']:
  x=s['profile']; env=';'.join(f'{k}={v}' for k,v in x.get('extra_env',{}).items())
- print(sep.join(map(str,[s['id'],x['hf_spec'],s['cuda_visible_devices'],int(s['multi_gpu']),x['kv_k'],x['kv_v'],x['batch'],x['ubatch'],x['flash_attn'],x['template'],env,x.get('note','')])))
+ print(sep.join(map(str,[s['id'],x['hf_spec'],s['cuda_visible_devices'],int(s['multi_gpu']),x['kv_k'],x['kv_v'],x['batch'],x['ubatch'],x['flash_attn'],x['template'],env,x.get('note',''),s['context'],s['slots']])))
 PY
 }
 
@@ -342,15 +350,15 @@ stop_log_follower() {
 start_backends() {
     mkdir -p "$STATE_DIR/logs" "$CACHE_DIR"; export LLAMA_CACHE="$CACHE_DIR" GGML_CUDA_ENABLE_UNIFIED_MEMORY="$ALLOW_OFFLOAD" CUDA_SCALE_LAUNCH_QUEUES=4x
     local next=$((PORT_BASE+1)); BACKENDS_TSV="$STATE_DIR/backends.$$"; : > "$BACKENDS_TSV"
-    while IFS=$'\x1f' read -r id hf gpus multi kvk kvv batch ubatch fa template envpairs note; do
+    while IFS=$'\x1f' read -r id hf gpus multi kvk kvv batch ubatch fa template envpairs note context slots; do
         local port log pid follower failed=0 waited=0
         port="$(free_port "$next")"; next=$((port+1)); log="$STATE_DIR/logs/${id}.log"; : > "$log"
-        local -a cmd=("$LLAMA_SERVER" -hf "$hf" --alias "$id" --no-mmproj -ngl 999 -c "$CTX" -np 1 --cache-type-k "$kvk" --cache-type-v "$kvv" -b "$batch" -ub "$ubatch" -fa "$fa" --jinja --no-context-shift --host 127.0.0.1 --port "$port")
+        local -a cmd=("$LLAMA_SERVER" -hf "$hf" --alias "$id" --no-mmproj -ngl 999 -c "$((context * slots))" -np "$slots" --cache-type-k "$kvk" --cache-type-v "$kvv" -b "$batch" -ub "$ubatch" -fa "$fa" --jinja --no-context-shift --host 127.0.0.1 --port "$port")
         [[ "$multi" == 1 ]] && cmd+=(--split-mode layer)
         [[ "$template" == qwen-fixed ]] && cmd+=(--chat-template-file "$QWEN_TEMPLATE")
         local -a envcmd=(env "CUDA_VISIBLE_DEVICES=$gpus" "LLAMA_CACHE=$CACHE_DIR" "GGML_CUDA_ENABLE_UNIFIED_MEMORY=$ALLOW_OFFLOAD" "CUDA_SCALE_LAUNCH_QUEUES=4x")
         if [[ -n "$envpairs" ]]; then local -a pairs; IFS=';' read -ra pairs <<< "$envpairs"; local pair; for pair in "${pairs[@]}"; do envcmd+=("$pair"); done; fi
-        say "Starting $id on GPU(s) [$gpus], $hf, ctx=$CTX${note:+ — $note}"
+        say "Starting $id on GPU(s) [$gpus], $hf, ctx/slot=$context, slots=$slots${note:+ — $note}"
         "${envcmd[@]}" "${cmd[@]}" >"$log" 2>&1 & pid=$!; PIDS+=("$pid")
         follower="$(start_log_follower "$log")"
         while ! curl -fsS "http://127.0.0.1:$port/health" >/dev/null 2>&1; do
@@ -378,7 +386,11 @@ p=json.load(open(sys.argv[1])); ports={}
 for line in open(sys.argv[2]):
  mid,port,*_=line.rstrip('\n').split('\t'); ports[mid]=int(port)
 roles={r:{'model_id':mid,'backend_alias':mid,'url':f'http://127.0.0.1:{ports[mid]}'} for r,mid in p['role_ids'].items()}
-json.dump({'roles':roles},open(sys.argv[3],'w'),indent=2)
+models={}
+if p.get('classifier_id'):
+ mid=p['classifier_id']
+ models[mid]={'model_id':mid,'backend_alias':mid,'url':f'http://127.0.0.1:{ports[mid]}'}
+json.dump({'roles':roles,'models':models},open(sys.argv[3],'w'),indent=2)
 PY
 }
 
@@ -427,7 +439,7 @@ for r in ('haiku','sonnet','opus','fable'): print(f"  {r:6} -> {p['roles'][r]} (
 print('Servers:')
 for s in p['servers']:
  x=s['profile']; gs=', '.join(f"GPU{g['index']} {g['name']} ({g['free_mib']/1024:.1f} GiB free, PCIe Gen{g['pcie_gen']} x{g['pcie_width']})" for g in s['gpus'])
- print(f"  {s['id']}: {x['hf_spec']}\n    {gs}\n    KV={x['kv_k']}/{x['kv_v']} batch={x['batch']}/{x['ubatch']} FA={x['flash_attn']} quality-tier={x['quality']}")
+ print(f"  {s['id']}: {x['hf_spec']}\n    {gs}\n    context/slot={s['context']} slots={s['slots']} KV={x['kv_k']}/{x['kv_v']} batch={x['batch']}/{x['ubatch']} FA={x['flash_attn']} quality-tier={x['quality']}")
 PY
 }
 
@@ -448,6 +460,15 @@ show_runtime_errors() {
 run_claude() {
     local key="claude-local-$RANDOM-$$" role id sonnet_id rc
     export ANTHROPIC_BASE_URL="http://127.0.0.1:$GATEWAY_PORT" ANTHROPIC_AUTH_TOKEN="$key" ANTHROPIC_API_KEY="$key" CLAUDE_CODE_MAX_CONTEXT_TOKENS="$CLIENT_CTX"
+    if [[ -z "${CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY:-}" ]]; then
+        CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY="$(python3 - "$PLAN_FILE" <<'PY'
+import json,sys
+p=json.load(open(sys.argv[1]))
+print(min(4, sum(s['slots'] for s in p['servers'] if s['id'] != p.get('classifier_id'))))
+PY
+)"
+        export CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY
+    fi
     unset CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY ANTHROPIC_BEDROCK_BASE_URL ANTHROPIC_VERTEX_BASE_URL || true
     while IFS=$'\t' read -r role id; do
         case "$role" in
@@ -501,6 +522,10 @@ while (($#)); do
       --local-cache) [[ $# -ge 2 ]] || die "--local-cache needs a directory"; CACHE_DIR="$2"; shift 2;;
       --local-context) CTX="$2"; shift 2;;
       --local-client-context) CLIENT_CTX="$2"; shift 2;;
+      --local-slots) [[ $# -ge 2 ]] || die "--local-slots needs a count"; SLOTS="$2"; shift 2;;
+      --local-classifier-model) [[ $# -ge 2 ]] || die "--local-classifier-model needs a model"; CLASSIFIER_MODEL="$2"; shift 2;;
+      --local-classifier-gpu) [[ $# -ge 2 ]] || die "--local-classifier-gpu needs a physical index"; CLASSIFIER_GPU="$2"; shift 2;;
+      --local-classifier-context) [[ $# -ge 2 ]] || die "--local-classifier-context needs a context"; CLASSIFIER_CTX="$2"; shift 2;;
       --local-port-base) PORT_BASE="$2"; shift 2;;
       --local-no-teams) ENABLE_TEAMS=0; shift;;
       --local-keep-servers) KEEP_SERVERS=1; shift;;
@@ -514,13 +539,21 @@ done
 
 [[ "$CTX" =~ ^[0-9]+$ && "$CLIENT_CTX" =~ ^[0-9]+$ ]] || die "context values must be integers"
 (( CLIENT_CTX <= CTX )) || die "client context ($CLIENT_CTX) exceeds physical context ($CTX)"
+[[ "$SLOTS" =~ ^[1-9][0-9]*$ && "$CLASSIFIER_CTX" =~ ^[1-9][0-9]*$ ]] || die "slots and classifier context must be positive integers"
+if [[ -n "$CLASSIFIER_MODEL" || -n "$CLASSIFIER_GPU" ]]; then
+    [[ -n "$CLASSIFIER_MODEL" && "$CLASSIFIER_GPU" =~ ^[0-9]+$ ]] || die "classifier model and physical GPU index must be supplied together"
+fi
 if [[ $DRY_RUN -eq 0 ]]; then install_base_deps; ensure_nvidia_driver; else have_cmd nvidia-smi || die "nvidia-smi required for dry run"; fi
 mkdir -p "$STATE_DIR" "$CACHE_DIR"; PLAN_FILE="$STATE_DIR/plan.$$.json"
 
 # Serialize only startup/allocation. Existing sessions remain concurrent, but a
 # second launch cannot observe the same free VRAM/port state and race the first.
 [[ $DRY_RUN -eq 0 ]] && acquire_startup_lock
-plan_args=(plan --context "$CTX"); if ((${#MODELS[@]})); then plan_args+=("${MODELS[@]}"); else plan_args+=(--smart); fi
+plan_args=(plan --context "$CTX" --slots "$SLOTS")
+if [[ -n "$CLASSIFIER_MODEL" ]]; then
+    plan_args+=(--classifier-model "$CLASSIFIER_MODEL" --classifier-gpu "$CLASSIFIER_GPU" --classifier-context "$CLASSIFIER_CTX")
+fi
+if ((${#MODELS[@]})); then plan_args+=("${MODELS[@]}"); else plan_args+=(--smart); fi
 python3 "$PLAN_PY" "${plan_args[@]}" > "$PLAN_FILE" || exit $?
 print_plan; [[ $DRY_RUN -eq 1 ]] && exit 0
 install_claude_code; prepare_host_compiler; activate_cuda; ensure_llamacpp

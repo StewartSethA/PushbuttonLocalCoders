@@ -282,11 +282,9 @@ class Candidate:
 
 
 def scaled_required_mib(profile: Profile, context: int) -> int:
-    if context >= profile.native_context:
-        return profile.required_mib
     # Most of required_mib is immutable model weight. Shorter context can only
     # reduce the context-dependent fraction, capped here at 15% conservatively.
-    frac = max(0.0, min(1.0, context / profile.native_context))
+    frac = max(0.0, context / profile.native_context)
     return int(profile.required_mib * (0.85 + 0.15 * frac))
 
 
@@ -489,7 +487,23 @@ def ordered_group_for_layer_split(candidate: Candidate, gpus: list[GPU]) -> list
     return [slowest] + rest
 
 
-def plan(models: list[str], gpus: list[GPU], context: int) -> dict:
+def plan(
+    models: list[str], gpus: list[GPU], context: int, *,
+    slots: int = 1, classifier_model: str | None = None,
+    classifier_gpu: int | None = None, classifier_context: int = 32768,
+) -> dict:
+    if slots < 1 or context < 1 or classifier_context < 1:
+        raise ValueError("slots and contexts must be positive")
+    if (classifier_model is None) != (classifier_gpu is None):
+        raise ValueError("classifier model and physical GPU index must be supplied together")
+    classifier = None
+    if classifier_model is not None:
+        reserved = [g for g in gpus if g.index == classifier_gpu]
+        if not reserved:
+            raise ValueError(f"classifier GPU {classifier_gpu} is not available")
+        classifier = plan([classifier_model], reserved, classifier_context)["servers"][0]
+        classifier["id"] = "local-classifier"
+        gpus = [g for g in gpus if g.index != classifier_gpu]
     rm = role_map(models)
     unique: list[str] = []
     for role in ROLES:
@@ -498,11 +512,11 @@ def plan(models: list[str], gpus: list[GPU], context: int) -> dict:
             unique.append(model)
 
     if len(unique) == 1:
-        picked = single_model_choice(unique[0], gpus, context)
+        picked = single_model_choice(unique[0], gpus, context * slots)
         choices = [picked] if picked else None
         policy = "freest-then-link"
     else:
-        choices = joint_model_choices(unique, gpus, context, rm["sonnet"])
+        choices = joint_model_choices(unique, gpus, context * slots, rm["sonnet"])
         policy = "joint-global-plan"
 
     if not choices or any(c is None for c in choices):
@@ -521,6 +535,8 @@ def plan(models: list[str], gpus: list[GPU], context: int) -> dict:
         servers.append(
             {
                 "id": f"local-{c.model.replace(':', '-').replace('.', '').replace('_', '-')}",
+                "context": context,
+                "slots": slots,
                 "model": c.model,
                 "profile": {
                     **asdict(c.profile),
@@ -541,10 +557,13 @@ def plan(models: list[str], gpus: list[GPU], context: int) -> dict:
         role: next(s["id"] for s in servers if s["model"] == model)
         for role, model in rm.items()
     }
+    if classifier is not None:
+        servers.append(classifier)
     return {
         "context": context,
         "roles": rm,
         "role_ids": role_ids,
+        "classifier_id": classifier["id"] if classifier else None,
         "servers": servers,
         "unused_gpus": [
             asdict(g)
@@ -563,6 +582,10 @@ def main() -> int:
     lp.add_argument("models", nargs="*")
     lp.add_argument("--context", type=int, default=262144)
     lp.add_argument("--smart", action="store_true")
+    lp.add_argument("--slots", type=int, default=1)
+    lp.add_argument("--classifier-model")
+    lp.add_argument("--classifier-gpu", type=int)
+    lp.add_argument("--classifier-context", type=int, default=32768)
     sub.add_parser("catalogue")
     args = ap.parse_args()
     try:
@@ -580,10 +603,15 @@ def main() -> int:
             print(json.dumps(data, indent=2))
             return 0
         gpus = inventory()
+        main_gpus = [g for g in gpus if g.index != args.classifier_gpu]
         models = args.models
         if args.smart or not models:
-            models = smart_defaults(gpus)
-        print(json.dumps(plan(models, gpus, args.context), indent=2))
+            models = smart_defaults(main_gpus)
+        print(json.dumps(plan(
+            models, gpus, args.context, slots=args.slots,
+            classifier_model=args.classifier_model, classifier_gpu=args.classifier_gpu,
+            classifier_context=args.classifier_context,
+        ), indent=2))
         return 0
     except ValueError as exc:
         print(f"claude-local planner: {exc}", file=sys.stderr)

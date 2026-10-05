@@ -38,10 +38,13 @@ def family_for(model: str) -> str | None:
 class Router:
     def __init__(self, config: dict):
         self.roles: dict[str, dict] = config["roles"]
+        self.models: dict[str, dict] = config.get("models", {})
         self.alias_map: dict[str, dict] = {}
         for role, route in self.roles.items():
             self.alias_map[route["model_id"].lower()] = route
             self.alias_map[role] = route
+        for model, route in self.models.items():
+            self.alias_map[model.lower()] = route
 
     def resolve(self, model: str) -> dict:
         key = (model or "").lower()
@@ -85,7 +88,7 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/v1/models", "/models"):
             seen = set()
             data = []
-            for role, route in self.router.roles.items():
+            for route in (*self.router.roles.values(), *self.router.models.values()):
                 mid = route["model_id"]
                 if mid not in seen:
                     data.append({"id": mid, "object": "model", "owned_by": "claude-local"})
@@ -125,7 +128,10 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             return self._json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": f"bad JSON: {exc}"}})
 
-        route = self.router.resolve(str(body.get("model", "")))
+        requested_model = str(body.get("model", ""))
+        route = self.router.resolve(requested_model)
+        self.log_message("route model=%s backend_alias=%s endpoint=%s path=%s",
+                         requested_model, route["backend_alias"], route["url"], path)
         body["model"] = route["backend_alias"]
         raw = json.dumps(body, separators=(",", ":")).encode()
         headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP_HEADERS}

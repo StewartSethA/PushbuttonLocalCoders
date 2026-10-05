@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 import importlib.util
+import http.client
+import json
 import pathlib
+import subprocess
 import sys
+import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -45,6 +51,43 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(planmod.plan(["q38"], gpus, 262144)["servers"][0]["profile"]["quant"], "IQ3_XXS")
         self.assertEqual(planmod.plan(["q36"], gpus, 262144)["servers"][0]["profile"]["quant"], "UD-IQ3_XXS")
 
+    def test_classifier_replica_reserves_gpu_even_for_same_model(self):
+        gpus = [
+            planmod.GPU(i, "RTX 3090", 24576, 24000) for i in (0, 1)
+        ]
+        p = planmod.plan(["q38"], gpus, 131072,
+                         classifier_model="q38", classifier_gpu=1)
+        main, classifier = p["servers"]
+        self.assertEqual(main["cuda_visible_devices"], "0")
+        self.assertEqual(classifier["cuda_visible_devices"], "1")
+        self.assertEqual(classifier["context"], 32768)
+        self.assertEqual(classifier["slots"], 1)
+        self.assertEqual(p["classifier_id"], "local-classifier")
+        self.assertNotEqual(p["role_ids"]["sonnet"], p["classifier_id"])
+        self.assertEqual(p["unused_gpus"], [])
+
+    def test_classifier_configuration_fails_closed(self):
+        gpus = [planmod.GPU(0, "RTX 3090", 24576, 24000)]
+        for kwargs in (
+            {"classifier_model": "q38"},
+            {"classifier_gpu": 0},
+            {"classifier_model": "q38", "classifier_gpu": 1},
+            {"classifier_model": "q38", "classifier_gpu": 0},
+            {"slots": 0},
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                planmod.plan(["q38"], gpus, 262144, **kwargs)
+
+    def test_multiple_slots_budget_aggregate_context(self):
+        gpus = [planmod.GPU(0, "RTX 3090", 24576, 24000)]
+        p = planmod.plan(["q38"], gpus, 262144, slots=2)
+        s = p["servers"][0]
+        self.assertEqual(s["slots"], 2)
+        self.assertEqual(s["context"], 262144)
+        profile = next(x for x in planmod.PROFILES[s["model"]]
+                       if x.quant == s["profile"]["quant"])
+        self.assertGreater(s["required_mib"], profile.required_mib)
+
 
 class GatewayTests(unittest.TestCase):
     def setUp(self):
@@ -64,6 +107,97 @@ class GatewayTests(unittest.TestCase):
 
     def test_unknown_internal_model_stays_local(self):
         self.assertEqual(self.router.resolve("unexpected-internal-id")["model_id"], "local-sonnet")
+
+    def test_classifier_model_is_independent_of_main_model(self):
+        classifier = {"model_id": "local-classifier", "backend_alias": "local-classifier",
+                      "url": "http://127.0.0.1:2"}
+        router = gwmod.Router({"roles": self.router.roles,
+                               "models": {"local-classifier": classifier}})
+        self.assertEqual(router.resolve("local-classifier"), classifier)
+        self.assertEqual(router.resolve("local-sonnet")["url"], "http://127.0.0.1:1")
+        self.assertEqual(router.resolve("unknown")["model_id"], "local-sonnet")
+
+    def test_classifier_failure_does_not_fall_back_to_main(self):
+        requests = []
+
+        class Backend(BaseHTTPRequestHandler):
+            def do_POST(self):
+                requests.append((self.path, json.loads(
+                    self.rfile.read(int(self.headers["content-length"])))))
+                raw = b'{"error":"classifier unavailable"}'
+                self.send_response(503)
+                self.send_header("content-length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def log_message(self, *_):
+                pass
+
+        backend = ThreadingHTTPServer(("127.0.0.1", 0), Backend)
+        gateway = ThreadingHTTPServer(("127.0.0.1", 0), gwmod.Handler)
+        gateway.router = gwmod.Router({
+            "roles": self.router.roles,
+            "models": {"local-classifier": {
+                "model_id": "local-classifier", "backend_alias": "local-classifier",
+                "url": f"http://127.0.0.1:{backend.server_port}",
+            }},
+        })
+        gateway.verbose = False
+        threads = [threading.Thread(target=s.serve_forever) for s in (backend, gateway)]
+        for t in threads:
+            t.start()
+        conn = http.client.HTTPConnection("127.0.0.1", gateway.server_port, timeout=5)
+        try:
+            conn.request("GET", "/v1/models")
+            self.assertIn("local-classifier", [m["id"] for m in
+                          json.loads(conn.getresponse().read())["data"]])
+            for path in ("/v1/messages", "/v1/messages/count_tokens"):
+                conn.request("POST", path, json.dumps({"model": "local-classifier"}),
+                             {"content-type": "application/json"})
+                resp = conn.getresponse()
+                self.assertEqual(resp.status, 503)
+                self.assertEqual(json.loads(resp.read())["error"], "classifier unavailable")
+            self.assertEqual(len(requests), 4)
+            self.assertTrue(all(body["model"] == "local-classifier" for _, body in requests))
+        finally:
+            conn.close()
+            for s in (gateway, backend):
+                s.shutdown()
+                s.server_close()
+            for t in threads:
+                t.join()
+
+
+class HarnessTests(unittest.TestCase):
+    def test_server_rows_and_gateway_config_include_classifier(self):
+        gpus = [planmod.GPU(i, "RTX 3090", 24576, 24000) for i in (0, 1)]
+        p = planmod.plan(["q38"], gpus, 131072, slots=2,
+                         classifier_model="q38", classifier_gpu=1)
+        with tempfile.TemporaryDirectory() as tmp:
+            state = pathlib.Path(tmp)
+            planfile = state / "plan.json"
+            planfile.write_text(json.dumps(p))
+            backends = state / "backends"
+            backends.write_text("\n".join(
+                f"{s['id']}\t{19000+i}\tmodel" for i, s in enumerate(p["servers"])))
+            source = (ROOT / "claude-local").read_text()
+            source = source[source.index("server_rows() {"):source.index("contains_claude_flag()")]
+            result = subprocess.run(
+                ["bash", "-c", source + '\nPLAN_FILE="$1"; STATE_DIR="$2"; '
+                 'BACKENDS_TSV="$3"; server_rows; write_gateway_config; '
+                 'cat "$GATEWAY_CONFIG"', "claude-local",
+                 str(planfile), str(state), str(backends)],
+                text=True, capture_output=True, check=True,
+            )
+            rows = result.stdout.splitlines()
+            main, classifier = [row.split("\x1f") for row in rows[:2]]
+            self.assertEqual(main[-2:], ["131072", "2"])
+            self.assertEqual(classifier[-2:], ["32768", "1"])
+            cfg = json.loads("\n".join(rows[2:]))
+            self.assertEqual(cfg["models"]["local-classifier"]["url"],
+                             "http://127.0.0.1:19001")
+            self.assertEqual(cfg["roles"]["sonnet"]["url"],
+                             "http://127.0.0.1:19000")
 
 
 if __name__ == "__main__":
