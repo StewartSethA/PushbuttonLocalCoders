@@ -284,6 +284,7 @@ class Candidate:
 def scaled_required_mib(profile: Profile, context: int) -> int:
     # Most of required_mib is immutable model weight. Shorter context can only
     # reduce the context-dependent fraction, capped here at 15% conservatively.
+    # Additional inference slots increase aggregate context beyond native_context.
     frac = max(0.0, context / profile.native_context)
     return int(profile.required_mib * (0.85 + 0.15 * frac))
 

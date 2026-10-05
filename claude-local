@@ -19,6 +19,7 @@ SLOTS="${CLAUDE_LOCAL_SLOTS:-1}"
 CLASSIFIER_MODEL=""
 CLASSIFIER_GPU=""
 CLASSIFIER_CTX=32768
+CLASSIFIER_REQUEST_MODELS=()
 PORT_BASE="${CLAUDE_LOCAL_PORT_BASE:-18180}"
 ALLOW_OFFLOAD=0
 KEEP_SERVERS=0
@@ -59,6 +60,7 @@ Harness options (put before ordinary Claude Code flags):
   --local-classifier-model M independent classifier model (may match main model)
   --local-classifier-gpu N   reserve physical GPU index N for classifier
   --local-classifier-context N classifier context (default 32768; one slot)
+  --local-classifier-request-model ID route observed classifier ID (repeatable)
   --local-port-base N        starting port for gateway/backends
   --local-no-teams           disable experimental Claude agent teams
   --local-keep-servers       leave model servers running after Claude exits
@@ -380,7 +382,7 @@ start_backends() {
 
 write_gateway_config() {
     GATEWAY_CONFIG="$STATE_DIR/gateway.$$.json"
-python3 - "$PLAN_FILE" "$BACKENDS_TSV" "$GATEWAY_CONFIG" <<'PY'
+python3 - "$PLAN_FILE" "$BACKENDS_TSV" "$GATEWAY_CONFIG" "${CLASSIFIER_REQUEST_MODELS[@]}" <<'PY'
 import json,sys
 p=json.load(open(sys.argv[1])); ports={}
 for line in open(sys.argv[2]):
@@ -390,6 +392,8 @@ models={}
 if p.get('classifier_id'):
  mid=p['classifier_id']
  models[mid]={'model_id':mid,'backend_alias':mid,'url':f'http://127.0.0.1:{ports[mid]}'}
+ for request_id in sys.argv[4:]:
+  models[request_id]={'model_id':request_id,'backend_alias':mid,'url':f'http://127.0.0.1:{ports[mid]}'}
 json.dump({'roles':roles,'models':models},open(sys.argv[3],'w'),indent=2)
 PY
 }
@@ -487,6 +491,10 @@ PY
     local -a args=("${CLAUDE_ARGS[@]}")
     contains_claude_flag --model || args=(--model "$sonnet_id" "${args[@]}")
     contains_claude_flag --agents || args=(--agents "$(agents_json)" "${args[@]}")
+    if [[ -n "$CLASSIFIER_MODEL" ]]; then
+        say "Dedicated classifier on physical GPU $CLASSIFIER_GPU; request IDs: ${CLASSIFIER_REQUEST_MODELS[*]}"
+        warn "Classifier routing matches model IDs, not request purpose. Do not use these IDs for session/subagent models."
+    fi
     say "All local services ready. Launching Claude Code from $PWD"
     say "Claude Code -> local gateway http://127.0.0.1:$GATEWAY_PORT (no cloud fallback)"
     if claude "${args[@]}"; then
@@ -526,6 +534,7 @@ while (($#)); do
       --local-classifier-model) [[ $# -ge 2 ]] || die "--local-classifier-model needs a model"; CLASSIFIER_MODEL="$2"; shift 2;;
       --local-classifier-gpu) [[ $# -ge 2 ]] || die "--local-classifier-gpu needs a physical index"; CLASSIFIER_GPU="$2"; shift 2;;
       --local-classifier-context) [[ $# -ge 2 ]] || die "--local-classifier-context needs a context"; CLASSIFIER_CTX="$2"; shift 2;;
+      --local-classifier-request-model) [[ $# -ge 2 && -n "$2" ]] || die "--local-classifier-request-model needs an observed model ID"; CLASSIFIER_REQUEST_MODELS+=("$2"); shift 2;;
       --local-port-base) PORT_BASE="$2"; shift 2;;
       --local-no-teams) ENABLE_TEAMS=0; shift;;
       --local-keep-servers) KEEP_SERVERS=1; shift;;
@@ -542,6 +551,10 @@ done
 [[ "$SLOTS" =~ ^[1-9][0-9]*$ && "$CLASSIFIER_CTX" =~ ^[1-9][0-9]*$ ]] || die "slots and classifier context must be positive integers"
 if [[ -n "$CLASSIFIER_MODEL" || -n "$CLASSIFIER_GPU" ]]; then
     [[ -n "$CLASSIFIER_MODEL" && "$CLASSIFIER_GPU" =~ ^[0-9]+$ ]] || die "classifier model and physical GPU index must be supplied together"
+    ((${#CLASSIFIER_REQUEST_MODELS[@]})) || die "dedicated classifier requires --local-classifier-request-model with the observed classifier API model ID"
+    contains_claude_flag --model && die "dedicated classifier requires the harness-managed session model; omit --model"
+elif ((${#CLASSIFIER_REQUEST_MODELS[@]})); then
+    die "classifier request routing requires a dedicated classifier model and GPU"
 fi
 if [[ $DRY_RUN -eq 0 ]]; then install_base_deps; ensure_nvidia_driver; else have_cmd nvidia-smi || die "nvidia-smi required for dry run"; fi
 mkdir -p "$STATE_DIR" "$CACHE_DIR"; PLAN_FILE="$STATE_DIR/plan.$$.json"
@@ -555,6 +568,16 @@ if [[ -n "$CLASSIFIER_MODEL" ]]; then
 fi
 if ((${#MODELS[@]})); then plan_args+=("${MODELS[@]}"); else plan_args+=(--smart); fi
 python3 "$PLAN_PY" "${plan_args[@]}" > "$PLAN_FILE" || exit $?
+if [[ -n "$CLASSIFIER_MODEL" ]]; then
+    python3 - "$PLAN_FILE" "${CLASSIFIER_REQUEST_MODELS[@]}" <<'PY'
+import json,sys
+p=json.load(open(sys.argv[1]))
+reserved={mid.lower() for mid in p['role_ids'].values()} | set(p['role_ids'])
+for mid in sys.argv[2:]:
+ if mid.lower() in reserved:
+  sys.exit(f"classifier request ID conflicts with a session/agent route: {mid}")
+PY
+fi
 print_plan; [[ $DRY_RUN -eq 1 ]] && exit 0
 install_claude_code; prepare_host_compiler; activate_cuda; ensure_llamacpp
 grep -q '"template": "qwen-fixed"' "$PLAN_FILE" && fetch_qwen_template || true

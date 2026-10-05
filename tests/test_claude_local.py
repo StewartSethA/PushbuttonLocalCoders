@@ -78,6 +78,13 @@ class PlannerTests(unittest.TestCase):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 planmod.plan(["q38"], gpus, 262144, **kwargs)
 
+    def test_classifier_can_use_a_different_registered_model(self):
+        gpus = [planmod.GPU(i, "RTX 3090", 24576, 24000) for i in (0, 1)]
+        p = planmod.plan(["q38"], gpus, 131072,
+                         classifier_model="q36", classifier_gpu=1)
+        self.assertEqual(p["servers"][-1]["model"], "qwen3.6:35b")
+        self.assertEqual(p["servers"][-1]["cuda_visible_devices"], "1")
+
     def test_multiple_slots_budget_aggregate_context(self):
         gpus = [planmod.GPU(0, "RTX 3090", 24576, 24000)]
         p = planmod.plan(["q38"], gpus, 262144, slots=2)
@@ -116,6 +123,20 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(router.resolve("local-classifier"), classifier)
         self.assertEqual(router.resolve("local-sonnet")["url"], "http://127.0.0.1:1")
         self.assertEqual(router.resolve("unknown")["model_id"], "local-sonnet")
+
+    def test_explicit_classifier_request_id_overrides_family_only_for_that_id(self):
+        route = {"model_id": "claude-sonnet-5", "backend_alias": "local-classifier",
+                 "url": "http://127.0.0.1:2"}
+        router = gwmod.Router({"roles": self.router.roles,
+                               "models": {"claude-sonnet-5": route}})
+        self.assertEqual(router.resolve("claude-sonnet-5"), route)
+        self.assertEqual(router.resolve("claude-sonnet-other")["model_id"], "local-sonnet")
+        self.assertEqual(router.resolve("local-sonnet")["model_id"], "local-sonnet")
+
+    def test_classifier_request_id_cannot_override_session_route(self):
+        with self.assertRaises(ValueError):
+            gwmod.Router({"roles": self.router.roles,
+                          "models": {"LOCAL-SONNET": {}}})
 
     def test_classifier_failure_does_not_fall_back_to_main(self):
         requests = []
@@ -169,6 +190,29 @@ class GatewayTests(unittest.TestCase):
 
 
 class HarnessTests(unittest.TestCase):
+    def test_default_concurrency_counts_main_slots_not_classifier(self):
+        gpus = [planmod.GPU(i, "RTX 3090", 24576, 24000) for i in (0, 1)]
+        p = planmod.plan(["q38"], gpus, 131072, slots=2,
+                         classifier_model="q38", classifier_gpu=1)
+        source = (ROOT / "claude-local").read_text()
+        source = source[source.index("server_rows() {"):source.index("doctor() {")]
+        with tempfile.TemporaryDirectory() as tmp:
+            planfile = pathlib.Path(tmp) / "plan.json"
+            planfile.write_text(json.dumps(p))
+            for override, expected in (("", "2"), ("7", "7")):
+                result = subprocess.run(
+                    ["bash", "-c", source + '\nPLAN_FILE="$1"; '
+                     'CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY="$2"; '
+                     'GATEWAY_PORT=19000; CLIENT_CTX=100000; ENABLE_TEAMS=0; '
+                     'CLAUDE_ARGS=(); CLASSIFIER_MODEL=""; say() { :; }; '
+                     'claude() { echo "$CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY"; '
+                     'echo "$ANTHROPIC_MODEL"; }; run_claude',
+                     "claude-local", str(planfile), override],
+                    text=True, capture_output=True, check=True,
+                )
+                self.assertEqual(result.stdout.splitlines(),
+                                 [expected, p["role_ids"]["sonnet"]])
+
     def test_server_rows_and_gateway_config_include_classifier(self):
         gpus = [planmod.GPU(i, "RTX 3090", 24576, 24000) for i in (0, 1)]
         p = planmod.plan(["q38"], gpus, 131072, slots=2,
@@ -184,8 +228,15 @@ class HarnessTests(unittest.TestCase):
             source = source[source.index("server_rows() {"):source.index("contains_claude_flag()")]
             result = subprocess.run(
                 ["bash", "-c", source + '\nPLAN_FILE="$1"; STATE_DIR="$2"; '
-                 'BACKENDS_TSV="$3"; server_rows; write_gateway_config; '
-                 'cat "$GATEWAY_CONFIG"', "claude-local",
+                 'BACKENDS_TSV="$3"; CLASSIFIER_REQUEST_MODELS=(claude-sonnet-5); '
+                 'server_rows; write_gateway_config; '
+                 'cat "$GATEWAY_CONFIG"; '
+                 'CACHE_DIR="$STATE_DIR"; PORT_BASE=19000; ALLOW_OFFLOAD=0; '
+                 'LLAMA_SERVER=unused; QWEN_TEMPLATE=unused; PIDS=(); '
+                 'say() { :; }; free_port() { echo "$1"; }; curl() { return 0; }; '
+                 'start_log_follower() { echo 0; }; stop_log_follower() { :; }; '
+                 'env() { printf "%s\\n" "$@" > "$STATE_DIR/args.${1#CUDA_VISIBLE_DEVICES=}"; }; '
+                 'start_backends; wait', "claude-local",
                  str(planfile), str(state), str(backends)],
                 text=True, capture_output=True, check=True,
             )
@@ -198,6 +249,27 @@ class HarnessTests(unittest.TestCase):
                              "http://127.0.0.1:19001")
             self.assertEqual(cfg["roles"]["sonnet"]["url"],
                              "http://127.0.0.1:19000")
+            self.assertEqual(cfg["models"]["claude-sonnet-5"]["backend_alias"],
+                             "local-classifier")
+            for gpu, context, slots in ((0, "262144", "2"), (1, "32768", "1")):
+                args = (state / f"args.{gpu}").read_text().splitlines()
+                self.assertEqual(args[args.index("-c")+1], context)
+                self.assertEqual(args[args.index("-np")+1], slots)
+
+    def test_classifier_requires_explicit_distinct_request_id(self):
+        for args in (
+            ["--local-classifier-model", "q38", "--local-classifier-gpu", "1"],
+            ["--local-classifier-request-model", "claude-sonnet-5"],
+            ["--local-classifier-model", "q38", "--local-classifier-gpu", "1",
+             "--local-classifier-request-model", "claude-sonnet-5", "--model", "sonnet"],
+            ["--local-slots", "0"],
+            ["--local-classifier-request-model"],
+        ):
+            with self.subTest(args=args):
+                result = subprocess.run(["bash", str(ROOT / "claude-local"), *args],
+                                        capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn("Installing", result.stdout)
 
 
 if __name__ == "__main__":

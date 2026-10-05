@@ -142,6 +142,102 @@ Unless `--local-no-teams` is supplied, the harness enables Claude Code's agent-t
 
 Claude Code remains the orchestrator. When it fans out, all agent API traffic returns to the same local gateway and therefore to the planned local GPUs.
 
+### Auto-mode classifier timeouts
+
+Auto permission mode adds inference requests to classify tool safety. A session,
+its agents, and the classifier can queue behind the same one-slot backend.
+Repeated timeouts do not establish that the server is down. A free second GPU
+does not help unless an independent server runs there and requests reach it.
+
+Choose one of these options; none silently authorizes a tool after classification
+fails:
+
+1. **Manual approval:** resume with `--permission-mode default` and explicitly
+   approve Bash actions. `--permission-mode acceptEdits` is another option for
+   editing workflows, but does not blanket-authorize Bash.
+2. **Dedicated backend:** reserve a physical GPU and route the classifier's
+   observed API model ID to an independent replica.
+3. **Shared capacity:** increase inference slots, retaining sufficient context
+   and VRAM for each slot. This reduces queueing but does not guarantee the
+   classifier's deadline.
+
+For manual approval:
+
+```bash
+claude-local qwen3.8:27b --resume --permission-mode default
+```
+
+For a dedicated classifier on physical GPU 1:
+
+```bash
+claude-local qwen3.8:27b \
+  --local-classifier-model qwen3.8:27b \
+  --local-classifier-gpu 1 \
+  --local-classifier-request-model claude-sonnet-5 \
+  --local-classifier-context 32768 \
+  --local-verbose \
+  --resume --permission-mode auto
+```
+
+**Verify the request ID for your Claude Code version first.** An Anthropic
+[maintainer response](https://github.com/anthropics/claude-code/issues/69002#issuecomment-5310942863)
+states that an arbitrary classifier-model override is not exposed; a
+[2.1.280 gateway report](https://github.com/anthropics/claude-code/issues/96411)
+observes `claude-sonnet-5`. This example is an explicit gateway model-ID mapping,
+not a supported Claude classifier-selection setting. No undocumented selector
+variable or prompt-text heuristic is used.
+
+Routing is **model-wide**, not classifier-purpose detection: any request using
+the configured ID reaches the classifier backend. The harness keeps session
+and built-in subagent models on their opaque local IDs and rejects `--model`
+when a dedicated classifier is configured. Custom agents must also avoid
+classifier request IDs. Repeat `--local-classifier-request-model` for multiple
+verified, distinct IDs if needed. IDs that collide with harness role IDs are
+rejected. If your version sends classification using the same opaque ID as the
+session, this mapping cannot isolate it safely; use manual approval or shared
+capacity instead. Recheck routing after CLI upgrades.
+
+The classifier GPU is excluded from the main planner before allocation. The
+classifier uses one slot and its own context; it remains a distinct
+`local-classifier` server even when its model matches the session's model.
+Repeated positional model arguments still share a server. The main model is
+planned on the remaining GPUs (GPU 0 on a two-GPU host); unavailable or
+insufficient classifier/main capacity aborts startup instead of sharing the
+reserved GPU. Use `--local-dry-run` with the same harness options to inspect
+placement without starting servers. Select a different registered
+`--local-classifier-model` to use a smaller model, but validate its safety
+classification quality and response compatibility before relying on it.
+
+For shared capacity:
+
+```bash
+claude-local qwen3.8:27b \
+  --local-slots 2 \
+  --local-context 131072 \
+  --local-client-context 100000 \
+  --resume --permission-mode auto
+```
+
+`--local-context` is the context **per slot**; the server receives aggregate
+context `context × slots`. The planner scales its existing memory envelope for
+that aggregate context. These are estimates, not measured KV/cache guarantees:
+verify runtime VRAM and avoid offload if responsiveness matters. The classifier
+keeps one slot when both options are combined. `CLAUDE_LOCAL_SLOTS` also sets the
+main slot count. Default tool concurrency is the sum of planned main slots,
+capped at four, excluding the classifier; explicitly set
+`CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY` to override it.
+
+With `--local-verbose`, gateway logs show requested model ID, resolved backend
+alias, endpoint, and path without recording prompts. Startup/dry-run output
+shows physical GPU placement, context per slot, and slot count. Compare idle
+and busy requests and inspect llama-server logs/metrics for slot occupancy.
+Check that classifier requests reach GPU 1 while session requests remain on
+their main backend, then exercise repeated classification under agent load.
+If the classifier fails, its HTTP error is returned; there is no alternate
+backend, cloud fallback, synthetic safety verdict, or automatic permission-mode
+change. A live GPU/Claude Code test is required to establish latency and safety
+compatibility; gateway unit tests alone cannot establish either.
+
 ## Useful commands
 
 ```bash

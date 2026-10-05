@@ -44,6 +44,8 @@ class Router:
             self.alias_map[route["model_id"].lower()] = route
             self.alias_map[role] = route
         for model, route in self.models.items():
+            if model.lower() in self.alias_map:
+                raise ValueError(f"additional model route conflicts with Claude role: {model}")
             self.alias_map[model.lower()] = route
 
     def resolve(self, model: str) -> dict:

@@ -317,7 +317,7 @@ The installed `claude-local` wrapper therefore defaults to:
 - a 15-minute stream-idle budget
 - only two API retries instead of repeatedly replaying an expensive local request
 - local subagent stall budget of 30 minutes
-- read-only/tool/subagent concurrency capped to the number of visible GPUs (max 4)
+- read-only/tool/subagent concurrency capped to planned main inference slots (max 4), excluding the classifier
 - one safe gateway retry only before an SSE response is committed downstream
 
 These can all be overridden with the corresponding Claude Code environment
@@ -328,6 +328,14 @@ If you use Claude Code's `auto` permission mode on a slow single-GPU local model
 remember that auto mode itself uses model-classified background safety checks.
 `default` or `acceptEdits` avoids adding that classifier traffic when you do not
 need it.
+
+For auto mode, `claude-local` supports an independent classifier backend on a
+reserved physical GPU (`--local-classifier-model`, `--local-classifier-gpu`,
+and explicit `--local-classifier-request-model` routing), or configurable shared
+capacity (`--local-slots`). Classifier routing is model-ID-wide, not automatic
+request-purpose detection, and must be verified against your CLI version.
+See [classifier timeout options and verification](CLAUDE_LOCAL.md#auto-mode-classifier-timeouts).
+No option silently authorizes Bash when classification fails.
 
 For a single RTX 3090, a smaller context is often a better responsiveness/reliability
 tradeoff than allocating 262K merely because it fits:
