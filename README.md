@@ -332,7 +332,9 @@ need it.
 For auto mode, `claude-local` supports an independent classifier backend on a
 reserved physical GPU (`--local-classifier-model`, `--local-classifier-gpu`,
 and explicit `--local-classifier-request-model` routing), or configurable shared
-capacity (`--local-slots`). Classifier routing is model-ID-wide, not automatic
+capacity (`--local-slots`, default **2** for every `claude-local` backend).
+Use `--local-slots 1` for lower-memory single-slot operation; context remains
+allocated per slot. Classifier routing is model-ID-wide, not automatic
 request-purpose detection, and must be verified against your CLI version.
 See [classifier timeout options and verification](CLAUDE_LOCAL.md#auto-mode-classifier-timeouts).
 No option silently authorizes Bash when classification fails.

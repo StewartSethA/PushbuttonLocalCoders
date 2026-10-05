@@ -490,7 +490,7 @@ def ordered_group_for_layer_split(candidate: Candidate, gpus: list[GPU]) -> list
 
 def plan(
     models: list[str], gpus: list[GPU], context: int, *,
-    slots: int = 1, classifier_model: str | None = None,
+    slots: int = 2, classifier_model: str | None = None,
     classifier_gpu: int | None = None, classifier_context: int = 32768,
 ) -> dict:
     if slots < 1 or context < 1 or classifier_context < 1:
@@ -502,7 +502,7 @@ def plan(
         reserved = [g for g in gpus if g.index == classifier_gpu]
         if not reserved:
             raise ValueError(f"classifier GPU {classifier_gpu} is not available")
-        classifier = plan([classifier_model], reserved, classifier_context)["servers"][0]
+        classifier = plan([classifier_model], reserved, classifier_context, slots=slots)["servers"][0]
         classifier["id"] = "local-classifier"
         gpus = [g for g in gpus if g.index != classifier_gpu]
     rm = role_map(models)
@@ -583,7 +583,7 @@ def main() -> int:
     lp.add_argument("models", nargs="*")
     lp.add_argument("--context", type=int, default=262144)
     lp.add_argument("--smart", action="store_true")
-    lp.add_argument("--slots", type=int, default=1)
+    lp.add_argument("--slots", type=int, default=2)
     lp.add_argument("--classifier-model")
     lp.add_argument("--classifier-gpu", type=int)
     lp.add_argument("--classifier-context", type=int, default=32768)

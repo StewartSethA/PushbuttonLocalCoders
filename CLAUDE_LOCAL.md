@@ -198,7 +198,7 @@ session, this mapping cannot isolate it safely; use manual approval or shared
 capacity instead. Recheck routing after CLI upgrades.
 
 The classifier GPU is excluded from the main planner before allocation. The
-classifier uses one slot and its own context; it remains a distinct
+classifier uses the configured slot count and its own per-slot context; it remains a distinct
 `local-classifier` server even when its model matches the session's model.
 Repeated positional model arguments still share a server. The main model is
 planned on the remaining GPUs (GPU 0 on a two-GPU host); unavailable or
@@ -208,7 +208,11 @@ placement without starting servers. Select a different registered
 `--local-classifier-model` to use a smaller model, but validate its safety
 classification quality and response compatibility before relying on it.
 
-For shared capacity:
+All `claude-local` backends default to **two inference slots**, including a
+dedicated classifier. Use `--local-slots 1` or `CLAUDE_LOCAL_SLOTS=1` to restore
+single-slot operation. An explicit `--local-slots` overrides the environment.
+
+For shared capacity with a smaller per-slot context:
 
 ```bash
 claude-local qwen3.8:27b \
@@ -221,9 +225,11 @@ claude-local qwen3.8:27b \
 `--local-context` is the context **per slot**; the server receives aggregate
 context `context × slots`. The planner scales its existing memory envelope for
 that aggregate context. These are estimates, not measured KV/cache guarantees:
-verify runtime VRAM and avoid offload if responsiveness matters. The classifier
-keeps one slot when both options are combined. `CLAUDE_LOCAL_SLOTS` also sets the
-main slot count. Default tool concurrency is the sum of planned main slots,
+verify runtime VRAM and avoid offload if responsiveness matters. Two slots retain
+full context per request, rather than sharing a fixed total KV budget; a 16 GB
+card may need a smaller context or the one-slot override to fit. The classifier
+uses the same slot count with its separate context budget. `CLAUDE_LOCAL_SLOTS`
+also sets the slot count for all backends. Default tool concurrency is the sum of planned main slots,
 capped at four, excluding the classifier; explicitly set
 `CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY` to override it.
 

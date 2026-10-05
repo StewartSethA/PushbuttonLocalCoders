@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 import importlib.util
+import contextlib
 import http.client
+import io
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -9,6 +12,7 @@ import tempfile
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -39,7 +43,7 @@ class PlannerTests(unittest.TestCase):
             planmod.GPU(0, "Tesla V100-SXM2-32GB", 32768, 32400, "7.0", "", 3, 16),
             planmod.GPU(1, "RTX 4060 Ti", 16380, 16000, "8.9", "", 2, 8),
         ]
-        p = planmod.plan(["q38", "q36"], gpus, 262144)
+        p = planmod.plan(["q38", "q36"], gpus, 262144, slots=1)
         by_model = {s["model"]: s for s in p["servers"]}
         self.assertEqual(by_model["qwen3.6:35b"]["cuda_visible_devices"], "0")
         self.assertEqual(by_model["qwen3.6:35b"]["profile"]["quant"], "UD-Q5_K_M")
@@ -48,8 +52,8 @@ class PlannerTests(unittest.TestCase):
 
     def test_full_context_4060ti_profiles(self):
         gpus = [planmod.GPU(0, "RTX 4060 Ti", 16380, 16100, "8.9", "", 4, 8)]
-        self.assertEqual(planmod.plan(["q38"], gpus, 262144)["servers"][0]["profile"]["quant"], "IQ3_XXS")
-        self.assertEqual(planmod.plan(["q36"], gpus, 262144)["servers"][0]["profile"]["quant"], "UD-IQ3_XXS")
+        self.assertEqual(planmod.plan(["q38"], gpus, 262144, slots=1)["servers"][0]["profile"]["quant"], "IQ3_XXS")
+        self.assertEqual(planmod.plan(["q36"], gpus, 262144, slots=1)["servers"][0]["profile"]["quant"], "UD-IQ3_XXS")
 
     def test_classifier_replica_reserves_gpu_even_for_same_model(self):
         gpus = [
@@ -61,7 +65,8 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(main["cuda_visible_devices"], "0")
         self.assertEqual(classifier["cuda_visible_devices"], "1")
         self.assertEqual(classifier["context"], 32768)
-        self.assertEqual(classifier["slots"], 1)
+        self.assertEqual(main["slots"], 2)
+        self.assertEqual(classifier["slots"], 2)
         self.assertEqual(p["classifier_id"], "local-classifier")
         self.assertNotEqual(p["role_ids"]["sonnet"], p["classifier_id"])
         self.assertEqual(p["unused_gpus"], [])
@@ -87,13 +92,35 @@ class PlannerTests(unittest.TestCase):
 
     def test_multiple_slots_budget_aggregate_context(self):
         gpus = [planmod.GPU(0, "RTX 3090", 24576, 24000)]
-        p = planmod.plan(["q38"], gpus, 262144, slots=2)
+        p = planmod.plan(["q38"], gpus, 262144)
         s = p["servers"][0]
         self.assertEqual(s["slots"], 2)
         self.assertEqual(s["context"], 262144)
         profile = next(x for x in planmod.PROFILES[s["model"]]
                        if x.quant == s["profile"]["quant"])
         self.assertGreater(s["required_mib"], profile.required_mib)
+
+    def test_one_slot_override_applies_to_classifier_too(self):
+        gpus = [planmod.GPU(i, "RTX 3090", 24576, 24000) for i in (0, 1)]
+        p = planmod.plan(["q38"], gpus, 131072, slots=1,
+                         classifier_model="q38", classifier_gpu=1)
+        self.assertTrue(all(s["slots"] == 1 for s in p["servers"]))
+
+    def test_planner_cli_defaults_and_override(self):
+        gpus = [planmod.GPU(0, "RTX 3090", 24576, 24000)]
+        for args, slots in (([], 2), (["--slots", "1"], 1)):
+            output = io.StringIO()
+            with mock.patch.object(planmod, "inventory", return_value=gpus), \
+                 mock.patch.object(sys, "argv", ["planner", "plan", "q38", *args]), \
+                 contextlib.redirect_stdout(output):
+                self.assertEqual(planmod.main(), 0)
+            self.assertEqual(json.loads(output.getvalue())["servers"][0]["slots"], slots)
+
+    def test_two_slots_fit_16gb_with_reduced_context(self):
+        gpus = [planmod.GPU(0, "RTX 4060 Ti", 16380, 16100)]
+        s = planmod.plan(["q38"], gpus, 131072)["servers"][0]
+        self.assertEqual(s["slots"], 2)
+        self.assertLessEqual(s["required_mib"], gpus[0].free_mib)
 
 
 class GatewayTests(unittest.TestCase):
@@ -190,6 +217,26 @@ class GatewayTests(unittest.TestCase):
 
 
 class HarnessTests(unittest.TestCase):
+    def test_harness_slot_default_environment_and_cli_override(self):
+        source = (ROOT / "claude-local").read_text()
+        initialization = source[source.index('STATE_DIR="${'):source.index("say() {")]
+        parsing = source[source.rindex("\nwhile (($#)); do\n"):
+                         source.index('\n[[ "$CTX" =~')]
+        for environment, args, expected in (
+            (None, [], "2"), ("1", [], "1"),
+            ("3", ["--local-slots", "1"], "1"),
+        ):
+            env = os.environ.copy()
+            env.pop("CLAUDE_LOCAL_SLOTS", None)
+            if environment is not None:
+                env["CLAUDE_LOCAL_SLOTS"] = environment
+            result = subprocess.run(
+                ["bash", "-c", initialization + parsing + '\necho "$SLOTS"',
+                 str(ROOT / "claude-local"), *args],
+                env=env, text=True, capture_output=True, check=True,
+            )
+            self.assertEqual(result.stdout.strip(), expected)
+
     def test_default_concurrency_counts_main_slots_not_classifier(self):
         gpus = [planmod.GPU(i, "RTX 3090", 24576, 24000) for i in (0, 1)]
         p = planmod.plan(["q38"], gpus, 131072, slots=2,
@@ -243,7 +290,7 @@ class HarnessTests(unittest.TestCase):
             rows = result.stdout.splitlines()
             main, classifier = [row.split("\x1f") for row in rows[:2]]
             self.assertEqual(main[-2:], ["131072", "2"])
-            self.assertEqual(classifier[-2:], ["32768", "1"])
+            self.assertEqual(classifier[-2:], ["32768", "2"])
             cfg = json.loads("\n".join(rows[2:]))
             self.assertEqual(cfg["models"]["local-classifier"]["url"],
                              "http://127.0.0.1:19001")
@@ -251,7 +298,7 @@ class HarnessTests(unittest.TestCase):
                              "http://127.0.0.1:19000")
             self.assertEqual(cfg["models"]["claude-sonnet-5"]["backend_alias"],
                              "local-classifier")
-            for gpu, context, slots in ((0, "262144", "2"), (1, "32768", "1")):
+            for gpu, context, slots in ((0, "262144", "2"), (1, "65536", "2")):
                 args = (state / f"args.{gpu}").read_text().splitlines()
                 self.assertEqual(args[args.index("-c")+1], context)
                 self.assertEqual(args[args.index("-np")+1], slots)

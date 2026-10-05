@@ -15,7 +15,7 @@ CACHE_DIR="${CLAUDE_LOCAL_CACHE:-$HOME/.cache/pushbutton/llama}"
 LOCK_FILE="${CLAUDE_LOCAL_LOCK_FILE:-$HOME/.local/share/pushbutton/claude-local/startup.lock}"
 CTX="${CLAUDE_LOCAL_CONTEXT:-262144}"
 CLIENT_CTX="${CLAUDE_LOCAL_CLIENT_CONTEXT:-200000}"
-SLOTS="${CLAUDE_LOCAL_SLOTS:-1}"
+SLOTS="${CLAUDE_LOCAL_SLOTS:-2}"
 CLASSIFIER_MODEL=""
 CLASSIFIER_GPU=""
 CLASSIFIER_CTX=32768
@@ -56,10 +56,10 @@ Harness options (put before ordinary Claude Code flags):
   --local-cache DIR          llama.cpp/Hugging Face model cache
   --local-context N          context per inference slot (default 262144)
   --local-client-context N   Claude Code budget (default 200000)
-  --local-slots N            inference slots per main backend (default 1)
+  --local-slots N            inference slots per backend, including classifier (default 2)
   --local-classifier-model M independent classifier model (may match main model)
   --local-classifier-gpu N   reserve physical GPU index N for classifier
-  --local-classifier-context N classifier context (default 32768; one slot)
+  --local-classifier-context N classifier context per slot (default 32768)
   --local-classifier-request-model ID route observed classifier ID (repeatable)
   --local-port-base N        starting port for gateway/backends
   --local-no-teams           disable experimental Claude agent teams

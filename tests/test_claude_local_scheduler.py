@@ -25,7 +25,7 @@ class SchedulerPolicyTests(unittest.TestCase):
             planmod.GPU(0, "RTX 4060 Ti", 16380, 15500, "8.9", "", 4, 8),
             planmod.GPU(1, "RTX 4060 Ti", 16380, 16000, "8.9", "", 2, 8),
         ]
-        p = planmod.plan(["q38"], gpus, 262144)
+        p = planmod.plan(["q38"], gpus, 262144, slots=1)
         self.assertEqual(p["servers"][0]["cuda_visible_devices"], "1")
         self.assertEqual(p["placement_policy"], "freest-then-link")
 
@@ -34,7 +34,7 @@ class SchedulerPolicyTests(unittest.TestCase):
             planmod.GPU(0, "RTX 4060 Ti", 16380, 16000, "8.9", "", 2, 8),
             planmod.GPU(1, "RTX 4060 Ti", 16380, 16000, "8.9", "", 4, 8),
         ]
-        p = planmod.plan(["q38"], gpus, 262144)
+        p = planmod.plan(["q38"], gpus, 262144, slots=1)
         self.assertEqual(p["servers"][0]["cuda_visible_devices"], "1")
 
     def test_inventory_uses_system_max_link_not_idle_current_link(self):
@@ -54,7 +54,7 @@ class SchedulerPolicyTests(unittest.TestCase):
             planmod.GPU(0, "Tesla V100-SXM2-32GB", 32768, 32400, "7.0", "", 3, 16),
             planmod.GPU(1, "RTX 4060 Ti", 16380, 16000, "8.9", "", 4, 8),
         ]
-        p = planmod.plan(["q38", "q36"], gpus, 262144)
+        p = planmod.plan(["q38", "q36"], gpus, 262144, slots=1)
         by_model = {s["model"]: s for s in p["servers"]}
         self.assertEqual(p["placement_policy"], "joint-global-plan")
         self.assertEqual(by_model["qwen3.6:35b"]["cuda_visible_devices"], "0")
