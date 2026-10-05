@@ -49,6 +49,121 @@ The positional mapping is:
 | 3 | #1 | #2 | #3 | #3 |
 | 4 | #1 | #2 | #3 | #4 |
 
+### Lightweight Haiku with Flash Next as Fable
+
+Yes: the fourth positional selector can be `qwen3.8-flash-next`. For example,
+this requests **four distinct models**, in Haiku / Sonnet / Opus / Fable order:
+
+```bash
+claude-local qwen3-4b-instruct-2507 qwen3.8:27b qwen3.6:35b qwen3.8-flash-next \
+  --local-startup-policy allow-cpu-only \
+  --local-memory-metadata /path/to/verified-memory.json \
+  --local-dry-run
+```
+
+This is a configuration example, **not a claim it fits two ordinary GPUs**.
+Four distinct GPU primaries cannot occupy two GPUs under exclusive placement.
+With calibrated CPU placements and sufficient non-swap RAM/CPU capacity, the
+planner can keep Sonnet on GPU and place other roles on CPU. Every GPU primary
+also needs a resident, same-model/same-quant CPU overflow replica.
+Neither GPU sharing nor a different-model universal fallback is enabled.
+
+Flash Next is not lightweight: its existing catalogue envelopes are
+**94–136 GiB at 262,144 tokens** (single native-context envelope). Two default
+slots at that context require **188–272 GiB** in the uncalibrated strict GPU
+planner, plus GPU reserves and an additional host staging envelope.
+Even its lowest tier does not fit two 24 GiB or two 32 GiB GPUs at one slot.
+Shorter contexts do not shrink these indivisible envelopes. If Sonnet and a
+dedicated classifier occupy the two GPUs, Flash Next must instead have a
+verified CPU-only placement. Its RAM footprint and long-context prefill/decode
+latency must be measured; a small active-parameter count does not remove the
+need to hold all expert weights. No production Flash Next CPU capacity or
+latency calibration is shipped here.
+
+A possible **six-server** role-only layout (no separate classifier) is:
+
+| Resident server | Device |
+|---|---|
+| Haiku: Qwen3 4B Instruct 2507 | CPU primary |
+| Sonnet: Qwen3.8 27B | GPU 0 primary |
+| Sonnet: identical quant/context | CPU overflow |
+| Opus: Qwen3.6 35B | GPU 1 primary |
+| Opus: identical quant/context | CPU overflow |
+| Fable: Qwen3.8 Flash Next | CPU primary |
+
+This is illustrative, not pinned: quality tiers, measured budgets and available
+hardware determine which secondary role receives GPU 1. RAM admission sums
+**all six** weights, per-slot caches and buffers (including GPU host allocations
+and loading/staging), plus the 1024 MiB host reserve. Identical replicas are
+budgeted separately; do not assume mmap sharing or count only the two GPU
+models. Each server still defaults to two slots; thread quotas cover all six.
+The synthetic unit-test calibrations demonstrate placement mechanics only,
+not these models' actual capacities.
+
+For a separate safety classifier, keep the same four positional selectors and
+add the existing explicit routing options before ordinary Claude Code flags:
+
+```bash
+  --local-classifier-model qwen3-4b-instruct-2507 \
+  --local-classifier-gpu 1 \
+  --local-classifier-context 32768 \
+  --local-classifier-request-model OBSERVED_DISTINCT_REQUEST_ID
+```
+
+This reserves GPU 1 for a **distinct** classifier primary, with its own CPU
+overflow. Sonnet is preferred on GPU 0; Haiku, Opus and Fable are CPU primaries.
+That is **seven resident servers**, not six: four role primaries, one classifier
+primary and two overflow replicas. The classifier's weights may match Haiku,
+but its server ID, slots and routes never merge with Haiku. Follow the request-ID
+verification procedure below; Haiku selection alone never redirects safety
+requests or changes permissions.
+
+### Qwen3 4B Instruct 2507 profiles and evidence
+
+`qwen3-4b-instruct-2507` (aliases `q3-4b`, `qwen3-4b-2507`,
+`qwen3:4b-instruct-2507`) is the **non-thinking Instruct-2507** checkpoint, not
+the earlier thinking/hybrid Qwen3-4B. Its native context is **262,144**, not 32K,
+so it can coexist with 262K Fable without introducing per-role context flags.
+The classifier retains its existing independent context option.
+
+| `hf_spec` | GGUF filename |
+|---|---|
+| `unsloth/Qwen3-4B-Instruct-2507-GGUF:Q5_K_M` | `Qwen3-4B-Instruct-2507-Q5_K_M.gguf` |
+| `unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_K_M` | `Qwen3-4B-Instruct-2507-Q4_K_M.gguf` |
+
+Q5 is considered before Q4; quality numbers are ordering tiers, not measured
+safety or coding accuracy. These profiles use upstream llama.cpp and the
+**embedded GGUF chat template**, not the Qwen3.8-specific fixed template.
+Validate tool-call/Anthropic-wire compatibility on the exact downloaded GGUF
+and current llama-server before relying on it for agent work.
+
+Sources: [official Qwen release/checkpoint](https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507),
+[GGUF repository](https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF),
+[Xinference catalogue](https://github.com/xorbitsai/inference/blob/603adda5c50ed3ca0ac1cfd57572f7817fd19fb4/doc/source/models/builtin/llm/qwen3-instruct.rst)
+lists 262144 context, both quant selectors and llama.cpp support;
+[pinned Q4 artifact manifest](https://github.com/AkshitIreddy/Interactive-LLM-Powered-NPCs/blob/146ea50af1cce11d12b8e0b640550923d7f96b0b/packaging/model-packs/qwen3-4b-instruct-2507-q4-k-m.json)
+records the exact filename, 2,497,281,120-byte file, non-thinking mode and 262144
+context; [Q5 filename evidence](https://github.com/Thireus/GGUF-Tool-Suite/blob/384c1f85b77b30f2b388328af278aea0900f6ca1/ppl_from_others.db)
+links the exact Unsloth Q5 artifact. These corroborating catalogues were accessible
+when direct Hugging Face DNS access was unavailable; they are not local hardware
+measurements or safety benchmarks.
+
+**No runtime memory envelope is inferred from that small weight file.**
+Both profiles expose `required_mib: null` and require explicit calibrated
+metadata for **GPU as well as CPU** placement. Long-context caches, two slots,
+buffers and staging can dominate weights. Supply entries for the exact quant
+and device modes needed by the chosen layout using the calibration format below.
+Legacy frontends reuse the shared aliases/catalogue but skip profiles without
+an envelope; they do not currently consume this strict calibration metadata.
+
+The 4B model is an **evaluation candidate**, not a proven Bash safety gate.
+Before enabling automatic permissions, evaluate held-out harmless and risky
+command *descriptions* without executing them: false approvals, false refusals,
+prompt-injection resistance, verdict-format compatibility and timeout/error
+behavior under concurrent agent load. Check both GPU and CPU classifier routes
+and keep failures closed. No measured safety advantage is asserted here; use
+manual approval until your exact model/quant/build passes your safety criteria.
+
 All ordinary Claude Code arguments are passed through:
 
 ```bash
@@ -134,12 +249,13 @@ include dense, MoE and recurrent caches, so evenly dividing weights by layer
 count or using an arbitrary weight/cache percentage is unsafe. CPU-only
 placements require `--local-memory-metadata FILE` (or
 `CLAUDE_LOCAL_MEMORY_METADATA`) containing explicit calibrated placements.
-Without it, GPU-only uses indivisible conservative catalogue envelopes:
+Without it, GPU-only uses available indivisible conservative catalogue envelopes:
 no context-based reduction, rounded-up aggregate-context envelope multiples,
 and a full additional host envelope for mapped weights/loading staging.
 This intentionally may reject otherwise workable GPU machines. It does not
 pretend the old envelopes are measured weights/cache/buffer components.
-The legacy Python planner functions used by other frontends remain unchanged.
+Profiles with no envelope (currently Qwen3 4B Instruct 2507) require calibration
+even for GPU-only; the legacy frontend planners skip them rather than guess.
 
 #### Calibration format
 

@@ -58,6 +58,7 @@ Model order:
   4 models: Haiku, Sonnet, Opus, Fable respectively
 
 Built-ins: nemotron-3.5-lightning qwen3.6:35b qwen3.8:27b glm-5.3-flash
+           qwen3.8-flash-next deepseek-v4-flash qwen3-4b-instruct-2507
 
 Harness options (put before ordinary Claude Code flags):
   --local-cache DIR          llama.cpp/Hugging Face model cache
@@ -73,7 +74,7 @@ Harness options (put before ordinary Claude Code flags):
   --local-keep-servers       leave model servers running after Claude exits
   --local-allow-offload      obsolete: rejected; use explicit startup policy
   --local-startup-policy P   gpu-only (default), allow-cpu-only (bounded overflow)
-  --local-memory-metadata F calibrated memory placements JSON (required for CPU)
+  --local-memory-metadata F calibrated placements JSON (required for CPU and Qwen3 4B)
   --local-min-quality N     minimum catalogue quality tier, 0..100
   --local-max-layouts N     bounded complete startup alternatives (default 3)
   --local-dry-run            show hardware/model plan only

@@ -31,6 +31,27 @@ gwmod = load("claude_local_gateway", ROOT / "lib" / "claude_local_gateway.py")
 
 
 class PlannerTests(unittest.TestCase):
+    def test_small_instruct_aliases_and_four_roles(self):
+        for alias in ("Qwen3-4B-Instruct-2507", "qwen3:4b-instruct-2507",
+                      "qwen3-4b-2507", "q3-4b"):
+            self.assertEqual(planmod.canonical_model(alias), "qwen3-4b-instruct-2507")
+        roles = planmod.role_map(["q3-4b", "q38", "q36", "q38next"])
+        self.assertEqual(list(roles.values()), [
+            "qwen3-4b-instruct-2507", "qwen3.8:27b",
+            "qwen3.6:35b", "qwen3.8-flash-next"])
+        profiles = planmod.PROFILES[roles["haiku"]]
+        self.assertEqual([p.hf_spec for p in profiles], [
+            "unsloth/Qwen3-4B-Instruct-2507-GGUF:Q5_K_M",
+            "unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_K_M"])
+        for profile in profiles:
+            self.assertEqual((profile.native_context, profile.template, profile.build),
+                             (262144, "embedded", "upstream"))
+            self.assertIsNone(profile.required_mib)
+            with self.assertRaisesRegex(ValueError, "calibrated"):
+                planmod.scaled_required_mib(profile, 32768)
+        # Shared legacy frontends must not interpret unknown capacity as zero.
+        self.assertIsNone(planmod.best_profile_for_capacity(roles["haiku"], 10**9, 262144))
+
     def test_role_mapping(self):
         self.assertEqual(planmod.role_map(["q38"])["fable"], "qwen3.8:27b")
         r = planmod.role_map(["nemotron", "q36", "q38", "glm53"])

@@ -224,6 +224,7 @@ The hardware-aware local planner currently knows these selectors:
 
 | Selector | Intended use |
 |---|---|
+| `qwen3-4b-instruct-2507` | Lightweight non-thinking Haiku evaluation candidate; `claude-local` GPU/CPU placement requires calibrated metadata |
 | `qwen3.8-flash-next` | Highest-end local coding agent; multi-GPU |
 | `qwen3.8:27b` | Strong dense coder; excellent single 24/32 GB GPU target |
 | `qwen3.6:35b` | Fast MoE coder; excellent V100/3090 target |
@@ -231,9 +232,15 @@ The hardware-aware local planner currently knows these selectors:
 | `deepseek-v4-flash` | Large high-quality agent model; multi-GPU |
 | `glm-5.3-flash` | Large alternate agent model; multi-GPU/forked llama.cpp path |
 
-Aliases such as `q38`, `q36`, `nemotron`, `deepseek`, and `glm` are also accepted.
+Aliases such as `q3-4b`, `q38`, `q36`, `nemotron`, `deepseek`, and `glm` are also accepted.
 Pushbutton chooses the actual quant based on live free VRAM and the requested
-worker layout.
+worker layout. The 4B profiles offer Q5_K_M/Q4_K_M at 262,144 native context,
+but deliberately have no guessed runtime envelope; legacy frontends skip them.
+See [the calibrated four-role example](CLAUDE_LOCAL.md#lightweight-haiku-with-flash-next-as-fable)
+for using Flash Next as Fable beside the lightweight Haiku. Flash Next's
+94–136 GiB native envelopes do **not** imply it fits two ordinary GPUs; CPU
+primaries/overflow require measured RAM budgets. Haiku is not automatically
+the safety classifier.
 
 ---
 

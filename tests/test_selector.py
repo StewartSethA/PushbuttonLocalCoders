@@ -1,4 +1,5 @@
-import json, os, pathlib, subprocess, sys, tempfile, unittest
+import contextlib, io, json, os, pathlib, runpy, subprocess, sys, tempfile, unittest
+from unittest import mock
 ROOT=pathlib.Path(__file__).resolve().parents[1]
 SEL=ROOT/'pushbutton-select'
 
@@ -29,6 +30,44 @@ class SelectorTests(unittest.TestCase):
         self.assertEqual(obj['model'],'qwen3.8:27b')
         self.assertEqual(obj['vram_limit_mib'],16384)
         self.assertEqual(obj['ram_limit_mib'],32768)
+
+    def test_calibration_only_explicit_requests_fail_cleanly(self):
+        for model in ('qwen3-4b-instruct-2507', 'q3-4b', 'qwen3:4b-instruct-2507'):
+            for output in ((), ('--json',)):
+                with self.subTest(model=model, output=output):
+                    cp=self.run_sel(model,'--vram-limit','128G','--ram-limit','256G',
+                                    '--no-interactive',*output,check=False)
+                    self.assertNotEqual(cp.returncode,0)
+                    self.assertIn('qwen3-4b-instruct-2507 requires calibrated memory metadata',cp.stderr)
+                    self.assertNotIn('Traceback',cp.stderr)
+                    self.assertNotIn('Recommended launch:',cp.stdout)
+                    self.assertEqual(cp.stdout,'')
+
+    def test_interactive_default_excludes_calibration_only_model(self):
+        selector=runpy.run_path(str(SEL))
+        out=io.StringIO()
+        with mock.patch('builtins.input',return_value=''), contextlib.redirect_stdout(out):
+            self.assertEqual(selector['model_menu'](),'qwen3.8:27b')
+        self.assertNotIn('qwen3-4b-instruct-2507',out.getvalue())
+        self.assertIn('  1. qwen3.8:27b',out.getvalue())
+
+    def test_interactive_explicit_calibration_alias_is_preserved(self):
+        selector=runpy.run_path(str(SEL))
+        with mock.patch('builtins.input',return_value='q3-4b'), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(selector['model_menu'](),'qwen3-4b-instruct-2507')
+
+    def test_rows_skip_uncalibrated_profiles_in_mixed_catalogue(self):
+        selector=runpy.run_path(str(SEL))
+        plan=selector['plan']
+        calibrated=plan.PROFILES['qwen3.8:27b'][-1]
+        uncalibrated=plan.PROFILES['qwen3-4b-instruct-2507'][0]
+        with mock.patch.dict(plan.PROFILES,{'mixed':(uncalibrated,calibrated)}), \
+             mock.patch.object(plan,'scaled_required_mib',wraps=plan.scaled_required_mib) as scale:
+            rows=selector['rows_for']('mixed',None,16384,32768,262144)
+        self.assertEqual(len(rows),1)
+        self.assertEqual(rows[0]['artifact'],calibrated.quant)
+        self.assertEqual(rows[0]['status'],'FIT')
+        scale.assert_called_once_with(calibrated,262144)
 
     def test_telemetry_is_explicit_opt_in(self):
         with tempfile.TemporaryDirectory() as td:

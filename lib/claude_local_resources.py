@@ -207,7 +207,7 @@ def startup_plan(base, models, gpus, context, *, slots=2, startup_policy="gpu-on
                                               mode, ram, vram, e))
                     if len(candidates) > 4096:
                         raise ValueError("too many startup placements; reduce GPUs/models/calibrations")
-            if not any(e["mode"] == "gpu" for e in calibrated):
+            if profile.required_mib is not None and not any(e["mode"] == "gpu" for e in calibrated):
                 # Legacy catalogue envelopes are indivisible, not 85/15
                 # weight/cache estimates. Do not extrapolate fallback from them.
                 envelope = profile.required_mib * max(1, math.ceil(ctx * slots / profile.native_context))
@@ -223,7 +223,7 @@ def startup_plan(base, models, gpus, context, *, slots=2, startup_policy="gpu-on
                         raise ValueError("too many startup placements; reduce GPUs/models/calibrations")
         if not candidates:
             raise ValueError(f"no safe {startup_policy} placement for {model}; provide calibrated "
-                             "memory metadata for fallback; context/slots/quality are never reduced")
+                             "memory metadata or sufficient GPU capacity; context/slots/quality are never reduced")
         options = []
         for candidate in candidates:
             if startup_policy == "allow-cpu-only" and candidate["mode"] == "gpu":

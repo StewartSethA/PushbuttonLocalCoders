@@ -6,7 +6,7 @@
       "source": "https://github.com/ggml-org/llama.cpp",
       "status": "baseline",
       "gpu_arch": ["sm70", "sm75", "sm80", "sm86", "sm89", "sm90"],
-      "models": ["qwen3.8:27b", "qwen3.8-flash-next"],
+      "models": ["qwen3.8:27b", "qwen3.8-flash-next", "qwen3-4b-instruct-2507"],
       "notes": "Portable baseline and fallback used by PushbuttonLocalCoders."
     },
     "llamampere": {

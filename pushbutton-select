@@ -18,7 +18,9 @@ ALIASES={'qwen38':'qwen3.8:27b','qwen3.8-27b':'qwen3.8:27b','q38':'qwen3.8:27b'}
 RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; BOLD='\033[1m'; RESET='\033[0m'
 def color(s,c): return f'{c}{s}{RESET}' if sys.stdout.isatty() else s
 
-def canon(x:str)->str:return ALIASES.get(x.lower(),x.lower())
+def canon(x:str)->str:
+ try:return plan.canonical_model(x)
+ except ValueError:return ALIASES.get(x.lower(),x.lower())
 def parse_mem(s:str|None)->int|None:
  if not s:return None
  m=re.fullmatch(r'\s*(\d+(?:\.\d+)?)\s*([GM]?)I?B?\s*',s,re.I)
@@ -66,10 +68,10 @@ def known_endpoints():
  return rows
 
 def model_menu():
- names=list(plan.PROFILES)
+ names=[m for m,ps in plan.PROFILES.items() if any(p.required_mib is not None for p in ps)]
  print('\nAvailable model families:')
  for i,m in enumerate(names,1):
-  profiles=plan.PROFILES[m]; q=profiles[0].quality if profiles else '-'
+  profiles=[p for p in plan.PROFILES[m] if p.required_mib is not None]; q=profiles[0].quality
   print(f' {i:>2}. {m:<26} best planner quality {q}')
  while True:
   s=input('Choose model [1]: ').strip() or '1'
@@ -106,6 +108,7 @@ def rows_for(model,gpu,cap,ram_cap,context):
  rows=[]; gpu_name=gpu.name if gpu else None
  if model in plan.PROFILES:
   for p in plan.PROFILES[model]:
+   if p.required_mib is None:continue
    req=plan.scaled_required_mib(p,context); ram_req=max(2048,int(req*.12))
    status='FIT'
    if cap is not None and req>cap:status='BLOCK'
@@ -126,6 +129,8 @@ def rows_for(model,gpu,cap,ram_cap,context):
   pp=(sm.get('pp') or {}).get('median'); tg=(sm.get('tg') or {}).get('median')
   evidence='MEASURED' if pp or tg else 'ESTIMATED'
   rows.append({'model':model,'backend':b,'artifact':d['artifact'],'req':hard,'ram_req':ram_req,'quality':d.get('quality','n/a'),'pp':pp,'tg':tg,'status':status,'note':d['note'],'evidence':evidence,'spread':sm,'local':any(r.get('source')=='local' for r in obs)})
+ if not rows and model in plan.PROFILES:
+  raise ValueError(f'{model} requires calibrated memory metadata; pushbutton-select cannot recommend uncalibrated profiles.')
  rank={'FIT':0,'UNVERIFIED':1,'BLOCK':2}
  rows.sort(key=lambda r:(rank[r['status']],0 if r['evidence']=='MEASURED' else 1,-(r['tg'] or -1),-(int(r['quality']) if str(r['quality']).isdigit() else -1)))
  return rows
@@ -189,7 +194,8 @@ def main():
  if model not in plan.PROFILES and not any(m==model for m,_ in UPSTREAM):raise SystemExit(f'unknown selector model {model}')
  if cap is None and gpu:cap=gpu.free_mib
  if ram_cap is None:_,ram_cap=ram_info()
- rs=rows_for(model,gpu,cap,ram_cap,a.context)
+ try:rs=rows_for(model,gpu,cap,ram_cap,a.context)
+ except ValueError as exc:raise SystemExit(f'pushbutton-select: {exc}') from None
  if a.json:
   print(json.dumps({'model':model,'gpu':None if gpu is None else gpu.__dict__,'ram_limit_mib':ram_cap,'vram_limit_mib':cap,'rows':rs,'resident':known_endpoints()},indent=2));return
  print_table(rs,gpu,cap,ram_cap)

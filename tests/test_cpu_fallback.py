@@ -130,6 +130,81 @@ class StartupPlannerTests(unittest.TestCase):
         self.assertEqual(by_model["qwen3.6:35b"]["mode"], "cpu")
         self.assertLessEqual(sum(s["threads"] for s in p["servers"]), 8)
 
+    def test_four_distinct_roles_two_gpus_and_classifier(self):
+        models = ["q3-4b", "q38", "q36", "q38next"]
+        entries = [calibration(model, mode) for model in models for mode in ("gpu", "cpu")]
+        p = self.plan(models, entries, context=262144, gpus=self.gpus[:2],
+                      classifier_model="q3-4b", classifier_gpu=1,
+                      startup_policy="allow-cpu-only")
+        primaries = {s["model"]: s for s in p["servers"]
+                     if not s["classifier"] and not s.get("fallback")}
+        self.assertEqual(len(primaries), 4)
+        self.assertEqual(len(set(p["role_ids"].values())), 4)
+        self.assertEqual(primaries[p["roles"]["sonnet"]]["cuda_visible_devices"], "0")
+        for role in ("haiku", "opus", "fable"):
+            self.assertEqual(primaries[p["roles"][role]]["mode"], "cpu")
+        classifier = next(s for s in p["servers"] if s["id"] == p["classifier_id"])
+        self.assertEqual(classifier["cuda_visible_devices"], "1")
+        self.assertNotEqual(classifier["id"], p["role_ids"]["haiku"])
+        self.assertEqual(classifier["model"], p["roles"]["haiku"])
+        self.assertEqual(classifier["context"], 32768)
+        self.assertEqual(len(p["servers"]), 7)
+        by_id = {s["id"]: s for s in p["servers"]}
+        for s in p["servers"]:
+            self.assertEqual(s["slots"], 2)
+            self.assertIn("test fixture; not production", s["estimate_source"])
+            if not s["classifier"]:
+                self.assertEqual(s["context"], 262144)
+            if s["mode"] == "gpu":
+                replica = by_id[s["fallback_id"]]
+                self.assertEqual(replica["mode"], "cpu")
+                for field in ("model", "context", "slots", "classifier"):
+                    self.assertEqual(replica[field], s[field])
+                self.assertEqual(replica["profile"]["hf_spec"], s["profile"]["hf_spec"])
+        self.assertEqual(p["ram_required_mib"], sum(s["ram_required_mib"] for s in p["servers"]))
+        self.assertLessEqual(sum(s["threads"] for s in p["servers"]), 8)
+
+    def test_four_roles_without_classifier_have_six_servers(self):
+        models = ["q3-4b", "q38", "q36", "q38next"]
+        entries = [calibration(model, mode) for model in models for mode in ("gpu", "cpu")]
+        p = self.plan(models, entries, gpus=self.gpus[:2], startup_policy="allow-cpu-only")
+        self.assertEqual(len(p["servers"]), 6)
+        self.assertIsNone(p["classifier_id"])
+        self.assertEqual(sum(s["mode"] == "gpu" for s in p["servers"]), 2)
+        self.assertEqual(sum(bool(s.get("fallback")) for s in p["servers"]), 2)
+        self.assertEqual(len(set(p["role_ids"].values())), 4)
+
+    def test_small_model_requires_calibration_even_on_large_gpu(self):
+        for policy in ("gpu-only", "allow-cpu-only"):
+            with self.subTest(policy=policy), self.assertRaisesRegex(ValueError, "calibrated"):
+                resources.startup_plan(base, ["q3-4b"], [base.GPU(0, "fixture", 10**9, 10**9)],
+                                       262144, host=self.host, startup_policy=policy)
+
+    def test_small_model_both_quants_and_context_limit(self):
+        for profile in base.PROFILES[base.canonical_model("q3-4b")]:
+            entries = [calibration("q3-4b", mode, hf_spec=profile.hf_spec)
+                       for mode in ("gpu", "cpu")]
+            with self.subTest(quant=profile.quant):
+                p = self.plan(["q3-4b"], entries, context=262144,
+                              startup_policy="allow-cpu-only")
+                self.assertEqual([s["profile"]["hf_spec"] for s in p["servers"]],
+                                 [profile.hf_spec, profile.hf_spec])
+                self.assertEqual(p["servers"][0]["fallback_id"], p["servers"][1]["id"])
+                cpu = self.plan(["q3-4b"], entries, context=262144, gpus=[],
+                                startup_policy="allow-cpu-only")
+                self.assertEqual(len(cpu["servers"]), 1)
+                self.assertEqual(cpu["servers"][0]["mode"], "cpu")
+                self.assertEqual(cpu["servers"][0]["profile"]["hf_spec"], profile.hf_spec)
+                with self.assertRaisesRegex(ValueError, "no safe"):
+                    self.plan(["q3-4b"], entries, context=262145,
+                              startup_policy="allow-cpu-only")
+
+    def test_flash_next_catalogue_does_not_fit_two_24g_gpus(self):
+        with self.assertRaisesRegex(ValueError, "no safe"):
+            resources.startup_plan(base, ["q38next"],
+                                   [base.GPU(i, "fixture 24G", 24576, 24576) for i in range(2)],
+                                   262144, host=self.host)
+
     def test_joint_ram_budget_rejects_individually_fitting_models(self):
         host = resources.Host(7000, 7000, 7000, tuple(range(8)), 8, (), 1000)
         with self.assertRaisesRegex(ValueError, "joint RAM"):
@@ -518,6 +593,37 @@ class LauncherFallbackTests(unittest.TestCase):
     def source(self, start, end):
         source = (ROOT / "claude-local").read_text()
         return source[source.index(start):source.index(end)]
+
+    def test_four_role_gateway_config_keeps_classifier_explicit(self):
+        models = ["q3-4b", "q38", "q36", "q38next"]
+        p = resources.startup_plan(
+            base, models, [base.GPU(i, "fixture GPU", 12000, 11000) for i in range(2)],
+            262144, startup_policy="allow-cpu-only", classifier_model="q3-4b",
+            classifier_gpu=1, host=resources.Host(64000, None, 64000, tuple(range(8)), 8, ()),
+            metadata={"version": 1, "placements": [
+                calibration(model, mode) for model in models for mode in ("gpu", "cpu")]})
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            state = pathlib.Path(directory)
+            (state / "plan.json").write_text(json.dumps(p))
+            (state / "backends.tsv").write_text("".join(
+                f"{s['id']}\t{19000+i}\n" for i, s in enumerate(p["servers"])))
+            script = self.source("write_gateway_config() {", "start_gateway() {")
+            result = subprocess.run(["bash", "-c", script + '''
+STATE_DIR="$1"; PLAN_FILE="$1/plan.json"; BACKENDS_TSV="$1/backends.tsv";
+CLASSIFIER_REQUEST_MODELS=(observed-safety-id);
+write_gateway_config
+cat "$GATEWAY_CONFIG"
+''', "test", directory], capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            router = gateway.Router(json.loads(result.stdout))
+            for role, mid in p["role_ids"].items():
+                self.assertEqual(router.resolve(role)["backend_alias"], mid)
+                self.assertEqual(router.resolve("claude-" + role + "-5")["backend_alias"], mid)
+            classifier = router.resolve("observed-safety-id")
+            self.assertEqual(classifier["backend_alias"], "local-classifier")
+            self.assertEqual(classifier["cpu_fallback"]["backend_alias"], "local-classifier-cpu")
+            self.assertNotEqual(classifier["url"], router.resolve("haiku")["url"])
+            self.assertNotEqual(classifier["url"], router.resolve("sonnet")["url"])
 
     def test_cancel_exits_without_retry_and_holds_lock_through_teardown(self):
         import fcntl

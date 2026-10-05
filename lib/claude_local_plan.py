@@ -75,7 +75,7 @@ class Profile:
     display: str
     repo: str
     quant: str
-    required_mib: int
+    required_mib: int | None
     quality: int
     native_context: int = 262144
     kv_k: str = "q4_0"
@@ -94,6 +94,9 @@ class Profile:
 
 
 ALIASES = {
+    "qwen3-4b-instruct-2507": "qwen3-4b-instruct-2507",
+    "qwen3:4b-instruct-2507": "qwen3-4b-instruct-2507",
+    "qwen3-4b-2507": "qwen3-4b-instruct-2507", "q3-4b": "qwen3-4b-instruct-2507",
     "qwen3.8:27b": "qwen3.8:27b", "qwen3.8-27b": "qwen3.8:27b", "q38": "qwen3.8:27b",
     "qwen3.8": "qwen3.8:27b", "qwen38": "qwen3.8:27b",
     "qwen3.8-flash-next": "qwen3.8-flash-next", "qwen3.8:flash-next": "qwen3.8-flash-next",
@@ -111,7 +114,18 @@ ALIASES = {
 # required_mib includes model weights, full native context at the listed KV
 # quant, compute buffers, and a modest CUDA safety margin. Profiles are ordered
 # best quality first. Values are conservative planning envelopes, not promises.
+# None means calibration is required; file size alone is not a runtime envelope.
 PROFILES: dict[str, tuple[Profile, ...]] = {
+    "qwen3-4b-instruct-2507": (
+        Profile("qwen3-4b-instruct-2507", "Qwen3 4B Instruct 2507",
+                "unsloth/Qwen3-4B-Instruct-2507-GGUF", "Q5_K_M", None, 97,
+                native_context=262144, kv_k="f16", kv_v="f16",
+                note="non-thinking Haiku evaluation candidate; GPU/CPU memory calibration required"),
+        Profile("qwen3-4b-instruct-2507", "Qwen3 4B Instruct 2507",
+                "unsloth/Qwen3-4B-Instruct-2507-GGUF", "Q4_K_M", None, 95,
+                native_context=262144, kv_k="f16", kv_v="f16",
+                note="smaller Haiku evaluation candidate; not a validated safety classifier; calibration required"),
+    ),
     "qwen3.8:27b": (
         Profile("qwen3.8:27b", "Qwen3.8 27B", "unsloth/Qwen3.8-27B-GGUF", "Q8_0", 35*1024, 100, template="qwen-fixed"),
         Profile("qwen3.8:27b", "Qwen3.8 27B", "unsloth/Qwen3.8-27B-GGUF", "UD-Q6_K", 28*1024, 98, template="qwen-fixed"),
@@ -285,6 +299,8 @@ class Candidate:
 
 
 def scaled_required_mib(profile: Profile, context: int) -> int:
+    if profile.required_mib is None:
+        raise ValueError(f"{profile.hf_spec} requires calibrated memory metadata")
     # Most of required_mib is immutable model weight. Shorter context can only
     # reduce the context-dependent fraction, capped here at 15% conservatively.
     # Additional inference slots increase aggregate context beyond native_context.
@@ -302,6 +318,8 @@ def best_profile_for_capacity(
     model: str, capacity_mib: int, context: int
 ) -> tuple[Profile, int] | None:
     for profile in PROFILES[model]:
+        if profile.required_mib is None:
+            continue
         req = scaled_required_mib(profile, context)
         if req <= capacity_mib:
             return profile, req
