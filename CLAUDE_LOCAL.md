@@ -62,15 +62,15 @@ Harness-specific flags must appear before the first ordinary Claude Code flag.
 
 ## Hardware planner
 
-The planner inventories every visible NVIDIA GPU independently, including free VRAM, compute capability, PCIe generation, and link width. It then:
-
-1. Allocates the Sonnet/daily-driver model first.
-2. Prefers the smallest GPU count that can run a high-quality full-context quant, reducing PCIe traffic and preserving other GPUs for concurrent agents.
-3. Selects the highest-quality registered quant within that device-count tier.
-4. Gives each concurrently served unique model an exclusive GPU set by default; it does not intentionally overcommit VRAM.
-5. Uses layer splitting when a model must span GPUs.
-6. On a heterogeneous layer split, places the slowest PCIe endpoint at an edge rather than between faster cards.
-7. Builds CUDA for all compute capabilities in the plan, so mixed Volta/Ada hosts can use one compatible build.
+The launcher inventories free GPU VRAM, compute capability and PCIe links, plus
+Linux `MemAvailable`, remaining visible cgroup v1/v2 memory limits (including
+ancestors), CPU affinity/quota and NUMA CPU lists. Swap is **never** capacity.
+Host capacity is the minimum of MemAvailable and cgroup remaining memory.
+Complete layouts jointly reserve RAM, disjoint GPU sets and CPU thread budgets
+for **every** server, including a separate same-model classifier replica.
+The planner keeps the daily driver and classifier on GPUs preferentially;
+secondary workers can move to CPU when permitted. NUMA information is reported,
+not automatically pinned: local memory bandwidth and placement remain relevant.
 
 The default physical context is **262,144 tokens**. The default Claude Code client budget is **200,000 tokens**, leaving physical headroom for large tool results and token-accounting differences before the backend ceiling.
 
@@ -79,6 +79,140 @@ Run a dry plan before downloading anything:
 ```bash
 claude-local qwen3.6:35b qwen3.8:27b --local-dry-run
 ```
+
+### Explicit CPU fallback policies
+
+`--local-startup-policy` (or `CLAUDE_LOCAL_STARTUP_POLICY`) selects:
+
+| Policy | Permitted complete layouts |
+|---|---|
+| `gpu-only` (default) | Every server fully GPU-offloaded |
+| `allow-hybrid` | GPU/CPU layer splits and CPU secondary servers; at least one GPU server |
+| `allow-cpu-only` | The above, plus an entirely CPU-hosted layout |
+
+The requested model identities, per-slot contexts and slot counts are never
+silently reduced. Quant selection remains catalogue-based. Set
+`--local-min-quality N` (`CLAUDE_LOCAL_MIN_QUALITY`, default 0) to reject catalogue
+tiers below N; scores are ordinal tiers, **not** measured accuracy percentages.
+Fallback is not a reason to use a less capable model or change safety routing.
+
+CPU-only startup needs neither NVIDIA tools nor a CUDA toolkit. It builds a
+separate `build-cpu` with `GGML_CUDA=OFF`; mixed layouts use the CUDA build,
+but CPU servers explicitly receive `-ngl 0 --device none --no-kv-offload`.
+Every server gets the planned layer count, cache types, batch sizes and
+`-t`/`-tb` thread budgets. `--fit off` disables llama.cpp's automatic parameter
+adjustment. Required options are checked against the actual binary's help;
+older binaries/forks that lack them must be rebuilt or are rejected.
+
+**No built-in CPU/hybrid capacities are fabricated.** These model architectures
+include dense, MoE and recurrent caches, so evenly dividing weights by layer
+count or using an arbitrary weight/cache percentage is unsafe. CPU/hybrid
+placements require `--local-memory-metadata FILE` (or
+`CLAUDE_LOCAL_MEMORY_METADATA`) containing explicit calibrated placements.
+Without it, GPU-only uses indivisible conservative catalogue envelopes:
+no context-based reduction, rounded-up aggregate-context envelope multiples,
+and a full additional host envelope for mapped weights/loading staging.
+This intentionally may reject otherwise workable GPU machines. It does not
+pretend the old envelopes are measured weights/cache/buffer components.
+The legacy Python planner functions used by other frontends remain unchanged.
+
+#### Calibration format
+
+An existing JSON file must have `{"version": 1, "placements": [...]}`.
+Each placement is model/quant-specific (`hf_spec` exactly matches `models`
+output) and must provide all of:
+
+```json
+{
+  "hf_spec": "unsloth/Qwen3.8-27B-GGUF:Q8_0",
+  "source": "REPLACE with GGUF identity, llama.cpp commit, hardware and measured evidence",
+  "mode": "cpu",
+  "layer_count": 64,
+  "ngl": 0,
+  "weights_host_mib": 0,
+  "weights_gpu_mib": 0,
+  "cache_host_mib_per_token": 0,
+  "cache_gpu_mib_per_token": 0,
+  "buffer_host_mib": 0,
+  "buffer_gpu_mib": 0,
+  "max_context": 262144,
+  "max_slots": 2,
+  "max_threads": 8,
+  "batch": 512,
+  "ubatch": 256,
+  "kv_k": "f16",
+  "kv_v": "f16",
+  "flash_attn": "off"
+}
+```
+
+**This is a schema illustration, not a runnable calibration:** zero weights
+are rejected and the layer count is illustrative. Obtain actual GGUF metadata
+and measured conservative upper bounds for your exact quant/build/hardware.
+The harness trusts explicitly supplied calibration, not the illustrative values.
+Include mapped GGUF pages, transient loading/staging allocations, CPU repacking,
+recurrent state, compute/workspace, allocator overhead and concurrent-slot peaks.
+Fixed or non-linear cache/state belongs in buffer bounds; a per-token cache
+coefficient is only valid over a verified context/slot range. Bind evidence to
+exact model files and re-calibrate after model or llama.cpp changes.
+
+For each host/device, budget is `weights + buffer + context * slots *
+cache_mib_per_token`, rounded up. Host reserve is 1024 MiB; each GPU retains
+512 MiB. These margins are not a guarantee against unrelated processes.
+`max_context`, `max_slots` and `max_threads` bound validity of the calibration;
+batch/ubatch and cache/FA settings are launched exactly. GPU placements must
+offload all layers including output; hybrid uses explicit partial `ngl`.
+CPU/hybrid cache types currently require f16: **CPU cache quantization and
+GPU-weights/CPU-cache-only placement are deferred**. Hybrid cache follows layer
+placement; no guessed uniform layer distribution is used. Calibrated
+GPU/hybrid entries currently support a single GPU per server; legacy
+GPU-only envelopes can still span disjoint GPU sets.
+
+For an actual calibrated CPU machine:
+
+```bash
+claude-local q38 --local-startup-policy allow-cpu-only \
+  --local-memory-metadata /path/to/verified-memory.json \
+  --local-min-quality 95 --local-dry-run
+```
+
+A distinct classifier may omit `--local-classifier-gpu` only under a fallback
+policy. The planner then prefers GPU placement but may use a calibrated CPU
+replica. An explicit physical classifier GPU remains reserved and is **never**
+moved to CPU. Observed classifier request IDs are still mandatory and cannot
+override a session route; failed classifications are never synthesized.
+
+### Startup validation and latency limits
+
+Startup tries up to `--local-max-layouts N` (`CLAUDE_LOCAL_MAX_LAYOUTS`,
+default 3, maximum 8) complete pre-budgeted alternatives, with the same models,
+contexts, slots and quality floor. There are no per-server ad-hoc downgrades.
+Failed layouts are fully stopped and reaped before another starts, even with
+`--local-keep-servers`; the gateway and Claude launch only after acceptance.
+Readiness is bounded by `CLAUDE_LOCAL_STARTUP_TIMEOUT` (default 1800 seconds
+per layout). Once **all** servers are healthy, concurrent real one-token
+inference warmups cover every server/slot, including the classifier, followed
+by resident RAM, cgroup/host remaining memory and GPU allocation checks.
+The loader's actual `offloaded N/M layers to GPU` report must confirm full
+GPU or the exact calibrated hybrid layer count; an unnoticed CPU execution
+cannot satisfy `gpu-only`. Missing/incompatible GPU load reports fail closed.
+Live RAM/VRAM/CPU admission is rechecked after provisioning and before each
+layout allocates memory, refreshing GPU usage baselines.
+`CLAUDE_LOCAL_WARMUP_TIMEOUT` defaults to 120 seconds for the whole warmup;
+both deadlines accept 1..3600 seconds. Builds/download provisioning is separate
+from the backend readiness deadline. Strict search is bounded to 16 GPUs,
+4096 candidates per server, 200,000 enumeration/search steps and 64 aggregate
+warmup slots. When available, attempts reserve one layout for each stage:
+fully GPU, mixed CPU/GPU, then fully CPU.
+
+Warmup verifies inference and allocation, **not** full-context throughput,
+model correctness, classifier prompt quality, or production latency. CPU
+weights can be extremely slow, even for MoE models; long prefills, two concurrent
+slots, shared memory bandwidth and NUMA effects can exceed interactive or
+safety-classifier deadlines. There are no benchmark-derived latency promises.
+Test representative real requests locally before relying on auto mode;
+manual approval is safer than a classifier configuration that times out.
+No live GPU/CPU model benchmarks are implied by planner regression tests.
 
 ## Built-in model selectors
 
@@ -103,7 +237,9 @@ A working NVIDIA driver is reused. If NVIDIA hardware is present on Ubuntu but `
 
 The CUDA toolkit is independent of the driver. If suitable `nvcc` is absent, the harness installs a private toolkit under its state directory using micromamba. Legacy architectures such as V100/SM70 use CUDA 12.8; newer NVIDIA cards use CUDA 12.9. A mixed V100 + Ada plan therefore builds a binary containing both SM70 and SM89 without replacing the host driver.
 
-Automatic CUDA unified-memory spill is disabled by default because it can destroy interactive decode performance. `--local-allow-offload` enables it as an emergency safety net, but the planner still does not deliberately choose an overcommitted plan.
+CUDA unified-memory spill is disabled. The legacy `--local-allow-offload`
+option is rejected: use an explicit startup policy and calibrated CPU-layer
+placement instead of unbudgeted spill.
 
 ## Model cache
 

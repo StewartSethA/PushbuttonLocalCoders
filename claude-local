@@ -22,6 +22,13 @@ CLASSIFIER_CTX=32768
 CLASSIFIER_REQUEST_MODELS=()
 PORT_BASE="${CLAUDE_LOCAL_PORT_BASE:-18180}"
 ALLOW_OFFLOAD=0
+STARTUP_POLICY="${CLAUDE_LOCAL_STARTUP_POLICY:-gpu-only}"
+MEMORY_METADATA="${CLAUDE_LOCAL_MEMORY_METADATA:-}"
+MIN_QUALITY="${CLAUDE_LOCAL_MIN_QUALITY:-0}"
+MAX_LAYOUTS="${CLAUDE_LOCAL_MAX_LAYOUTS:-3}"
+STARTUP_TIMEOUT="${CLAUDE_LOCAL_STARTUP_TIMEOUT:-1800}"
+WARMUP_TIMEOUT="${CLAUDE_LOCAL_WARMUP_TIMEOUT:-120}"
+STARTUP_COMPLETE=0
 KEEP_SERVERS=0
 ENABLE_TEAMS=1
 DRY_RUN=0
@@ -58,13 +65,17 @@ Harness options (put before ordinary Claude Code flags):
   --local-client-context N   Claude Code budget (default 200000)
   --local-slots N            inference slots per backend, including classifier (default 2)
   --local-classifier-model M independent classifier model (may match main model)
-  --local-classifier-gpu N   reserve physical GPU index N for classifier
+  --local-classifier-gpu N   reserve physical GPU N (required in gpu-only mode)
   --local-classifier-context N classifier context per slot (default 32768)
   --local-classifier-request-model ID route observed classifier ID (repeatable)
   --local-port-base N        starting port for gateway/backends
   --local-no-teams           disable experimental Claude agent teams
   --local-keep-servers       leave model servers running after Claude exits
-  --local-allow-offload      allow CUDA unified-memory spill (slow; default off)
+  --local-allow-offload      obsolete: rejected; use explicit startup policy
+  --local-startup-policy P   gpu-only (default), allow-hybrid, allow-cpu-only
+  --local-memory-metadata F calibrated memory placements JSON (required for CPU)
+  --local-min-quality N     minimum catalogue quality tier, 0..100
+  --local-max-layouts N     bounded complete startup alternatives (default 3)
   --local-dry-run            show hardware/model plan only
   --local-verbose            verbose local gateway logging
   --                         stop harness parsing; pass rest to Claude Code
@@ -78,6 +89,7 @@ EOF
 require_files() {
     [[ -f "$PLAN_PY" ]] || die "missing $PLAN_PY"
     [[ -f "$GATEWAY_PY" ]] || die "missing $GATEWAY_PY"
+    [[ -f "$LIB/claude_local_resources.py" && -f "$LIB/claude_local_validate.py" ]] || die "missing startup resource/validation modules"
 }
 
 base_deps_missing() {
@@ -276,14 +288,21 @@ PY
 
 ensure_llamacpp() {
     local kind arches src build repo ref
-    kind="$(build_kind)"; arches="$(inventory_arches)"; [[ -n "$arches" ]] || arches=native
+    kind="$(build_kind)"; arches="$(inventory_arches)"
+    local cuda=OFF
+    if plan_uses_gpu; then
+        cuda=ON; [[ -n "$arches" ]] || arches=native
+        prepare_host_compiler; activate_cuda
+    fi
     if [[ "$kind" == glm53 ]]; then
         src="$STATE_DIR/llama.cpp-glm53"; repo=https://github.com/unslothai/llama.cpp.git; ref=glm5next/upstream
     else
         src="$STATE_DIR/llama.cpp"; repo=https://github.com/ggml-org/llama.cpp.git; ref=master
     fi
-    build="$src/build-cuda-${arches//;/_}"; LLAMA_SERVER="$build/bin/llama-server"
-    [[ -x "$LLAMA_SERVER" && "${CLAUDE_LOCAL_REBUILD:-0}" != 1 ]] && { say "Using existing CUDA llama.cpp: $LLAMA_SERVER"; return; }
+    build="$src/build-cpu"
+    [[ "$cuda" == ON ]] && build="$src/build-cuda-${arches//;/_}"
+    LLAMA_SERVER="$build/bin/llama-server"
+    [[ -x "$LLAMA_SERVER" && "${CLAUDE_LOCAL_REBUILD:-0}" != 1 ]] && { say "Using existing llama.cpp: $LLAMA_SERVER"; return; }
     if [[ -d "$src/.git" ]]; then
         say "Updating llama.cpp ($kind)..."
         git -C "$src" fetch --depth=1 origin "$ref:refs/remotes/origin/$ref"
@@ -292,12 +311,15 @@ ensure_llamacpp() {
     else
         say "Cloning llama.cpp ($kind)..."; git clone --depth=1 --branch "$ref" "$repo" "$src"
     fi
-    local -a cmake_args=(-DGGML_CUDA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON -DGGML_CUDA_PEER_MAX_BATCH_SIZE=8192 -DLLAMA_OPENSSL=ON -DCMAKE_BUILD_TYPE=Release "-DCMAKE_CUDA_ARCHITECTURES=$arches")
-    [[ -n "${CUDA_ROOT:-}" ]] && cmake_args+=("-DCMAKE_CUDA_COMPILER=$CUDA_ROOT/bin/nvcc" "-DCUDAToolkit_ROOT=$CUDA_ROOT")
-    say "Building CUDA llama.cpp for SM: $arches"
-    cmake -S "$src" -B "$build" -G Ninja "${cmake_args[@]}"
-    cmake --build "$build" --target llama-server llama-bench -j"$(nproc)"
-    [[ -x "$LLAMA_SERVER" ]] || die "CUDA llama-server build failed"
+    local -a cmake_args=("-DGGML_CUDA=$cuda" -DLLAMA_OPENSSL=ON -DCMAKE_BUILD_TYPE=Release)
+    if [[ "$cuda" == ON ]]; then
+        cmake_args+=(-DGGML_CUDA_FA_ALL_QUANTS=ON -DGGML_CUDA_PEER_MAX_BATCH_SIZE=8192 "-DCMAKE_CUDA_ARCHITECTURES=$arches")
+        [[ -n "${CUDA_ROOT:-}" ]] && cmake_args+=("-DCMAKE_CUDA_COMPILER=$CUDA_ROOT/bin/nvcc" "-DCUDAToolkit_ROOT=$CUDA_ROOT")
+    fi
+    say "Building llama.cpp (CUDA=$cuda, SM=${arches:-none})"
+    cmake -S "$src" -B "$build" -G Ninja "${cmake_args[@]}" || return 1
+    cmake --build "$build" --target llama-server llama-bench -j"$(nproc)" || return 1
+    [[ -x "$LLAMA_SERVER" ]] || { warn "llama-server build failed"; return 1; }
 }
 
 fetch_qwen_template() {
@@ -311,9 +333,21 @@ fetch_qwen_template() {
 
 cleanup() {
     release_startup_lock
-    [[ $KEEP_SERVERS -eq 1 ]] && return 0
+    [[ $KEEP_SERVERS -eq 1 && $STARTUP_COMPLETE -eq 1 ]] && return 0
+    stop_layout
+}
+
+stop_layout() {
     local p
-    for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done
+    for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null || true; done
+    # A failed layout must release every allocation before the next is started.
+    for p in "${PIDS[@]}"; do
+        local waited=0
+        while kill -0 "$p" 2>/dev/null && (( waited < 10 )); do sleep 1; waited=$((waited+1)); done
+        kill -0 "$p" 2>/dev/null && kill -KILL "$p" 2>/dev/null || true
+        wait "$p" 2>/dev/null || true
+    done
+    PIDS=()
 }
 trap cleanup EXIT INT TERM
 
@@ -323,7 +357,7 @@ import json,sys
 sep='\x1f'
 for s in json.load(open(sys.argv[1]))['servers']:
  x=s['profile']; env=';'.join(f'{k}={v}' for k,v in x.get('extra_env',{}).items())
- print(sep.join(map(str,[s['id'],x['hf_spec'],s['cuda_visible_devices'],int(s['multi_gpu']),x['kv_k'],x['kv_v'],x['batch'],x['ubatch'],x['flash_attn'],x['template'],env,x.get('note',''),s['context'],s['slots']])))
+ print(sep.join(map(str,[s['id'],x['hf_spec'],s['cuda_visible_devices'],int(s['multi_gpu']),x['kv_k'],x['kv_v'],x['batch'],x['ubatch'],x['flash_attn'],x['template'],env,x.get('note',''),s.get('ngl',999),s.get('threads',1),s.get('threads_batch',1),int(s.get('cache_on_cpu',False)),s['context'],s['slots']])))
 PY
 }
 
@@ -353,19 +387,22 @@ stop_log_follower() {
 start_backends() {
     mkdir -p "$STATE_DIR/logs" "$CACHE_DIR"; export LLAMA_CACHE="$CACHE_DIR" GGML_CUDA_ENABLE_UNIFIED_MEMORY="$ALLOW_OFFLOAD" CUDA_SCALE_LAUNCH_QUEUES=4x
     local next=$((PORT_BASE+1)); BACKENDS_TSV="$STATE_DIR/backends.$$"; : > "$BACKENDS_TSV"
-    while IFS=$'\x1f' read -r id hf gpus multi kvk kvv batch ubatch fa template envpairs note context slots; do
+    while IFS=$'\x1f' read -r id hf gpus multi kvk kvv batch ubatch fa template envpairs note ngl threads threads_batch cpu_cache context slots; do
         local port log pid follower failed=0 waited=0
         port="$(free_port "$next")"; next=$((port+1)); log="$STATE_DIR/logs/${id}.log"; : > "$log"
-        local -a cmd=("$LLAMA_SERVER" -hf "$hf" --alias "$id" --no-mmproj -ngl 999 -c "$((context * slots))" -np "$slots" --cache-type-k "$kvk" --cache-type-v "$kvv" -b "$batch" -ub "$ubatch" -fa "$fa" --jinja --no-context-shift --host 127.0.0.1 --port "$port")
+        local -a cmd=("$LLAMA_SERVER" -hf "$hf" --alias "$id" --no-mmproj -ngl "$ngl" --fit off -t "$threads" -tb "$threads_batch" -c "$((context * slots))" -np "$slots" --cache-type-k "$kvk" --cache-type-v "$kvv" -b "$batch" -ub "$ubatch" -fa "$fa" --jinja --no-context-shift --host 127.0.0.1 --port "$port")
+        [[ "$cpu_cache" == 1 ]] && cmd+=(--no-kv-offload)
+        [[ "$ngl" == 0 ]] && cmd+=(--device none)
         [[ "$multi" == 1 ]] && cmd+=(--split-mode layer)
         [[ "$template" == qwen-fixed ]] && cmd+=(--chat-template-file "$QWEN_TEMPLATE")
         local -a envcmd=(env "CUDA_VISIBLE_DEVICES=$gpus" "LLAMA_CACHE=$CACHE_DIR" "GGML_CUDA_ENABLE_UNIFIED_MEMORY=$ALLOW_OFFLOAD" "CUDA_SCALE_LAUNCH_QUEUES=4x")
         if [[ -n "$envpairs" ]]; then local -a pairs; IFS=';' read -ra pairs <<< "$envpairs"; local pair; for pair in "${pairs[@]}"; do envcmd+=("$pair"); done; fi
-        say "Starting $id on GPU(s) [$gpus], $hf, ctx/slot=$context, slots=$slots${note:+ — $note}"
+        say "Starting $id on GPU(s) [${gpus:-none / CPU}], ngl=$ngl, threads=$threads, $hf, ctx/slot=$context, slots=$slots${note:+ — $note}"
         "${envcmd[@]}" "${cmd[@]}" >"$log" 2>&1 & pid=$!; PIDS+=("$pid")
         follower="$(start_log_follower "$log")"
-        while ! curl -fsS "http://127.0.0.1:$port/health" >/dev/null 2>&1; do
+        while ! curl --connect-timeout 1 --max-time 2 -fsS "http://127.0.0.1:$port/health" >/dev/null 2>&1; do
             kill -0 "$pid" 2>/dev/null || { failed=1; break; }
+            (( SECONDS < ${LAYOUT_DEADLINE:-$((SECONDS+1800))} )) || { failed=1; break; }
             sleep 1; waited=$((waited+1))
             (( waited % 30 == 0 )) && say "Still waiting for $id to become ready (${waited}s); live llama.cpp output is shown above."
         done
@@ -373,12 +410,81 @@ start_backends() {
         if [[ $failed -ne 0 ]]; then
             warn "$id exited before becoming ready. Full log: $log"
             tail -80 "$log" >&2 || true
-            die "failed to start $id"
+            return 1
         fi
         say "Backend ready: $id on http://127.0.0.1:$port"
-        printf '%s\t%s\t%s\n' "$id" "$port" "$hf" >> "$BACKENDS_TSV"
+        printf '%s\t%s\t%s\t%s\n' "$id" "$port" "$hf" "$pid" >> "$BACKENDS_TSV"
     done < <(server_rows)
     say "All model backends ready."
+}
+
+plan_uses_gpu() {
+    python3 - "$PLAN_FILE" <<'PY'
+import json,sys
+sys.exit(0 if any(s['gpus'] for s in json.load(open(sys.argv[1]))['servers']) else 1)
+PY
+}
+
+verify_llama_options() {
+    local help option
+    help="$("$LLAMA_SERVER" --help 2>&1)" || return 1
+    for option in --fit --threads-batch --cache-type-k --cache-type-v --device --no-kv-offload; do
+        [[ "$help" == *"$option"* ]] || { warn "llama-server lacks required option $option; rebuild with CLAUDE_LOCAL_REBUILD=1"; return 1; }
+    done
+}
+
+validate_layout() {
+    local pid rc=0 deadline=$((SECONDS+WARMUP_TIMEOUT))
+    python3 "$LIB/claude_local_validate.py" "$PLAN_FILE" "$BACKENDS_TSV" --timeout "$WARMUP_TIMEOUT" &
+    pid=$!; PIDS+=("$pid")
+    while kill -0 "$pid" 2>/dev/null; do
+        if (( SECONDS >= deadline || SECONDS >= LAYOUT_DEADLINE )); then
+            kill "$pid" 2>/dev/null || true
+            warn "Complete-layout warmup deadline exceeded"
+            return 1
+        fi
+        sleep 1
+    done
+    wait "$pid" || rc=$?
+    # Remove the reaped validator PID so cleanup cannot kill a reused PID.
+    unset 'PIDS[${#PIDS[@]}-1]'
+    PIDS=("${PIDS[@]}")
+    return "$rc"
+}
+
+admit_layout() {
+    python3 "$LIB/claude_local_validate.py" "$PLAN_FILE" --admit
+}
+
+start_layouts() {
+    local original="$STATE_DIR/layouts.$$.json" count attempt=0
+    cp "$PLAN_FILE" "$original"
+    count="$(python3 - "$original" <<'PY'
+import json,sys
+p=json.load(open(sys.argv[1])); print(1+len(p.get('alternatives',[])))
+PY
+)"
+    while (( attempt < count )); do
+        python3 - "$original" "$PLAN_FILE" "$attempt" <<'PY'
+import json,sys
+p=json.load(open(sys.argv[1])); alternatives=p.pop('alternatives',[])
+json.dump(([p]+alternatives)[int(sys.argv[3])],open(sys.argv[2],'w'),indent=2)
+PY
+        say "Complete-layout startup attempt $((attempt+1))/$count"
+        print_plan
+        if ensure_llamacpp && verify_llama_options && admit_layout; then
+            LAYOUT_DEADLINE=$((SECONDS+STARTUP_TIMEOUT))
+            if start_backends && validate_layout; then
+                rm -f "$original"
+                return 0
+            fi
+        fi
+        warn "Layout rejected; stopping all servers before trying a planned alternative."
+        stop_layout
+        attempt=$((attempt+1))
+    done
+    rm -f "$original"
+    die "all bounded local startup layouts failed; no cloud or synthetic classifier fallback"
 }
 
 write_gateway_config() {
@@ -407,8 +513,9 @@ start_gateway() {
     say "Starting local Anthropic gateway on http://127.0.0.1:$GATEWAY_PORT"
     python3 "$GATEWAY_PY" --config "$GATEWAY_CONFIG" --port "$GATEWAY_PORT" "${extra[@]}" >"$log" 2>&1 & pid=$!; PIDS+=("$pid")
     follower="$(start_log_follower "$log")"
-    while ! curl -fsS "http://127.0.0.1:$GATEWAY_PORT/health" >/dev/null 2>&1; do
+    while ! curl --connect-timeout 1 --max-time 2 -fsS "http://127.0.0.1:$GATEWAY_PORT/health" >/dev/null 2>&1; do
         kill -0 "$pid" 2>/dev/null || { failed=1; break; }
+        (( waited < 60 )) || { failed=1; break; }
         sleep 1; waited=$((waited+1))
         (( waited % 15 == 0 )) && say "Still waiting for local gateway (${waited}s)."
     done
@@ -440,11 +547,22 @@ print_plan() {
 python3 - "$PLAN_FILE" <<'PY'
 import json,sys
 p=json.load(open(sys.argv[1])); print(f"Physical context: {p['context']:,}\nClaude roles:")
+if 'host' in p:
+ h=p['host']
+ print(f"Startup policy: {p['startup_policy']}; minimum quality: {p['min_quality']}")
+ print(f"Host: MemAvailable={h['available_mib']} MiB; cgroup remaining={h['cgroup_remaining_mib']} MiB; usable={h['usable_mib']} MiB; reserve={h['reserve_mib']} MiB; joint RAM={p['ram_required_mib']} MiB (no swap)")
+ print(f"CPU affinity={h['cpu_ids']}; capacity={h['cpu_capacity']}; NUMA={h['numa_nodes']}")
+ print(f"Planned alternatives: {len(p.get('alternatives',[]))}; cache-only CPU placement deferred")
 for r in ('haiku','sonnet','opus','fable'): print(f"  {r:6} -> {p['roles'][r]} ({p['role_ids'][r]})")
 print('Servers:')
 for s in p['servers']:
  x=s['profile']; gs=', '.join(f"GPU{g['index']} {g['name']} ({g['free_mib']/1024:.1f} GiB free, PCIe Gen{g['pcie_gen']} x{g['pcie_width']})" for g in s['gpus'])
  print(f"  {s['id']}: {x['hf_spec']}\n    {gs}\n    context/slot={s['context']} slots={s['slots']} KV={x['kv_k']}/{x['kv_v']} batch={x['batch']}/{x['ubatch']} FA={x['flash_attn']} quality-tier={x['quality']}")
+ if 'mode' in s:
+  print(f"    placement={s['mode']} ngl={s['ngl']} threads={s['threads']}/{s['threads_batch']} RAM={s['ram_required_mib']} MiB VRAM={s['required_mib']} MiB")
+  print(f"    estimates={s['memory_estimate']}; source={s['estimate_source']}")
+if any(s.get('mode') in ('cpu','hybrid') for s in p['servers']):
+ print("WARNING: CPU/hybrid latency is unmeasured and can be unusable for long prompts or safety-classifier deadlines; warmup is not a latency guarantee.")
 PY
 }
 
@@ -493,7 +611,7 @@ PY
     contains_claude_flag --model || args=(--model "$sonnet_id" "${args[@]}")
     contains_claude_flag --agents || args=(--agents "$(agents_json)" "${args[@]}")
     if [[ -n "$CLASSIFIER_MODEL" ]]; then
-        say "Dedicated classifier on physical GPU $CLASSIFIER_GPU; request IDs: ${CLASSIFIER_REQUEST_MODELS[*]}"
+        say "Dedicated classifier (GPU reservation: ${CLASSIFIER_GPU:-automatic / CPU permitted}); request IDs: ${CLASSIFIER_REQUEST_MODELS[*]}"
         warn "Classifier routing matches model IDs, not request purpose. Do not use these IDs for session/subagent models."
     fi
     say "All local services ready. Launching Claude Code from $PWD"
@@ -540,6 +658,10 @@ while (($#)); do
       --local-no-teams) ENABLE_TEAMS=0; shift;;
       --local-keep-servers) KEEP_SERVERS=1; shift;;
       --local-allow-offload) ALLOW_OFFLOAD=1; shift;;
+      --local-startup-policy) [[ $# -ge 2 ]] || die "--local-startup-policy needs a policy"; STARTUP_POLICY="$2"; shift 2;;
+      --local-memory-metadata) [[ $# -ge 2 ]] || die "--local-memory-metadata needs a file"; MEMORY_METADATA="$2"; shift 2;;
+      --local-min-quality) [[ $# -ge 2 ]] || die "--local-min-quality needs a tier"; MIN_QUALITY="$2"; shift 2;;
+      --local-max-layouts) [[ $# -ge 2 ]] || die "--local-max-layouts needs a count"; MAX_LAYOUTS="$2"; shift 2;;
       --local-dry-run) DRY_RUN=1; shift;;
       --local-verbose) VERBOSE=1; shift;;
       -*) CLAUDE_ARGS+=("$@"); break;;
@@ -550,22 +672,34 @@ done
 [[ "$CTX" =~ ^[0-9]+$ && "$CLIENT_CTX" =~ ^[0-9]+$ ]] || die "context values must be integers"
 (( CLIENT_CTX <= CTX )) || die "client context ($CLIENT_CTX) exceeds physical context ($CTX)"
 [[ "$SLOTS" =~ ^[1-9][0-9]*$ && "$CLASSIFIER_CTX" =~ ^[1-9][0-9]*$ ]] || die "slots and classifier context must be positive integers"
+[[ "$STARTUP_POLICY" == gpu-only || "$STARTUP_POLICY" == allow-hybrid || "$STARTUP_POLICY" == allow-cpu-only ]] || die "invalid startup policy"
+for value in "$STARTUP_TIMEOUT" "$WARMUP_TIMEOUT"; do
+    [[ "$value" =~ ^[1-9][0-9]*$ ]] && (( value <= 3600 )) || die "startup/warmup deadlines must be 1..3600 seconds"
+done
+[[ $ALLOW_OFFLOAD -eq 0 ]] || die "unified-memory spill is not a bounded CPU fallback; use --local-startup-policy with calibrated metadata"
 if [[ -n "$CLASSIFIER_MODEL" || -n "$CLASSIFIER_GPU" ]]; then
-    [[ -n "$CLASSIFIER_MODEL" && "$CLASSIFIER_GPU" =~ ^[0-9]+$ ]] || die "classifier model and physical GPU index must be supplied together"
+    [[ -n "$CLASSIFIER_MODEL" ]] || die "classifier GPU requires a model"
+    [[ -z "$CLASSIFIER_GPU" || "$CLASSIFIER_GPU" =~ ^[0-9]+$ ]] || die "classifier GPU must be a physical index"
+    [[ "$STARTUP_POLICY" != gpu-only || -n "$CLASSIFIER_GPU" ]] || die "gpu-only classifier requires a physical GPU index"
     ((${#CLASSIFIER_REQUEST_MODELS[@]})) || die "dedicated classifier requires --local-classifier-request-model with the observed classifier API model ID"
     contains_claude_flag --model && die "dedicated classifier requires the harness-managed session model; omit --model"
 elif ((${#CLASSIFIER_REQUEST_MODELS[@]})); then
     die "classifier request routing requires a dedicated classifier model and GPU"
 fi
-if [[ $DRY_RUN -eq 0 ]]; then install_base_deps; ensure_nvidia_driver; else have_cmd nvidia-smi || die "nvidia-smi required for dry run"; fi
+if [[ $DRY_RUN -eq 0 ]]; then
+    install_base_deps
+    [[ "$STARTUP_POLICY" != gpu-only ]] || ensure_nvidia_driver
+fi
 mkdir -p "$STATE_DIR" "$CACHE_DIR"; PLAN_FILE="$STATE_DIR/plan.$$.json"
 
 # Serialize only startup/allocation. Existing sessions remain concurrent, but a
 # second launch cannot observe the same free VRAM/port state and race the first.
 [[ $DRY_RUN -eq 0 ]] && acquire_startup_lock
-plan_args=(plan --context "$CTX" --slots "$SLOTS")
+plan_args=(plan --context "$CTX" --slots "$SLOTS" --startup-policy "$STARTUP_POLICY" --min-quality "$MIN_QUALITY" --max-layouts "$MAX_LAYOUTS")
+[[ -z "$MEMORY_METADATA" ]] || plan_args+=(--memory-metadata "$MEMORY_METADATA")
 if [[ -n "$CLASSIFIER_MODEL" ]]; then
-    plan_args+=(--classifier-model "$CLASSIFIER_MODEL" --classifier-gpu "$CLASSIFIER_GPU" --classifier-context "$CLASSIFIER_CTX")
+    plan_args+=(--classifier-model "$CLASSIFIER_MODEL" --classifier-context "$CLASSIFIER_CTX")
+    [[ -z "$CLASSIFIER_GPU" ]] || plan_args+=(--classifier-gpu "$CLASSIFIER_GPU")
 fi
 if ((${#MODELS[@]})); then plan_args+=("${MODELS[@]}"); else plan_args+=(--smart); fi
 python3 "$PLAN_PY" "${plan_args[@]}" > "$PLAN_FILE" || exit $?
@@ -580,8 +714,9 @@ for mid in sys.argv[2:]:
 PY
 fi
 print_plan; [[ $DRY_RUN -eq 1 ]] && exit 0
-install_claude_code; prepare_host_compiler; activate_cuda; ensure_llamacpp
+install_claude_code
 grep -q '"template": "qwen-fixed"' "$PLAN_FILE" && fetch_qwen_template || true
-start_backends; write_gateway_config; start_gateway
+start_layouts; write_gateway_config; start_gateway
+STARTUP_COMPLETE=1
 release_startup_lock
 run_claude

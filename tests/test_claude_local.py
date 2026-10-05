@@ -26,6 +26,7 @@ def load(name, path):
 
 
 planmod = load("claude_local_plan", ROOT / "lib" / "claude_local_plan.py")
+resources = load("claude_local_resources", ROOT / "lib" / "claude_local_resources.py")
 gwmod = load("claude_local_gateway", ROOT / "lib" / "claude_local_gateway.py")
 
 
@@ -111,7 +112,9 @@ class PlannerTests(unittest.TestCase):
         for args, slots in (([], 2), (["--slots", "1"], 1)):
             output = io.StringIO()
             with mock.patch.object(planmod, "inventory", return_value=gpus), \
-                 mock.patch.object(sys, "argv", ["planner", "plan", "q38", *args]), \
+                 mock.patch.object(resources, "host_inventory", return_value=resources.Host(
+                     64000, None, 64000, (0, 1, 2, 3), 4, ())), \
+                 mock.patch.object(sys, "argv", ["planner", "plan", "q38", "--context", "131072", *args]), \
                  contextlib.redirect_stdout(output):
                 self.assertEqual(planmod.main(), 0)
             self.assertEqual(json.loads(output.getvalue())["servers"][0]["slots"], slots)

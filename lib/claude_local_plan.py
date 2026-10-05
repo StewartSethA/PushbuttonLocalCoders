@@ -182,10 +182,13 @@ def role_map(models: list[str]) -> dict[str, str]:
 def _query_nvidia(fields: str) -> list[str]:
     if not shutil.which("nvidia-smi"):
         return []
-    proc = subprocess.run(
-        ["nvidia-smi", f"--query-gpu={fields}", "--format=csv,noheader,nounits"],
-        text=True, capture_output=True,
-    )
+    try:
+        proc = subprocess.run(
+            ["nvidia-smi", f"--query-gpu={fields}", "--format=csv,noheader,nounits"],
+            text=True, capture_output=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
     if proc.returncode != 0:
         return []
     return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
@@ -587,6 +590,11 @@ def main() -> int:
     lp.add_argument("--classifier-model")
     lp.add_argument("--classifier-gpu", type=int)
     lp.add_argument("--classifier-context", type=int, default=32768)
+    lp.add_argument("--startup-policy", default="gpu-only",
+                    choices=("gpu-only", "allow-hybrid", "allow-cpu-only"))
+    lp.add_argument("--memory-metadata", help="versioned calibrated placement JSON")
+    lp.add_argument("--min-quality", type=int, default=0)
+    lp.add_argument("--max-layouts", type=int, default=3)
     sub.add_parser("catalogue")
     args = ap.parse_args()
     try:
@@ -607,14 +615,25 @@ def main() -> int:
         main_gpus = [g for g in gpus if g.index != args.classifier_gpu]
         models = args.models
         if args.smart or not models:
-            models = smart_defaults(main_gpus)
-        print(json.dumps(plan(
-            models, gpus, args.context, slots=args.slots,
-            classifier_model=args.classifier_model, classifier_gpu=args.classifier_gpu,
-            classifier_context=args.classifier_context,
-        ), indent=2))
+            models = (["qwen3.8:27b"] if not main_gpus and args.startup_policy == "allow-cpu-only"
+                      else smart_defaults(main_gpus))
+        kwargs = dict(
+            slots=args.slots, classifier_model=args.classifier_model,
+            classifier_gpu=args.classifier_gpu, classifier_context=args.classifier_context,
+        )
+        import claude_local_resources as resources
+        metadata = None
+        if args.memory_metadata:
+            with open(args.memory_metadata) as stream:
+                metadata = json.load(stream)
+        result = resources.startup_plan(
+            sys.modules[__name__], models, gpus, args.context, **kwargs,
+            startup_policy=args.startup_policy, metadata=metadata,
+            min_quality=args.min_quality, max_layouts=args.max_layouts,
+        )
+        print(json.dumps(result, indent=2))
         return 0
-    except ValueError as exc:
+    except (ValueError, OSError, KeyError) as exc:
         print(f"claude-local planner: {exc}", file=sys.stderr)
         return 2
 
