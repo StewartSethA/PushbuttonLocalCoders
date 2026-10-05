@@ -54,7 +54,7 @@ Built-ins: nemotron-3.5-lightning qwen3.6:35b qwen3.8:27b glm-5.3-flash
 
 Harness options (put before ordinary Claude Code flags):
   --local-cache DIR          llama.cpp/Hugging Face model cache
-  --local-context N          physical backend context (default 262144)
+  --local-context N          context per inference slot (default 262144)
   --local-client-context N   Claude Code budget (default 200000)
   --local-slots N            inference slots per main backend (default 1)
   --local-classifier-model M independent classifier model (may match main model)
@@ -70,7 +70,8 @@ Harness options (put before ordinary Claude Code flags):
   --                         stop harness parsing; pass rest to Claude Code
 
 All ordinary Claude Code flags, including --resume/--continue/--permission-mode,
-are passed through unchanged.
+are passed through unchanged. Dedicated classifier mode requires the harness
+session model, so --model overrides are rejected in that mode.
 EOF
 }
 
