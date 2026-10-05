@@ -374,13 +374,17 @@ something that actually fits rather than silently turning VRAM pressure into a
 very slow CPU/RAM fallback.
 
 `claude-local` now defaults to explicit `gpu-only` startup. Opt in with
-`--local-startup-policy allow-hybrid` or `allow-cpu-only`, using verified
+`--local-startup-policy allow-cpu-only`, using verified
 `--local-memory-metadata` for CPU placements and an optional
 `--local-min-quality` floor. RAM (MemAvailable/cgroup remaining, excluding swap)
 and VRAM are budgeted jointly, including a separate classifier. CPU-only builds
 do not require NVIDIA/CUDA tools. Complete layouts are warmed up and memory
-checked before Claude starts, with bounded clean retries and no synthetic
-classifier/cloud fallback. CPU latency is not guaranteed; cache-only CPU
+checked before Claude starts, with bounded clean retries and no
+cloud fallback or synthetic classifier verdict. CPU-only replicas are
+provisioned and jointly RAM-budgeted upfront; bounded active-slot admission
+routes GPU overflow to the same-model CPU backend or returns 503 when both
+are busy. No hybrid weights or post-commit stream replay is permitted.
+CPU latency is not guaranteed; cache-only CPU
 placement and CPU cache quantization are deferred.
 See [policies, calibration and limits](CLAUDE_LOCAL.md#explicit-cpu-fallback-policies).
 

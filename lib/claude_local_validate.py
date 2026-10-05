@@ -87,8 +87,8 @@ def check_offload(plan, logs):
         actual, total = map(int, reports[-1])
         if actual <= 0 or mode == "gpu" and actual != total:
             raise ValueError(f"{server['id']}: full GPU placement was not honored")
-        if mode == "hybrid" and (actual != server["ngl"] or actual >= total):
-            raise ValueError(f"{server['id']}: calibrated hybrid layer count was not honored")
+        if mode != "gpu":
+            raise ValueError(f"{server['id']}: unsupported placement mode")
 
 
 def main():

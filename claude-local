@@ -72,7 +72,7 @@ Harness options (put before ordinary Claude Code flags):
   --local-no-teams           disable experimental Claude agent teams
   --local-keep-servers       leave model servers running after Claude exits
   --local-allow-offload      obsolete: rejected; use explicit startup policy
-  --local-startup-policy P   gpu-only (default), allow-hybrid, allow-cpu-only
+  --local-startup-policy P   gpu-only (default), allow-cpu-only (bounded overflow)
   --local-memory-metadata F calibrated memory placements JSON (required for CPU)
   --local-min-quality N     minimum catalogue quality tier, 0..100
   --local-max-layouts N     bounded complete startup alternatives (default 3)
@@ -332,9 +332,19 @@ fetch_qwen_template() {
 }
 
 cleanup() {
+    # Do not interrupt teardown or expose allocations until all children exit.
+    trap '' INT TERM
+    if [[ $KEEP_SERVERS -ne 1 || $STARTUP_COMPLETE -ne 1 ]]; then
+        stop_layout
+    fi
     release_startup_lock
-    [[ $KEEP_SERVERS -eq 1 && $STARTUP_COMPLETE -eq 1 ]] && return 0
-    stop_layout
+}
+
+cancel_launcher() {
+    # EXIT must not run cleanup a second time after signal-driven teardown.
+    trap - EXIT
+    cleanup
+    exit "$1"
 }
 
 stop_layout() {
@@ -349,7 +359,9 @@ stop_layout() {
     done
     PIDS=()
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'cancel_launcher 130' INT
+trap 'cancel_launcher 143' TERM
 
 server_rows() {
 python3 - "$PLAN_FILE" <<'PY'
@@ -494,13 +506,21 @@ import json,sys
 p=json.load(open(sys.argv[1])); ports={}
 for line in open(sys.argv[2]):
  mid,port,*_=line.rstrip('\n').split('\t'); ports[mid]=int(port)
-roles={r:{'model_id':mid,'backend_alias':mid,'url':f'http://127.0.0.1:{ports[mid]}'} for r,mid in p['role_ids'].items()}
+servers={s['id']:s for s in p['servers']}
+def route(mid, request_id=None):
+ s=servers[mid]
+ result={'model_id':request_id or mid,'backend_alias':mid,'url':f'http://127.0.0.1:{ports[mid]}',
+         'slots':s['slots'],'proxy_attempts':1 if s.get('mode')=='cpu' else 2}
+ if s.get('fallback_id'):
+  result['cpu_fallback']=route(s['fallback_id'])
+ return result
+roles={r:route(mid) for r,mid in p['role_ids'].items()}
 models={}
 if p.get('classifier_id'):
  mid=p['classifier_id']
- models[mid]={'model_id':mid,'backend_alias':mid,'url':f'http://127.0.0.1:{ports[mid]}'}
+ models[mid]=route(mid)
  for request_id in sys.argv[4:]:
-  models[request_id]={'model_id':request_id,'backend_alias':mid,'url':f'http://127.0.0.1:{ports[mid]}'}
+  models[request_id]=route(mid,request_id)
 json.dump({'roles':roles,'models':models},open(sys.argv[3],'w'),indent=2)
 PY
 }
@@ -561,8 +581,8 @@ for s in p['servers']:
  if 'mode' in s:
   print(f"    placement={s['mode']} ngl={s['ngl']} threads={s['threads']}/{s['threads_batch']} RAM={s['ram_required_mib']} MiB VRAM={s['required_mib']} MiB")
   print(f"    estimates={s['memory_estimate']}; source={s['estimate_source']}")
-if any(s.get('mode') in ('cpu','hybrid') for s in p['servers']):
- print("WARNING: CPU/hybrid latency is unmeasured and can be unusable for long prompts or safety-classifier deadlines; warmup is not a latency guarantee.")
+if any(s.get('mode') == 'cpu' for s in p['servers']):
+ print("WARNING: CPU-only latency is unmeasured and can be unusable for long prompts or safety-classifier deadlines; warmup is not a latency guarantee.")
 PY
 }
 
@@ -587,7 +607,7 @@ run_claude() {
         CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY="$(python3 - "$PLAN_FILE" <<'PY'
 import json,sys
 p=json.load(open(sys.argv[1]))
-print(min(4, sum(s['slots'] for s in p['servers'] if s['id'] != p.get('classifier_id'))))
+print(min(4, sum(s['slots'] for s in p['servers'] if not s.get('classifier', s['id'] == p.get('classifier_id')))))
 PY
 )"
         export CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY
@@ -672,7 +692,7 @@ done
 [[ "$CTX" =~ ^[0-9]+$ && "$CLIENT_CTX" =~ ^[0-9]+$ ]] || die "context values must be integers"
 (( CLIENT_CTX <= CTX )) || die "client context ($CLIENT_CTX) exceeds physical context ($CTX)"
 [[ "$SLOTS" =~ ^[1-9][0-9]*$ && "$CLASSIFIER_CTX" =~ ^[1-9][0-9]*$ ]] || die "slots and classifier context must be positive integers"
-[[ "$STARTUP_POLICY" == gpu-only || "$STARTUP_POLICY" == allow-hybrid || "$STARTUP_POLICY" == allow-cpu-only ]] || die "invalid startup policy"
+[[ "$STARTUP_POLICY" == gpu-only || "$STARTUP_POLICY" == allow-cpu-only ]] || die "invalid startup policy (hybrid offload is unsupported)"
 for value in "$STARTUP_TIMEOUT" "$WARMUP_TIMEOUT"; do
     [[ "$value" =~ ^[1-9][0-9]*$ ]] && (( value <= 3600 )) || die "startup/warmup deadlines must be 1..3600 seconds"
 done

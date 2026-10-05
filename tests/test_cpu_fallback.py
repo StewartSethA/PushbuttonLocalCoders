@@ -1,6 +1,7 @@
 import json
 import os
 import pathlib
+import signal
 import subprocess
 import sys
 import tempfile
@@ -14,6 +15,9 @@ sys.path.insert(0, str(ROOT / "lib"))
 import claude_local_plan as base
 import claude_local_resources as resources
 import claude_local_validate as validate
+import claude_local_gateway as gateway
+import http.client
+import time
 
 
 def calibration(model="q38", mode="gpu", ngl=None, **overrides):
@@ -54,8 +58,8 @@ class StartupPlannerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no safe gpu-only"):
             self.plan(gpus=[], entries=[calibration(mode="cpu")])
 
-    def test_no_uncalibrated_cpu_or_hybrid_guess(self):
-        for policy in ("allow-hybrid", "allow-cpu-only"):
+    def test_no_uncalibrated_cpu_guess(self):
+        for policy in ("allow-cpu-only",):
             with self.subTest(policy=policy), self.assertRaises(ValueError):
                 resources.startup_plan(base, ["q38"], [], 131072, host=self.host,
                                        startup_policy=policy)
@@ -70,26 +74,61 @@ class StartupPlannerTests(unittest.TestCase):
         self.assertEqual(s["ram_required_mib"], 4563)
         self.assertEqual(s["required_mib"], 0)
 
-    def test_exact_nonuniform_calibrated_hybrid(self):
-        p = self.plan(gpus=self.gpus[:1], entries=[calibration(mode="hybrid", ngl=7)],
-                      startup_policy="allow-hybrid")
-        s = p["servers"][0]
-        self.assertEqual(s["ngl"], 7)
-        self.assertEqual(s["required_mib"], 4725)
-        self.assertEqual(s["ram_required_mib"], 4563)
+    def test_cpu_replica_is_provisioned_with_gpu(self):
+        p = self.plan(entries=[calibration(), calibration(mode="cpu")],
+                      startup_policy="allow-cpu-only")
+        main, replica = p["servers"]
+        self.assertEqual(main["mode"], "gpu")
+        self.assertEqual(replica["mode"], "cpu")
+        self.assertEqual(main["fallback_id"], replica["id"])
+        self.assertEqual(main["profile"]["hf_spec"], replica["profile"]["hf_spec"])
+        self.assertEqual((replica["context"], replica["slots"]), (131072, 2))
+        self.assertEqual(p["ram_required_mib"], sum(s["ram_required_mib"] for s in p["servers"]))
 
-    def test_hybrid_requires_some_gpu(self):
+    def test_cpu_replica_requires_matching_weights(self):
+        with self.assertRaisesRegex(ValueError, "replica"):
+            self.plan(entries=[calibration()], startup_policy="allow-cpu-only", min_quality=100)
+
+    def test_cpu_calibration_can_pair_with_conservative_gpu_envelope(self):
+        p = self.plan(entries=[calibration(mode="cpu")], gpus=[base.GPU(0, "GPU", 64000, 64000)],
+                      startup_policy="allow-cpu-only", min_quality=100)
+        main, replica = p["servers"]
+        self.assertEqual(main["mode"], "gpu")
+        self.assertEqual(replica["mode"], "cpu")
+        self.assertIn("legacy_envelope_mib", main["memory_estimate"])
+
+    def test_joint_replica_ram_budget_selects_cpu_not_unbudgeted_overflow(self):
+        host = resources.Host(6000, 6000, 6000, tuple(range(8)), 8, ())
+        p = self.plan(entries=[calibration(), calibration(mode="cpu")],
+                      startup_policy="allow-cpu-only", host=host, min_quality=100)
+        self.assertEqual([s["mode"] for s in p["servers"]], ["cpu"])
+        self.assertNotIn("fallback_id", p["servers"][0])
+
+    def test_classifier_replica_remains_distinct_with_reserved_gpu(self):
+        p = self.plan(entries=[calibration(), calibration(mode="cpu")],
+                      startup_policy="allow-cpu-only", classifier_model="q38", classifier_gpu=1)
+        main, main_cpu, classifier, classifier_cpu = p["servers"]
+        self.assertEqual(classifier["cuda_visible_devices"], "1")
+        self.assertEqual(classifier["fallback_id"], "local-classifier-cpu")
+        self.assertEqual(classifier_cpu["context"], 32768)
+        self.assertTrue(classifier_cpu["classifier"])
+        self.assertNotEqual(main_cpu["id"], classifier_cpu["id"])
+        self.assertNotEqual(main["cuda_visible_devices"], "1")
+
+    def test_hybrid_policy_and_metadata_rejected(self):
         with self.assertRaises(ValueError):
-            self.plan(gpus=[], entries=[calibration(mode="cpu")], startup_policy="allow-hybrid")
+            self.plan(startup_policy="allow-hybrid")
+        with self.assertRaises(ValueError):
+            self.plan(entries=[calibration(mode="hybrid")])
 
     def test_main_stays_gpu_secondary_moves_to_cpu(self):
         entries = [calibration("q36", "gpu"), calibration("q36", "cpu"),
                    calibration("q38", "gpu"), calibration("q38", "cpu")]
-        p = self.plan(["q36", "q38"], entries, gpus=self.gpus[:1], startup_policy="allow-hybrid")
-        by_model = {s["model"]: s for s in p["servers"]}
+        p = self.plan(["q36", "q38"], entries, gpus=self.gpus[:1], startup_policy="allow-cpu-only")
+        by_model = {s["model"]: s for s in p["servers"] if not s.get("fallback")}
         self.assertEqual(by_model["qwen3.8:27b"]["mode"], "gpu")
         self.assertEqual(by_model["qwen3.6:35b"]["mode"], "cpu")
-        self.assertEqual(sum(s["threads"] for s in p["servers"]), 8)
+        self.assertLessEqual(sum(s["threads"] for s in p["servers"]), 8)
 
     def test_joint_ram_budget_rejects_individually_fitting_models(self):
         host = resources.Host(7000, 7000, 7000, tuple(range(8)), 8, (), 1000)
@@ -142,11 +181,12 @@ class StartupPlannerTests(unittest.TestCase):
                           startup_policy="allow-cpu-only", **kwargs)
 
     def test_bounded_complete_alternatives_and_quality(self):
-        p = self.plan(entries=[calibration(), calibration(mode="hybrid"), calibration(mode="cpu")],
-                      startup_policy="allow-cpu-only", max_layouts=3, min_quality=100)
-        self.assertEqual(len(p["alternatives"]), 2)
+        p = self.plan(entries=[calibration(), calibration(mode="cpu")],
+                      startup_policy="allow-cpu-only", max_layouts=3, min_quality=100,
+                      gpus=self.gpus[:1])
+        self.assertEqual(len(p["alternatives"]), 1)
         self.assertEqual([layout["servers"][0]["mode"] for layout in [p, *p["alternatives"]]],
-                         ["gpu", "hybrid", "cpu"])
+                         ["gpu", "cpu"])
         for layout in [p, *p["alternatives"]]:
             self.assertEqual(layout["role_ids"], p["role_ids"])
             self.assertTrue(all(s["profile"]["quality"] == 100 for s in layout["servers"]))
@@ -237,10 +277,352 @@ class HostInventoryTests(unittest.TestCase):
         self.assertEqual(self.inventory(leaf_limit="2097152000").usable_mib, 2000)
 
 
+class OverflowGatewayTests(unittest.TestCase):
+    def setUp(self):
+        self.release_stream = threading.Event()
+        self.requests = []
+        self.behavior = {"gpu": "json", "cpu": "json", "classifier-gpu": "json", "classifier-cpu": "json"}
+        owner = self
+
+        def handler(kind):
+            class Backend(BaseHTTPRequestHandler):
+                def do_POST(self):
+                    body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                    owner.requests.append((kind, body["model"]))
+                    behavior = owner.behavior[kind]
+                    if behavior == "error":
+                        self.send_response(503)
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
+                    if behavior == "empty":
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/event-stream")
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
+                    if behavior in ("stream", "broken"):
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/event-stream")
+                        self.send_header("Content-Length", "40")
+                        self.end_headers()
+                        self.wfile.write(b"data: first\n\n")
+                        self.wfile.flush()
+                        owner.release_stream.wait(5)
+                        if behavior == "stream":
+                            try:
+                                self.wfile.write(b"x" * 27)
+                                self.wfile.flush()
+                            except (BrokenPipeError, ConnectionResetError):
+                                pass
+                        self.close_connection = True
+                        return
+                    raw = json.dumps({"model": body["model"]}).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+
+                def log_message(self, *_):
+                    pass
+            return Backend
+
+        self.cpu = ThreadingHTTPServer(("127.0.0.1", 0), handler("cpu"))
+        self.gpu = ThreadingHTTPServer(("127.0.0.1", 0), handler("gpu"))
+        self.primary = self.route(self.gpu, "main")
+        self.fallback = self.route(self.cpu, "main-cpu", proxy_attempts=1)
+        self.primary["cpu_fallback"] = self.fallback
+        classifier_gpu = ThreadingHTTPServer(("127.0.0.1", 0), handler("classifier-gpu"))
+        classifier_cpu = ThreadingHTTPServer(("127.0.0.1", 0), handler("classifier-cpu"))
+        classifier = self.route(classifier_gpu, "local-classifier")
+        classifier["cpu_fallback"] = self.route(classifier_cpu, "local-classifier-cpu", proxy_attempts=1)
+        self.router = gateway.Router({
+            "roles": {r: self.primary for r in ("haiku", "sonnet", "opus", "fable")},
+            "models": {"classifier-request": classifier},
+        })
+        self.gateway = ThreadingHTTPServer(("127.0.0.1", 0), gateway.Handler)
+        self.gateway.router = self.router
+        self.gateway.verbose = False
+        self.servers = [self.gateway, self.gpu, self.cpu, classifier_gpu, classifier_cpu]
+        self.threads = [threading.Thread(target=s.serve_forever, kwargs={"poll_interval": .05})
+                        for s in self.servers]
+        for thread in self.threads:
+            thread.start()
+        self.connections = []
+
+    @staticmethod
+    def route(server, alias, **kwargs):
+        return {"url": f"http://127.0.0.1:{server.server_port}", "backend_alias": alias,
+                "model_id": alias, "slots": 2, "timeout": 2, **kwargs}
+
+    def tearDown(self):
+        self.release_stream.set()
+        for connection in self.connections:
+            connection.close()
+        for server in self.servers:
+            server.shutdown()
+            server.server_close()
+        for thread in self.threads:
+            thread.join()
+
+    def request(self, model="sonnet"):
+        connection = http.client.HTTPConnection("127.0.0.1", self.gateway.server_port, timeout=5)
+        self.connections.append(connection)
+        connection.request("POST", "/v1/messages", json.dumps({"model": model}),
+                           {"Content-Type": "application/json"})
+        return connection, connection.getresponse()
+
+    def assert_idle(self):
+        deadline = time.monotonic() + 3
+        while any(self.router.active.values()) and time.monotonic() < deadline:
+            time.sleep(.01)
+        self.assertTrue(all(n == 0 for n in self.router.active.values()), self.router.active)
+
+    def test_gpu_available_keeps_request_on_gpu(self):
+        _, response = self.request()
+        self.assertEqual(json.loads(response.read())["model"], "main")
+        self.assertEqual(self.requests, [("gpu", "main")])
+        self.assert_idle()
+
+    def test_model_aliases_share_backend_capacity(self):
+        alternate = {**self.primary, "backend_alias": "another-alias", "model_id": "another-alias"}
+        router = gateway.Router({"roles": self.router.roles, "models": {"another": alternate}})
+        self.assertTrue(router.acquire(self.primary))
+        self.assertTrue(router.acquire(alternate))
+        self.assertFalse(router.acquire(self.primary))
+        router.release(self.primary)
+        router.release(alternate)
+
+    def test_two_busy_gpu_streams_overflow_to_cpu_then_exhaust(self):
+        self.behavior.update(gpu="stream", cpu="stream")
+        responses = []
+        for model in ("sonnet", "haiku"):
+            _, response = self.request(model)
+            self.assertEqual(response.read(13), b"data: first\n\n")
+            responses.append(response)
+        self.assertEqual(self.router.active[self.router.key(self.primary)], 2)
+        for model in ("unknown-internal-id", "fable"):
+            _, response = self.request(model)
+            self.assertEqual(response.read(13), b"data: first\n\n")
+            responses.append(response)
+        self.assertEqual(self.router.active[self.router.key(self.fallback)], 2)
+        _, response = self.request("opus")
+        self.assertEqual(response.status, 503)
+        response.read()
+        self.assertEqual(self.requests, [("gpu", "main")] * 2 + [("cpu", "main-cpu")] * 2)
+        self.release_stream.set()
+        for response in responses:
+            self.assertEqual(response.read(), b"x" * 27)
+        self.assert_idle()
+
+    def test_gpu_precommit_http_failure_can_use_cpu(self):
+        self.behavior["gpu"] = "error"
+        _, response = self.request()
+        self.assertEqual(response.status, 200)
+        self.assertEqual(json.loads(response.read())["model"], "main-cpu")
+        self.assertEqual([kind for kind, _ in self.requests], ["gpu", "gpu", "cpu"])
+        self.assert_idle()
+
+    def test_empty_gpu_stream_can_use_cpu(self):
+        self.behavior["gpu"] = "empty"
+        _, response = self.request()
+        self.assertEqual(json.loads(response.read())["model"], "main-cpu")
+        self.assert_idle()
+
+    def test_cpu_http_failure_surfaces_without_other_model(self):
+        self.behavior.update(gpu="error", cpu="error")
+        _, response = self.request()
+        self.assertEqual(response.status, 503)
+        response.read()
+        self.assertEqual(self.requests[-1], ("cpu", "main-cpu"))
+        self.assertEqual(sum(kind == "cpu" for kind, _ in self.requests), 1)
+        self.assert_idle()
+
+    def test_cpu_empty_stream_surfaces_gateway_error(self):
+        self.behavior.update(gpu="error", cpu="empty")
+        _, response = self.request()
+        self.assertEqual(response.status, 502)
+        response.read()
+        self.assert_idle()
+
+    def test_committed_gpu_failure_releases_slots_without_cpu_replay(self):
+        self.behavior["gpu"] = "broken"
+        _, response = self.request()
+        self.assertEqual(response.read(13), b"data: first\n\n")
+        self.assertEqual(self.router.active[self.router.key(self.primary)], 1)
+        self.release_stream.set()
+        with self.assertRaises(http.client.IncompleteRead):
+            response.read()
+        self.assertEqual(self.requests, [("gpu", "main")])
+        self.assert_idle()
+
+    def test_downstream_disconnect_releases_stream_slot(self):
+        self.behavior["gpu"] = "stream"
+        connection, response = self.request()
+        response.read(13)
+        response.close()
+        connection.close()
+        self.release_stream.set()
+        self.assert_idle()
+
+    def test_cpu_stream_holds_slot_and_failure_does_not_replay(self):
+        self.behavior.update(gpu="error", cpu="broken")
+        _, response = self.request()
+        response.read(13)
+        self.assertEqual(self.router.active[self.router.key(self.fallback)], 1)
+        self.release_stream.set()
+        with self.assertRaises(http.client.IncompleteRead):
+            response.read()
+        self.assertEqual(sum(kind == "cpu" for kind, _ in self.requests), 1)
+        self.assert_idle()
+
+    def test_classifier_overflow_is_independent_of_main(self):
+        classifier = self.router.resolve("classifier-request")
+        for _ in range(2):
+            self.assertTrue(self.router.acquire(classifier))
+        try:
+            _, response = self.request("classifier-request")
+            self.assertEqual(json.loads(response.read())["model"], "local-classifier-cpu")
+            _, response = self.request("sonnet")
+            self.assertEqual(json.loads(response.read())["model"], "main")
+        finally:
+            for _ in range(2):
+                self.router.release(classifier)
+        self.assert_idle()
+
+    def test_classifier_cpu_failure_does_not_use_main_or_synthesize_verdict(self):
+        self.behavior.update({"classifier-gpu": "error", "classifier-cpu": "error"})
+        _, response = self.request("classifier-request")
+        self.assertEqual(response.status, 503)
+        response.read()
+        self.assertEqual(self.requests, [("classifier-gpu", "local-classifier")] * 2 +
+                         [("classifier-cpu", "local-classifier-cpu")])
+        self.assert_idle()
+
+    def test_gpu_only_exhaustion_does_not_create_implicit_cpu_route(self):
+        self.primary.pop("cpu_fallback")
+        for _ in range(2):
+            self.router.acquire(self.primary)
+        try:
+            _, response = self.request()
+            self.assertEqual(response.status, 503)
+            response.read()
+            self.assertEqual(self.requests, [])
+        finally:
+            for _ in range(2):
+                self.router.release(self.primary)
+        self.assert_idle()
+
+
 class LauncherFallbackTests(unittest.TestCase):
     def source(self, start, end):
         source = (ROOT / "claude-local").read_text()
         return source[source.index(start):source.index(end)]
+
+    def test_cancel_exits_without_retry_and_holds_lock_through_teardown(self):
+        import fcntl
+
+        script = (self.source("acquire_startup_lock() {", "inventory_arches() {") +
+                  self.source("cleanup() {", "server_rows() {") +
+                  self.source("start_layouts() {", "write_gateway_config()"))
+        for sig, status in ((signal.SIGINT, 130), (signal.SIGTERM, 143)):
+            for phase in ("readiness", "retry-teardown"):
+                with self.subTest(signal=sig, phase=phase), \
+                     tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                    state = pathlib.Path(directory)
+                    (state / "plan.json").write_text(json.dumps({"alternatives": [{}]}))
+                    (state / "server.py").write_text('''
+import pathlib, signal, sys, time
+state = pathlib.Path(sys.argv[1])
+def stop(signum, frame):
+    with (state / "stops").open("a") as log:
+        log.write("stop\\n")
+    (state / "stopping").touch()
+    while not (state / "release").exists():
+        time.sleep(.02)
+    (state / "stopped").touch()
+    sys.exit(0)
+signal.signal(signal.SIGTERM, stop)
+(state / "ready").touch()
+while True:
+    time.sleep(.02)
+''')
+                    launcher = subprocess.Popen(["bash", "-c", script + '''
+set -euo pipefail
+STATE_DIR="$1"; PLAN_FILE="$1/plan.json"; LOCK_FILE="$1/startup.lock";
+KEEP_SERVERS=1; STARTUP_COMPLETE=0; STARTUP_LOCK_FD=""; PIDS=(); STARTUP_TIMEOUT=30;
+say() { :; }; warn() { :; }; print_plan() { :; }; ensure_llamacpp() { :; };
+verify_llama_options() { :; }; admit_layout() { :; }; validate_layout() { return 1; };
+die() { exit 1; };
+start_backends() {
+    echo launch >> "$STATE_DIR/launches"
+    python3 "$STATE_DIR/server.py" "$STATE_DIR" & PIDS+=("$!")
+    echo "$!" >> "$STATE_DIR/pids"
+    while [[ ! -e "$STATE_DIR/ready" ]]; do sleep .02; done
+    [[ "$PHASE" == retry-teardown ]] && return 1
+    while kill -0 "${PIDS[0]}" 2>/dev/null; do sleep .02; done
+    return 1
+}
+acquire_startup_lock
+start_layouts
+echo gateway >> "$STATE_DIR/launches"
+''',
+                        "test", directory], env={**os.environ, "PHASE": phase},
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    try:
+                        marker = state / ("ready" if phase == "readiness" else "stopping")
+                        deadline = time.monotonic() + 5
+                        while not marker.exists() and time.monotonic() < deadline:
+                            time.sleep(.02)
+                        self.assertTrue(marker.exists(), "launcher did not reach test phase")
+                        launcher.send_signal(sig)
+                        deadline = time.monotonic() + 5
+                        while not (state / "stopping").exists() and time.monotonic() < deadline:
+                            time.sleep(.02)
+                        self.assertTrue((state / "stopping").exists(), "server was not terminated")
+                        if phase == "readiness":
+                            launcher.send_signal(signal.SIGTERM if sig == signal.SIGINT else signal.SIGINT)
+                        with (state / "startup.lock").open("a") as lock:
+                            with self.assertRaises(BlockingIOError):
+                                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            self.assertFalse((state / "stopped").exists())
+                            (state / "release").touch()
+                            stdout, stderr = launcher.communicate(timeout=5)
+                            self.assertEqual(launcher.returncode, status, stdout + stderr)
+                            self.assertTrue((state / "stopped").exists())
+                            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        self.assertEqual((state / "launches").read_text().splitlines(), ["launch"])
+                        # A signal arriving during cleanup must not re-enter teardown.
+                        if phase == "readiness":
+                            self.assertEqual((state / "stops").read_text().splitlines(), ["stop"])
+                    finally:
+                        (state / "release").touch()
+                        if launcher.poll() is None:
+                            launcher.kill()
+                        launcher.communicate(timeout=5)
+                        if (state / "pids").exists() and not (state / "stopped").exists():
+                            for pid in (state / "pids").read_text().splitlines():
+                                try:
+                                    os.kill(int(pid), signal.SIGKILL)
+                                except ProcessLookupError:
+                                    pass
+
+    def test_cleanup_keep_servers_only_after_success_and_preserves_exit_status(self):
+        script = self.source("cleanup() {", "server_rows() {")
+        for complete in (0, 1):
+            for keep in (0, 1):
+                for termination, status in (("exit 7", 7), ("kill -INT $$", 130),
+                                            ("kill -TERM $$", 143)):
+                    with self.subTest(complete=complete, keep=keep, termination=termination):
+                        result = subprocess.run(["bash", "-c", script + '''
+KEEP_SERVERS="$1"; STARTUP_COMPLETE="$2"; PIDS=();
+stop_layout() { echo stop; PIDS=(); };
+release_startup_lock() { echo unlock; };
+''' + termination + "\necho resumed", "test", str(keep), str(complete)],
+                            capture_output=True, text=True, timeout=5)
+                        self.assertEqual(result.returncode, status, result.stderr)
+                        expected = ["unlock"] if keep and complete else ["stop", "unlock"]
+                        self.assertEqual(result.stdout.splitlines(), expected)
 
     def test_cpu_launch_exact_plan_flags(self):
         p = resources.startup_plan(base, ["q38"], [], 131072, startup_policy="allow-cpu-only",
@@ -315,6 +697,36 @@ die() { exit 1; }; ensure_llamacpp
             self.assertIn("-DGGML_CUDA=OFF", args)
             self.assertNotIn("CMAKE_CUDA_COMPILER", args)
             self.assertNotIn("forbidden", result.stdout)
+
+    def test_generated_gateway_routes_have_explicit_independent_cpu_capacity(self):
+        p = resources.startup_plan(
+            base, ["q38"], [base.GPU(i, "GPU", 12000, 11000) for i in (0, 1)], 131072,
+            startup_policy="allow-cpu-only", classifier_model="q38", classifier_gpu=1,
+            host=resources.Host(64000, None, 64000, tuple(range(8)), 8, ()),
+            metadata={"version": 1, "placements": [calibration(), calibration(mode="cpu")]})
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            state = pathlib.Path(directory)
+            plan, backends = state / "plan.json", state / "backends"
+            plan.write_text(json.dumps(p))
+            backends.write_text("".join(f"{s['id']}\t{19000+i}\tmodel\n"
+                                       for i, s in enumerate(p["servers"])))
+            source = self.source("write_gateway_config() {", "start_gateway()")
+            result = subprocess.run(["bash", "-c", source + '''
+PLAN_FILE="$1"; STATE_DIR="$2"; BACKENDS_TSV="$3";
+CLASSIFIER_REQUEST_MODELS=(classifier-request);
+write_gateway_config; cat "$GATEWAY_CONFIG"
+''', "test", str(plan), str(state), str(backends)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            config = json.loads(result.stdout)
+            main = config["roles"]["sonnet"]
+            classifier = config["models"]["classifier-request"]
+            self.assertEqual(main["cpu_fallback"]["backend_alias"], p["role_ids"]["sonnet"] + "-cpu")
+            self.assertEqual(classifier["cpu_fallback"]["backend_alias"], "local-classifier-cpu")
+            self.assertEqual(main["slots"], 2)
+            self.assertEqual(classifier["cpu_fallback"]["slots"], 2)
+            self.assertEqual(classifier["cpu_fallback"]["proxy_attempts"], 1)
+            router = gateway.Router(config)
+            self.assertEqual(len(router.active), 4)
 
     def test_readiness_failure_is_bounded(self):
         p = base.plan(["q38"], [base.GPU(0, "GPU", 64000, 64000)], 131072)
@@ -429,7 +841,7 @@ class RuntimeValidationTests(unittest.TestCase):
                  self.assertRaises(ValueError):
                 validate.warmup("http://127.0.0.1:1", "local-classifier", 0, 1)
 
-    def test_offload_log_enforces_gpu_hybrid_cpu_placement(self):
+    def test_offload_log_enforces_gpu_cpu_placement(self):
         with tempfile.TemporaryDirectory(dir=ROOT) as directory:
             root = pathlib.Path(directory)
             log = root / "main.log"
@@ -439,7 +851,7 @@ class RuntimeValidationTests(unittest.TestCase):
                 ("gpu", 999, "offloaded 32/65 layers to GPU", False),
                 ("gpu", 999, "offloaded 65/65 layers to GPU", True),
                 ("hybrid", 32, "offloaded 31/65 layers to GPU", False),
-                ("hybrid", 32, "offloaded 32/65 layers to GPU", True),
+                ("hybrid", 32, "offloaded 32/65 layers to GPU", False),
                 ("hybrid", 65, "offloaded 65/65 layers to GPU", False),
                 ("cpu", 0, "offloaded 1/65 layers to GPU", False),
                 ("cpu", 0, "", True),

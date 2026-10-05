@@ -591,7 +591,7 @@ def main() -> int:
     lp.add_argument("--classifier-gpu", type=int)
     lp.add_argument("--classifier-context", type=int, default=32768)
     lp.add_argument("--startup-policy", default="gpu-only",
-                    choices=("gpu-only", "allow-hybrid", "allow-cpu-only"))
+                    choices=("gpu-only", "allow-cpu-only"))
     lp.add_argument("--memory-metadata", help="versioned calibrated placement JSON")
     lp.add_argument("--min-quality", type=int, default=0)
     lp.add_argument("--max-layouts", type=int, default=3)

@@ -18,6 +18,7 @@ import http.client
 import json
 import signal
 import sys
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
@@ -47,6 +48,37 @@ class Router:
             if model.lower() in self.alias_map:
                 raise ValueError(f"additional model route conflicts with Claude role: {model}")
             self.alias_map[model.lower()] = route
+        self.lock = threading.Lock()
+        self.active: dict[str, int] = {}
+        self.capacities: dict[str, int] = {}
+        for route in (*self.roles.values(), *self.models.values()):
+            for backend in (route, route.get("cpu_fallback")):
+                if backend is None:
+                    continue
+                slots = backend.get("slots", 2)
+                if type(slots) is not int or not 1 <= slots <= 64:
+                    raise ValueError("backend slots must be 1..64")
+                key = self.key(backend)
+                if key in self.capacities and self.capacities[key] != slots:
+                    raise ValueError("conflicting slot capacities for shared backend")
+                self.capacities[key] = slots
+                self.active[key] = 0
+
+    @staticmethod
+    def key(route: dict) -> str:
+        return route["url"]
+
+    def acquire(self, route: dict) -> bool:
+        key = self.key(route)
+        with self.lock:
+            if self.active[key] >= self.capacities[key]:
+                return False
+            self.active[key] += 1
+            return True
+
+    def release(self, route: dict):
+        with self.lock:
+            self.active[self.key(route)] -= 1
 
     def resolve(self, model: str) -> dict:
         key = (model or "").lower()
@@ -132,6 +164,33 @@ class Handler(BaseHTTPRequestHandler):
 
         requested_model = str(body.get("model", ""))
         route = self.router.resolve(requested_model)
+        fallback = route.get("cpu_fallback")
+        if not self.router.acquire(route):
+            if fallback is None or not self.router.acquire(fallback):
+                return self._json(503, {"type": "error", "error": {
+                    "type": "overloaded_error", "message": "all permitted local backend slots are busy"}})
+            route = fallback
+        try:
+            completed = self._proxy(body, route, path, requested_model)
+        finally:
+            self.router.release(route)
+        if completed:
+            return
+        # Only a pre-commit failure can reach here. Classifier fallback is
+        # configured independently; never route it through the main model.
+        if route is not fallback and fallback is not None:
+            if not self.router.acquire(fallback):
+                return self._json(503, {"type": "error", "error": {
+                    "type": "overloaded_error", "message": "CPU fallback slots are busy"}})
+            try:
+                if self._proxy(body, fallback, path, requested_model):
+                    return
+            finally:
+                self.router.release(fallback)
+        return self._json(502, {"type": "error", "error": {
+            "type": "api_error", "message": "local backend failure before response"}})
+
+    def _proxy(self, body: dict, route: dict, path: str, requested_model: str) -> bool:
         self.log_message("route model=%s backend_alias=%s endpoint=%s path=%s",
                          requested_model, route["backend_alias"], route["url"], path)
         body["model"] = route["backend_alias"]
@@ -160,6 +219,8 @@ class Handler(BaseHTTPRequestHandler):
                     except Exception:
                         pass
                     continue
+                if resp.status in (500, 502, 503, 504) and route.get("cpu_fallback"):
+                    return False
 
                 content_type = (resp.getheader("content-type") or "").lower()
                 content_length = resp.getheader("content-length")
@@ -172,24 +233,26 @@ class Handler(BaseHTTPRequestHandler):
                     if not first:
                         raise ConnectionError("backend closed SSE stream before first event")
 
-                self._forward_headers(resp, content_length)
                 committed = True
+                self._forward_headers(resp, content_length)
                 if first:
                     self.wfile.write(first)
                     self.wfile.flush()
                 while True:
                     chunk = resp.read1(65536)
                     if not chunk:
+                        if resp.length:
+                            raise ConnectionError("backend response ended before content-length")
                         break
                     self.wfile.write(chunk)
                     self.wfile.flush()
-                return
+                return True
             except (BrokenPipeError, ConnectionResetError) as exc:
                 last_exc = exc
                 if committed:
                     self.log_message("downstream/upstream connection reset after stream commit: %r", exc)
                     self.close_connection = True
-                    return
+                    return True
             except Exception as exc:
                 last_exc = exc
                 if committed:
@@ -198,7 +261,7 @@ class Handler(BaseHTTPRequestHandler):
                     # corrupts the stream and produces misleading client errors.
                     self.log_message("backend failed after stream commit: %r", exc)
                     self.close_connection = True
-                    return
+                    return True
             finally:
                 conn.close()
 
@@ -207,7 +270,7 @@ class Handler(BaseHTTPRequestHandler):
                 continue
             break
 
-        return self._json(502, {"type": "error", "error": {"type": "api_error", "message": f"local backend failure before response: {last_exc}"}})
+        return False
 
 
 def main() -> int:

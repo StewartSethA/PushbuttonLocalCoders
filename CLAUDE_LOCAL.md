@@ -87,8 +87,33 @@ claude-local qwen3.6:35b qwen3.8:27b --local-dry-run
 | Policy | Permitted complete layouts |
 |---|---|
 | `gpu-only` (default) | Every server fully GPU-offloaded |
-| `allow-hybrid` | GPU/CPU layer splits and CPU secondary servers; at least one GPU server |
-| `allow-cpu-only` | The above, plus an entirely CPU-hosted layout |
+| `allow-cpu-only` | GPU servers with pre-provisioned CPU-only overflow replicas, CPU-only servers where GPUs cannot fit the requested models, or an entirely CPU-hosted layout |
+
+There are **no hybrid weights or partial CPU/GPU layers**. `allow-hybrid` is
+rejected. CPU fallback is explicit and local, not unified-memory spill.
+With overflow enabled, each GPU backend requires a calibrated CPU-only replica
+of exactly the same `hf_spec` (model and quant), context and slot count. All
+replicas are loaded and jointly RAM/thread-budgeted **before** the gateway
+accepts requests. A missing calibration or insufficient joint budget cannot
+produce an unbudgeted runtime allocation; a fitting CPU-only startup layout
+may be selected instead. No alternate fallback model is supported.
+
+The gateway admits at most the configured active slots per backend (default
+two), shared across all aliases/families pointing to that backend. Requests use
+the GPU when a slot is available, otherwise their explicit CPU-only route.
+Both GPU and CPU saturation return HTTP 503 immediately; there is no unbounded
+inference queue. Slots remain held through response completion or detected
+stream failure/disconnect, and are released on every exit path. A downstream
+disconnect while waiting for upstream output is detected on the next write or
+backend timeout; the lease remains conservative until then.
+
+GPU connection failures, empty SSE responses and HTTP 500/502/503/504 can retry
+once on GPU and then use the configured CPU route, **only before any response
+headers/bytes are committed**. CPU fallback makes one attempt; its HTTP errors
+are forwarded and transport failures return 502. After commit, failures close
+the stream without replay, rerouting or a second response. Admission covers
+both messages and count-tokens endpoints. Direct calls to backend ports bypass
+gateway admission and are unsupported during managed use.
 
 The requested model identities, per-slot contexts and slot counts are never
 silently reduced. Quant selection remains catalogue-based. Set
@@ -104,9 +129,9 @@ Every server gets the planned layer count, cache types, batch sizes and
 adjustment. Required options are checked against the actual binary's help;
 older binaries/forks that lack them must be rebuilt or are rejected.
 
-**No built-in CPU/hybrid capacities are fabricated.** These model architectures
+**No built-in CPU capacities are fabricated.** These model architectures
 include dense, MoE and recurrent caches, so evenly dividing weights by layer
-count or using an arbitrary weight/cache percentage is unsafe. CPU/hybrid
+count or using an arbitrary weight/cache percentage is unsafe. CPU-only
 placements require `--local-memory-metadata FILE` (or
 `CLAUDE_LOCAL_MEMORY_METADATA`) containing explicit calibrated placements.
 Without it, GPU-only uses indivisible conservative catalogue envelopes:
@@ -161,11 +186,11 @@ cache_mib_per_token`, rounded up. Host reserve is 1024 MiB; each GPU retains
 512 MiB. These margins are not a guarantee against unrelated processes.
 `max_context`, `max_slots` and `max_threads` bound validity of the calibration;
 batch/ubatch and cache/FA settings are launched exactly. GPU placements must
-offload all layers including output; hybrid uses explicit partial `ngl`.
-CPU/hybrid cache types currently require f16: **CPU cache quantization and
-GPU-weights/CPU-cache-only placement are deferred**. Hybrid cache follows layer
-placement; no guessed uniform layer distribution is used. Calibrated
-GPU/hybrid entries currently support a single GPU per server; legacy
+offload all layers including output; CPU-only placements require `ngl=0`
+and zero GPU weights/cache/buffer memory.
+CPU cache types currently require f16: **CPU cache quantization and
+GPU-weights/CPU-cache-only placement are deferred**. Calibrated
+GPU entries currently support a single GPU per server; legacy
 GPU-only envelopes can still span disjoint GPU sets.
 
 For an actual calibrated CPU machine:
@@ -178,9 +203,14 @@ claude-local q38 --local-startup-policy allow-cpu-only \
 
 A distinct classifier may omit `--local-classifier-gpu` only under a fallback
 policy. The planner then prefers GPU placement but may use a calibrated CPU
-replica. An explicit physical classifier GPU remains reserved and is **never**
-moved to CPU. Observed classifier request IDs are still mandatory and cannot
-override a session route; failed classifications are never synthesized.
+server. An explicit physical classifier GPU remains reserved for its primary
+and is never reassigned to main models. Under `allow-cpu-only` its distinct,
+same-model CPU-only overflow replica is also budgeted, even with a reserved
+GPU. The classifier primary still requires that GPU to fit. Classifier
+overflow never uses the main model/backend or a different safety model.
+Observed classifier request IDs remain mandatory and cannot override a session
+route; failed classifications are never synthesized and permission policy is
+never changed.
 
 ### Startup validation and latency limits
 
@@ -194,7 +224,7 @@ per layout). Once **all** servers are healthy, concurrent real one-token
 inference warmups cover every server/slot, including the classifier, followed
 by resident RAM, cgroup/host remaining memory and GPU allocation checks.
 The loader's actual `offloaded N/M layers to GPU` report must confirm full
-GPU or the exact calibrated hybrid layer count; an unnoticed CPU execution
+GPU placement; an unnoticed partial/CPU execution
 cannot satisfy `gpu-only`. Missing/incompatible GPU load reports fail closed.
 Live RAM/VRAM/CPU admission is rechecked after provisioning and before each
 layout allocates memory, refreshing GPU usage baselines.
@@ -202,8 +232,9 @@ layout allocates memory, refreshing GPU usage baselines.
 both deadlines accept 1..3600 seconds. Builds/download provisioning is separate
 from the backend readiness deadline. Strict search is bounded to 16 GPUs,
 4096 candidates per server, 200,000 enumeration/search steps and 64 aggregate
-warmup slots. When available, attempts reserve one layout for each stage:
-fully GPU, mixed CPU/GPU, then fully CPU.
+warmup slots, including CPU-only replicas. When available, attempts reserve
+one layout for each primary-placement stage: fully GPU, mixed CPU/GPU, then
+fully CPU. No layout changes or memory transfers occur after gateway launch.
 
 Warmup verifies inference and allocation, **not** full-context throughput,
 model correctness, classifier prompt quality, or production latency. CPU
@@ -375,9 +406,10 @@ shows physical GPU placement, context per slot, and slot count. Compare idle
 and busy requests and inspect llama-server logs/metrics for slot occupancy.
 Check that classifier requests reach GPU 1 while session requests remain on
 their main backend, then exercise repeated classification under agent load.
-If the classifier fails, its HTTP error is returned; there is no alternate
-backend, cloud fallback, synthetic safety verdict, or automatic permission-mode
-change. A live GPU/Claude Code test is required to establish latency and safety
+If the classifier fails, its HTTP error is returned unless the explicit
+CPU-only policy permits its same-model pre-commit fallback. There is no cloud
+fallback, synthetic safety verdict, or automatic permission-mode change.
+A live GPU/Claude Code test is required to establish latency and safety
 compatibility; gateway unit tests alone cannot establish either.
 
 ## Useful commands

@@ -127,15 +127,13 @@ def validate_metadata(data):
             value = entry.get(key)
             if type(value) is not int or value < (0 if key == "ngl" else 1):
                 raise ValueError(f"invalid calibrated {key}")
-        if entry.get("mode") not in ("gpu", "hybrid", "cpu"):
-            raise ValueError("placement mode must be gpu, hybrid or cpu")
+        if entry.get("mode") not in ("gpu", "cpu"):
+            raise ValueError("placement mode must be gpu or cpu; hybrid weights are unsupported")
         mode = entry["mode"]
         if (mode == "cpu") != (entry["ngl"] == 0):
-            raise ValueError("CPU placement requires ngl=0; GPU/hybrid require ngl>0")
+            raise ValueError("CPU placement requires ngl=0; GPU requires ngl>0")
         if mode == "gpu" and entry["ngl"] <= entry["layer_count"]:
             raise ValueError("GPU placement must offload all layers, including output")
-        if mode == "hybrid" and entry["ngl"] > entry["layer_count"]:
-            raise ValueError("hybrid placement must leave layers on CPU")
         if entry.get("kv_k") not in ("f16", "q4_0", "q8_0") or entry.get("kv_v") not in ("f16", "q4_0", "q8_0"):
             raise ValueError("unsupported calibrated cache type")
         if mode != "gpu" and (entry["kv_k"], entry["kv_v"]) != ("f16", "f16"):
@@ -147,9 +145,7 @@ def validate_metadata(data):
         if entry["weights_host_mib"] + entry["weights_gpu_mib"] <= 0:
             raise ValueError("calibration must include model weights")
         if mode != "cpu" and entry["weights_gpu_mib"] <= 0:
-            raise ValueError("GPU/hybrid placement requires GPU weights")
-        if mode == "hybrid" and entry["weights_host_mib"] <= 0:
-            raise ValueError("hybrid placement requires CPU weights")
+            raise ValueError("GPU placement requires GPU weights")
         if mode == "gpu" and entry["cache_host_mib_per_token"]:
             raise ValueError("cache-only CPU placement is deferred")
     return entries
@@ -158,7 +154,7 @@ def validate_metadata(data):
 def startup_plan(base, models, gpus, context, *, slots=2, startup_policy="gpu-only",
                  metadata=None, host=None, min_quality=0, classifier_model=None,
                  classifier_gpu=None, classifier_context=32768, max_layouts=3):
-    if startup_policy not in ("gpu-only", "allow-hybrid", "allow-cpu-only"):
+    if startup_policy not in ("gpu-only", "allow-cpu-only"):
         raise ValueError("unknown startup policy")
     if slots < 1 or min(context, classifier_context) < 1 or not 0 <= min_quality <= 100:
         raise ValueError("invalid context, slots or minimum quality")
@@ -196,9 +192,7 @@ def startup_plan(base, models, gpus, context, *, slots=2, startup_policy="gpu-on
                 if candidate_work > 200000:
                     raise ValueError("startup candidate enumeration exceeds bounded complexity")
                 mode = e["mode"]
-                if mode == "hybrid" and startup_policy == "gpu-only":
-                    continue
-                if mode == "cpu" and (startup_policy == "gpu-only" or classifier_gpu is not None and classifier):
+                if mode == "cpu" and startup_policy == "gpu-only":
                     continue
                 if ctx > e["max_context"] or slots > e["max_slots"]:
                     continue
@@ -213,7 +207,7 @@ def startup_plan(base, models, gpus, context, *, slots=2, startup_policy="gpu-on
                                               mode, ram, vram, e))
                     if len(candidates) > 4096:
                         raise ValueError("too many startup placements; reduce GPUs/models/calibrations")
-            if not calibrated:
+            if not any(e["mode"] == "gpu" for e in calibrated):
                 # Legacy catalogue envelopes are indivisible, not 85/15
                 # weight/cache estimates. Do not extrapolate fallback from them.
                 envelope = profile.required_mib * max(1, math.ceil(ctx * slots / profile.native_context))
@@ -230,9 +224,26 @@ def startup_plan(base, models, gpus, context, *, slots=2, startup_policy="gpu-on
         if not candidates:
             raise ValueError(f"no safe {startup_policy} placement for {model}; provide calibrated "
                              "memory metadata for fallback; context/slots/quality are never reduced")
-        choices.append(candidates)
+        options = []
+        for candidate in candidates:
+            if startup_policy == "allow-cpu-only" and candidate["mode"] == "gpu":
+                # Overflow must already be resident and budgeted, using exactly
+                # the requested weights, context and classifier identity.
+                replicas = [s for s in candidates if s["mode"] == "cpu" and
+                            s["profile"]["hf_spec"] == candidate["profile"]["hf_spec"]]
+                for replica in replicas:
+                    replica = {**replica, "id": candidate["id"] + "-cpu", "fallback": True}
+                    options.append([{**candidate, "fallback_id": replica["id"]}, replica])
+                    if len(options) > 4096:
+                        raise ValueError("too many startup placements; reduce GPUs/models/calibrations")
+            else:
+                if classifier and classifier_gpu is not None and candidate["mode"] == "cpu":
+                    continue
+                options.append([candidate])
+        if not options:
+            raise ValueError(f"no calibrated CPU-only replica for {model}; overflow requires matching weights")
+        choices.append(options)
     # Reserve CPU threads jointly, including CPU helper threads for GPU servers.
-    threads = max(1, math.floor(host.cpu_capacity / len(requests)))
     if host.cpu_capacity < len(requests):
         raise ValueError("CPU quota cannot provide one concurrent thread per server")
     best = {0: [], 1: [], 2: []}
@@ -244,26 +255,28 @@ def startup_plan(base, models, gpus, context, *, slots=2, startup_policy="gpu-on
         if explored > 200000:
             raise ValueError("startup search exceeds bounded complexity; reduce models/GPUs/calibrations")
         if i == len(choices):
-            if startup_policy == "allow-hybrid" and all(s["mode"] == "cpu" for s in selected):
+            if len(selected) > host.cpu_capacity or sum(s["slots"] for s in selected) > 64:
                 return
-            primary = next(s for s in selected if not s["classifier"] and s["model"] == roles["sonnet"])
-            classifier = next((s for s in selected if s["classifier"]), None)
-            rank = {"gpu": 2, "hybrid": 1, "cpu": 0}
+            primaries = [s for s in selected if not s.get("fallback")]
+            primary = next(s for s in primaries if not s["classifier"] and s["model"] == roles["sonnet"])
+            classifier = next((s for s in primaries if s["classifier"]), None)
+            rank = {"gpu": 2, "cpu": 0}
             score = (rank[primary["mode"]] + (rank[classifier["mode"]] if classifier else 0),
-                     rank[primary["mode"]], sum(rank[s["mode"]] for s in selected),
+                     rank[primary["mode"]], sum(rank[s["mode"]] for s in primaries),
                      -sum(len(s["gpus"]) for s in selected),
                      sum(s["profile"]["quality"] for s in selected), -ram)
-            stage = (0 if all(s["mode"] == "gpu" for s in selected)
-                     else 2 if all(s["mode"] == "cpu" for s in selected) else 1)
+            stage = (0 if all(s["mode"] == "gpu" for s in primaries)
+                     else 2 if all(s["mode"] == "cpu" for s in primaries) else 1)
             best[stage].append((score, selected))
             best[stage].sort(key=lambda x: x[0], reverse=True)
             del best[stage][max_layouts:]
             return
-        for s in choices[i]:
-            indices = {g["index"] for g in s["gpus"]}
-            if used & indices or ram + s["ram_required_mib"] > host.usable_mib - host.reserve_mib:
+        for option in choices[i]:
+            indices = {g["index"] for s in option for g in s["gpus"]}
+            required = sum(s["ram_required_mib"] for s in option)
+            if used & indices or ram + required > host.usable_mib - host.reserve_mib:
                 continue
-            search(i + 1, selected + [s], used | indices, ram + s["ram_required_mib"])
+            search(i + 1, selected + option, used | indices, ram + required)
 
     search(0, [], set(), 0)
     stages = [stage for stage in best.values() if stage]
@@ -275,6 +288,7 @@ def startup_plan(base, models, gpus, context, *, slots=2, startup_policy="gpu-on
     ranked.extend(proposal for stage in stages for proposal in stage[1:])
     layouts = []
     for _, selected in ranked[:max_layouts]:
+        threads = max(1, math.floor(host.cpu_capacity / len(selected)))
         servers = [{**s, "threads": min(threads, s["max_threads"]),
                     "threads_batch": min(threads, s["max_threads"])} for s in selected]
         role_ids = {r: next(s["id"] for s in servers if not s["classifier"] and s["model"] == m)
