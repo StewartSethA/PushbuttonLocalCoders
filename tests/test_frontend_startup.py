@@ -280,7 +280,7 @@ class StartupTests(unittest.TestCase):
                 self.assertFalse((self.root / "state").exists())
 
     def test_source_launchers_are_executable(self):
-        for name in ("hermes-local", "mini-swe-local"):
+        for name in ("hermes-local", "mini-swe-local", "qwen-local", "claude-local-safe"):
             with self.subTest(frontend=name):
                 result = subprocess.run([str(ROOT / name), "--help"], cwd=self.cwd,
                                         env=self.env, text=True, capture_output=True, timeout=5)
