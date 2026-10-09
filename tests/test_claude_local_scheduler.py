@@ -96,6 +96,9 @@ class SchedulerPolicyTests(unittest.TestCase):
         p = planmod.plan(["q38@context=32K,client_context=20K"], gpus, 262144,
                          client_context=24576)
         self.assertEqual(p["servers"][0]["capacity"]["client_context"], 20480)
+        with self.assertRaisesRegex(ValueError, "global client_context"):
+            planmod.plan(["q38@context=32K,client_context=20K"], gpus, 262144,
+                         client_context=65536)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,1 @@
+{"instances": [{"id": "i1", "model": "logical-model", "backend": "llama.cpp", "endpoint": "http://127.0.0.1:33919/v1", "max_context": 128, "framework_max_concurrency": 1, "measured_envelopes": [{"concurrency": 1, "max_context": 128, "safe": true, "evidence": "PROVEN"}], "tg": 50.0, "tg_measured": true, "healthy": true}]}

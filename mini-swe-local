@@ -40,12 +40,12 @@ mapfile -t rows < <(python3 - "$QWEN_HOME/settings.json" <<'PY'
 import json,sys
 q=json.load(open(sys.argv[1]))
 for i,m in enumerate(q['modelProviders']['openai'],1):
- print(i, m['id'], m['baseUrl'])
+ print(i, m['id'], m['baseUrl'], m.get('generationConfig',{}).get('samplingParams',{}).get('max_tokens',32768))
 PY
 )
 [[ ${#rows[@]} -gt 0 ]] || { echo "no Pushbutton workers available" >&2; exit 1; }
 make_cfg(){
-  local i="$1" mid="$2" url="$3" cfg="$root/configs/worker-$i.yaml"
+  local i="$1" mid="$2" url="$3" output="$4" cfg="$root/configs/worker-$i.yaml"
   cat >"$cfg" <<CFG
 model:
   model_name: "openai/$mid"
@@ -54,6 +54,7 @@ model:
     custom_llm_provider: "openai"
     api_base: "$url"
     api_key: "pushbutton-local"
+    max_tokens: $output
 CFG
   printf '%s\n' "$cfg"
 }
@@ -61,14 +62,14 @@ swarm="${MINI_SWE_SWARM_TASK:-}"
 if [[ -n "$swarm" ]]; then
   pids=(); i=0
   for row in "${rows[@]}"; do
-    read -r n mid url <<<"$row"; cfg="$(make_cfg "$n" "$mid" "$url")"; log="$root/runs/worker-$n.log"
+    read -r n mid url output <<<"$row"; cfg="$(make_cfg "$n" "$mid" "$url" "$output")"; log="$root/runs/worker-$n.log"
     echo "[mini-swe-local] worker $n -> $mid ($url); log=$log"
     mini -c "$cfg" -t "$swarm" -y > >(tee "$log") 2>&1 & pids+=("$!"); i=$((i+1))
   done
   rc=0; for p in "${pids[@]}"; do wait "$p" || rc=1; done
   exit "$rc"
 fi
-read -r n mid url <<<"${rows[0]}"; cfg="$(make_cfg "$n" "$mid" "$url")"
+read -r n mid url output <<<"${rows[0]}"; cfg="$(make_cfg "$n" "$mid" "$url" "$output")"
 if ((${#rows[@]} > 1)); then
   echo "[mini-swe-local] interactive mini uses worker 1; use --swarm TASK to run all ${#rows[@]} workers concurrently." >&2
 fi

@@ -10,6 +10,7 @@ import claude_local_plan as plan
 import coder_local_plan as workers
 import pushbutton_metrics as metrics
 import pushbutton_policy as policy
+import pushbutton_capacity as capacity_settings
 
 CATALOG_PATH=ROOT/'configs/model-catalog.json'
 def catalog():
@@ -134,20 +135,36 @@ def catalog_rows(model,gpu,capacity,ram_cap,context):
   rows.append({'model':model,'backend':'vllm/llama.cpp','artifact':'397B checkpoint / GGUF','req':None,'ram_req':None,'quality':'native','pp':None,'tg':None,'status':'UNVERIFIED','note':'large-node model; exact local quant/memory profile must be measured before automatic launch','evidence':'UNKNOWN','spread':{}})
  return rows
 
-def rows_for(model,gpu,cap,ram_cap,context,gpus=None):
+def rows_for(model,gpu,cap,ram_cap,context,gpus=None,request=None,slots=1):
  rows=[]; gpu_name=gpu.name if gpu else None
  gpus=gpus if gpus is not None else ([gpu] if gpu else [])
+ request=request or workers.WorkerRequest(model)
+ settings=capacity_settings.resolve_options(request.capacity,context,slots)
+ context=settings['context']
+ if request.vram_limit_mib is not None:cap=request.vram_limit_mib
+ if request.gpu_indices is not None:gpus=[g for g in gpus if g.index in request.gpu_indices]
  effective=[replace(g,free_mib=min(g.free_mib,cap)) if cap is not None else g for g in gpus]
  registry=json.loads((ROOT/'configs/backend-registry.json').read_text())['backends']
  baseline_gpus=[g for g in effective if 'sm'+g.compute_cap.replace('.','') in registry['llama.cpp']['gpu_arch']]
  capacity=sum(g.free_mib for g in baseline_gpus)
  if model in plan.PROFILES:
+  fitting=workers.candidates_for_request(replace(request,vram_limit_mib=cap),baseline_gpus,context,slots,quality_filter=False) if baseline_gpus else []
+  fitting_quants={c.profile.quant for c in fitting}
   for p in plan.PROFILES[model]:
-   req=plan.scaled_required_mib(p,context)
-   status=('FIT' if req<=capacity else 'BLOCK') if baseline_gpus else ('UNAVAILABLE' if effective else 'UNKNOWN')
+   note='baseline; conservative VRAM planning envelope, not measured allocation; host RAM minimum unknown; '+p.note
+   try:
+    resolved=workers.request_capacity(request,p,context,slots)
+    req=resolved['memory_estimate']['required_mib']
+    status=('FIT' if p.quant in fitting_quants else 'BLOCK') if baseline_gpus else ('UNAVAILABLE' if effective else 'UNKNOWN')
+   except ValueError as error:
+    resolved=settings;req=None;status='UNAVAILABLE';note+='; '+str(error)
+   if settings.get('quant') and settings['quant']!=p.quant.upper():
+    status='UNAVAILABLE';note+='; excluded by requested quant'
    obs,sm=measured_summary(model,'llama.cpp',gpu_name,context,p.quant)
+   if settings['slots']!=1 or settings.get('kv_k',p.kv_k)!=p.kv_k or settings.get('kv_v',p.kv_v)!=p.kv_v:
+    obs=[];sm={};note+='; no matching slot/cache throughput evidence'
    pp=(sm.get('pp') or {}).get('median'); tg=(sm.get('tg') or {}).get('median')
-   rows.append({'model':model,'backend':'llama.cpp','artifact':p.quant,'req':req,'ram_req':None,'quality':str(p.quality),'pp':pp,'tg':tg,'status':status,'note':'baseline; conservative VRAM planning envelope, not measured allocation; host RAM minimum unknown; '+p.note,'evidence':evidence_label(obs,sm),'spread':sm})
+   rows.append({'model':model,'backend':'llama.cpp','artifact':p.quant,'req':req,'ram_req':None,'quality':str(p.quality),'pp':pp,'tg':tg,'status':status,'note':note,'evidence':evidence_label(obs,sm),'spread':sm,'capacity':resolved})
  if model not in plan.PROFILES:rows+=catalog_rows(model,gpu,capacity if baseline_gpus else None,ram_cap,context)
  for (m,b),d in UPSTREAM.items():
   if m!=model:continue
@@ -169,6 +186,13 @@ def rows_for(model,gpu,cap,ram_cap,context,gpus=None):
   obs,sm=measured_summary(model,backend,gpu_name,context)
   rows.append({'model':model,'backend':backend,'artifact':d.get('artifact','recipe-specific'),'req':None,'ram_req':None,'quality':'n/a','pp':(sm.get('pp') or {}).get('median'),'tg':(sm.get('tg') or {}).get('median'),'status':status,'note':f"experimental; {note}; {d['notes']} Source: {d['source']}",'evidence':evidence_label(obs,sm),'spread':sm})
  for r in rows:
+  r.setdefault('capacity',settings)
+  if r['backend']=='llama.cpp' and model not in plan.PROFILES and (settings['slots']!=1 or any(k in settings for k in ('kv_k','kv_v','quant'))):
+   r.update(status='UNAVAILABLE',req=None,pp=None,tg=None,evidence='UNKNOWN',spread={})
+   r['note']+='; no planner capacity profile for requested slots/quant/cache overrides'
+  if r['backend']!='llama.cpp' and (settings['slots']!=1 or any(k in settings for k in ('kv_k','kv_v','quant'))):
+   r.update(status='UNAVAILABLE',pp=None,tg=None,evidence='UNKNOWN',spread={})
+   r['note']+='; requested slots/quant/cache overrides are unsupported by this adapter'
   metadata=registry.get(r['backend'],{})
   r['support']=metadata.get('status','catalogued')
   r['frontend_integrated']=r['backend']=='llama.cpp' and model in plan.PROFILES
@@ -255,9 +279,7 @@ def joint_preview(models,frontend,agents,gpus,context,cap=None,gpu_indices=None,
   requests=[workers.parse_model_spec(m,defaults) for m in models]
   requests=[replace(r,gpu_indices=r.gpu_indices if r.gpu_indices is not None else gpu_indices,
                     vram_limit_mib=r.vram_limit_mib if r.vram_limit_mib is not None else cap) for r in requests]
-  if client_context is not None:
-   requests=[replace(r,capacity={**r.capacity, 'client_context':r.capacity.get('client_context',client_context)}) for r in requests]
-  result=workers.build_plan(requests,agents,gpus,context,slots)
+  result=workers.build_plan(requests,agents,gpus,context,slots,client_context)
   # Pin each independent worker to its previewed GPU set and lease.
   launch_models=[]
   for w in result['workers']:
@@ -265,22 +287,17 @@ def joint_preview(models,frontend,agents,gpus,context,cap=None,gpu_indices=None,
    if w['vram_limit_mib_per_gpu'] is not None:spec+=f",vram={w['vram_limit_mib_per_gpu']}MiB"
    # Carry the exact capacity/precision plan into the launcher's replan.
    c=w['capacity']
-   spec+=f",context={c['context']},slots={c['slots']},output={c['output_tokens']},client_context={c['client_context']},compact={c['compact_trigger']},kv_k={w['profile']['kv_k']},kv_v={w['profile']['kv_v']}"
+   spec+=f",context={c['context']},slots={c['slots']},output={c['output_tokens']},client_context={c['client_context']},compact={c['compact_trigger']},safety={c['safety_tokens']},kv_k={w['profile']['kv_k']},kv_v={w['profile']['kv_v']}"
    if c.get('min_tps') is not None:spec+=f",min_tps={c['min_tps']}"
-   spec+=f",admission={c['admission_limit']},quant={w['profile']['quant']}"
+   if c.get('admission_explicit',True):spec+=f",admission={c['admission_limit']}"
+   spec+=f",quant={w['profile']['quant']}"
    launch_models.append(spec)
  else:
   if agents is not None:raise ValueError('Claude/Hermes use shared roles, not independent --agents replicas')
   if cap is not None or gpu_indices is not None:
    raise ValueError('GPU pins/leases are supported by coder frontends only; Claude/Hermes use their role planner')
   launch_models=[canon(m.split('@',1)[0])+('@'+m.split('@',1)[1] if '@' in m else '') for m in models]
-  if client_context is not None:
-   launch_models=[m+(',' if '@' in m else '@')+f'client_context={client_context}'
-                  if not re.search(r'(?:@|,)client_context=',m) else m for m in launch_models]
-  result=plan.plan(launch_models,gpus,context,slots)
- if client_context is not None:
-  if any(client_context>w['capacity']['context'] for w in result.get('workers',result.get('servers',[]))):
-   raise ValueError('explicit client context must be no larger than every per-model hard context')
+  result=plan.plan(launch_models,gpus,context,slots,client_context=client_context)
  result['unused_gpus'] += [asdict(g) for g in unsupported]
  return result,launch_models
 
@@ -368,10 +385,33 @@ def main():
  client_context=min(200000,a.context) if a.client_context is None else a.client_context
  if client_context<=0:raise ValueError('client context must be positive')
  if ram_cap is None:_,ram_cap=ram_info()
- tables={selector_model(m):rows_for(selector_model(m),gpu,cap,ram_cap,a.context,[gpu] if gpu else inv) for m in models}
+ tables={};instance_tables=[]
+ defaults=workers.load_placement_config(a.placement_config) if a.frontend in CODER_FRONTENDS else {}
+ indices=workers.parse_gpu_indices(a.gpus) if a.gpus else ((a.gpu,) if a.gpu is not None else None)
+ requests=[]
+ for model_spec in models:
+  model=selector_model(model_spec)
+  request=workers.parse_model_spec(model_spec,defaults) if model in plan.PROFILES else workers.WorkerRequest(model)
+  request=replace(request,gpu_indices=request.gpu_indices if request.gpu_indices is not None else indices,
+                  vram_limit_mib=request.vram_limit_mib if request.vram_limit_mib is not None else cap)
+  requests.append(request)
+ if a.frontend in CODER_FRONTENDS:requests=workers.expand_workers(requests,a.agents)
+ for index,request in enumerate(requests,1):
+  try:
+   request=workers.apply_client_context([request],a.context,a.client_context)[0]
+   rs=rows_for(request.model,gpu,cap,ram_cap,a.context,inv,request,a.slots)
+   resolved=capacity_settings.resolve_options(request.capacity,a.context,a.slots)
+   instance={'instance':index,'model':request.model,'capacity':resolved,'rows':rs,'error':None}
+  except ValueError as exc:
+   rs=[];instance={'instance':index,'model':request.model,'capacity':None,'rows':rs,'error':str(exc)}
+  tables.setdefault(request.model,rs)
+  instance_tables.append(instance)
  if not a.json:
-  for model,rs in tables.items():
-   print(f'\n{model} — available profiles (single-model guidance; joint plan below is authoritative)')
+  for instance in instance_tables:
+   model=instance['model'];rs=instance['rows'];resolved=instance['capacity']
+   print(f"\nInstance {instance['instance']}: {model} — available profiles (individual guidance; joint plan below is authoritative)")
+   if resolved:print(f"  hard={resolved['context']} slots={resolved['slots']} client={resolved['client_context']} output={resolved['output_tokens']}")
+   if instance['error']:print('  '+instance['error'])
    print_table(rs,gpu,cap,ram_cap,model)
    for r in rs:
     if 'validation_argv' in r:
@@ -379,7 +419,6 @@ def main():
  if action=='2':return 0
  error=None; result=None; command=None; launch_env={}
  try:
-  indices=workers.parse_gpu_indices(a.gpus) if a.gpus else ((a.gpu,) if a.gpu is not None else None)
   result,launch_models=joint_preview(models,a.frontend,a.agents,inv,a.context,cap,indices,a.placement_config,a.slots,a.client_context)
   capacities=[w['capacity'] for w in result.get('workers',result.get('servers',[]))]
   client_context=min(c['client_context'] for c in capacities)
@@ -396,7 +435,7 @@ def main():
    launch_env['PUSHBUTTON_SELECTOR_GPU_INDICES']=','.join(
     str(g['index']) for server in result['servers'] for g in server['gpus'])
  except ValueError as exc:error=str(exc)
- obj={'models':models,'frontend':a.frontend,'context':a.context,'client_context':client_context,'ram_limit_mib':ram_cap,'host_ram_fit':'unknown; no proven minimum','vram_limit_mib_per_gpu':cap,'inventory':[asdict(g) for g in inv],'rows':tables,'plan':result,'launch_argv':command,'launch_env':launch_env,'error':error,'speed_floor_tg':policy.MIN_DECODE_TOK_S,'capability_benchmarks':{m:catalog().get(m,{}).get('benchmarks',{}) for m in tables}}
+ obj={'models':models,'frontend':a.frontend,'context':a.context,'client_context':client_context,'ram_limit_mib':ram_cap,'host_ram_fit':'unknown; no proven minimum','vram_limit_mib_per_gpu':cap,'inventory':[asdict(g) for g in inv],'rows':tables,'instances':instance_tables,'plan':result,'launch_argv':command,'launch_env':launch_env,'error':error,'speed_floor_tg':policy.MIN_DECODE_TOK_S,'capability_benchmarks':{m:catalog().get(m,{}).get('benchmarks',{}) for m in tables}}
  if a.json:print(json.dumps(obj,indent=2))
  elif error:print(f'\nCannot launch: {error}',file=sys.stderr)
  else:
@@ -405,7 +444,10 @@ def main():
    print(f"  {w['model']} {w['profile']['quant']}: GPUs {w['cuda_visible_devices']}, envelope {fmt_mib(w['required_mib'])}, free lease capacity {fmt_mib(w['allocated_mib'])}, per-GPU lease {fmt_mib(w.get('vram_limit_mib_per_gpu'))}")
    c=w['capacity']
    print(f"    slots={c['slots']} hard={c['context']} input={c['input_tokens']} output={c['output_tokens']} client={c['client_context']} compact={c['compact_trigger']}")
-   row=next((r for r in tables[w['model']] if r['artifact']==w['profile']['quant']),None)
+   if c.get('min_tps') is not None:
+    print(f"    WARNING: min_tps={c['min_tps']} is requested, not proven; no runtime throughput SLA is verified by this preview.")
+   instance=next((i for i in instance_tables if i['instance']==w.get('worker')),None) if 'worker' in w else next((i for i in instance_tables if i['model']==w['model']),None)
+   row=next((r for r in (instance['rows'] if instance else []) if r['artifact']==w['profile']['quant']),None)
    if row and row['speed_status'] in {'SLOW','VERY_SLOW'}:
     print('\n*** SERIOUS SLOWNESS WARNING ***\n'+row['speed_warning'],file=sys.stderr)
   if 'roles' in result:print('  Shared roles: '+json.dumps(result['roles']))

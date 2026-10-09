@@ -5,6 +5,7 @@ import unittest
 ROOT=pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'lib'))
 import pushbutton_pool as pool
+import pushbutton_capacity as capacity
 
 
 class PoolTests(unittest.TestCase):
@@ -44,7 +45,22 @@ class PoolTests(unittest.TestCase):
         self.assertEqual(x.capacity(8192),2)
         self.assertEqual(x.context_limit(),8192)
         x.request_capacity['min_tps']=50
+        x.tg=45
         self.assertEqual(x.capacity(8192),1)
+        self.assertEqual(x.speed()[0],'SLOW')
+        self.assertIn('50',x.speed()[1])
+        self.assertIn('not an SLA guarantee',x.speed()[1])
+        x.request_capacity.update(min_tps=None,admission_limit=None)
+        self.assertEqual(x.capacity(8192),4)
+
+    def test_full_resolved_capacity_default_min_tps_is_none(self):
+        resolved=capacity.resolve_options({},8192,slots=4)
+        self.assertIsNone(resolved['min_tps'])
+        x=self.inst(request_capacity=resolved,measured_envelopes=[
+            {'concurrency':4,'max_context':8192,'tg_per_client_p10':30}])
+        self.assertEqual(x.context_limit(),8192)
+        self.assertEqual(x.capacity(8192),resolved['admission_limit'])
+        self.assertEqual(x.speed()[0],'OK')
 
 
 if __name__=='__main__':unittest.main()

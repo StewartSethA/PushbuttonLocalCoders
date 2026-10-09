@@ -9,12 +9,14 @@ def free_port():
 
 
 class FakeState:
-    lock=threading.Lock();active=0;max_active=0;calls=0
+    lock=threading.Lock();active=0;max_active=0;calls=0;native_calls=0
 
 
 class FakeBackend(BaseHTTPRequestHandler):
     def log_message(self,*a):pass
     def do_GET(self):
+        if self.path == '/props':
+            b=json.dumps({'default_generation_settings':{'n_ctx':128},'total_slots':1}).encode();self.send_response(200);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(b)));self.end_headers();self.wfile.write(b);return
         if self.path.endswith('/models'):
             b=json.dumps({'data':[{'id':'backend-real-id'}]}).encode();self.send_response(200);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(b)));self.end_headers();self.wfile.write(b);return
         self.send_error(404)
@@ -23,7 +25,12 @@ class FakeBackend(BaseHTTPRequestHandler):
         if self.path == '/apply-template':
             out={'prompt': ''.join(m.get('content','') for m in obj.get('messages',[])) + json.dumps(obj.get('tools',[]))}
         elif self.path == '/tokenize':
-            out={'tokens': list(range(len(obj.get('content',''))))}
+            if 'messages' in obj:
+                count=len(''.join(m.get('content','') for m in obj['messages']))+len(json.dumps(obj.get('tools',[])))
+                out={'count':count,'tokens':list(range(count)),'max_model_len':128}
+                FakeState.native_calls+=1
+            else:
+                out={'tokens': list(range(len(obj.get('content',''))))}
         else:
             out=None
         if out is not None:
@@ -40,6 +47,7 @@ class FakeBackend(BaseHTTPRequestHandler):
 class BrokerTests(unittest.TestCase):
     def setUp(self):
         FakeState.active=FakeState.max_active=FakeState.calls=0
+        FakeState.native_calls=0
         self.backend_port=free_port();self.backend=ThreadingHTTPServer(('127.0.0.1',self.backend_port),FakeBackend);self.bt=threading.Thread(target=self.backend.serve_forever,daemon=True);self.bt.start()
         self.td=tempfile.TemporaryDirectory(dir=ROOT);state=pathlib.Path(self.td.name);self.broker_port=free_port()
         reg={'instances':[{'id':'i1','model':'logical-model','backend':'llama.cpp','endpoint':f'http://127.0.0.1:{self.backend_port}/v1','max_context':128,'framework_max_concurrency':1,'measured_envelopes':[{'concurrency':1,'max_context':128,'safe':True,'evidence':'PROVEN'}],'tg':50.0,'tg_measured':True,'healthy':True}]}
@@ -91,6 +99,14 @@ class BrokerTests(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as cm:
             self.request(model='small',text='x'*70)
         self.assertEqual(cm.exception.code,400)
+        self.assertEqual(FakeState.calls,1)
+    def test_known_vllm_route_uses_native_chat_tokenizer(self):
+        path=pathlib.Path(self.td.name)/'instances.json'
+        registry=json.loads(path.read_text())
+        registry['instances'][0]['backend']='vllm-qwen38-3090'
+        path.write_text(json.dumps(registry))
+        self.request()
+        self.assertEqual(FakeState.native_calls,1)
         self.assertEqual(FakeState.calls,1)
     def test_maintenance_lease_queues_new_work_until_release(self):
         lease=self.control('/pushbutton/maintenance/acquire',{'id':'i1'});self.assertTrue(lease['ok'])

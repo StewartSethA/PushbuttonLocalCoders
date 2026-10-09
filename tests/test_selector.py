@@ -12,6 +12,7 @@ import unittest
 from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+FIXTURE_DIR = ROOT / ".git" / "pushbutton-test-fixtures"
 SEL = ROOT / 'pushbutton-select'
 loader = importlib.machinery.SourceFileLoader('selector', str(SEL))
 spec = importlib.util.spec_from_loader(loader.name, loader)
@@ -23,6 +24,9 @@ runtime = importlib.util.module_from_spec(runtime_spec)
 runtime_loader.exec_module(runtime)
 
 class SelectorTests(unittest.TestCase):
+    def setUp(self):
+        FIXTURE_DIR.mkdir(exist_ok=True)
+
     def run_sel(self, *args, gpus=None, tty=False, inputs=()):
         out, err = io.StringIO(), io.StringIO()
         with contextlib.ExitStack() as stack:
@@ -77,7 +81,7 @@ class SelectorTests(unittest.TestCase):
         self.assertIn('No model supplied', cp.stdout)
 
     def test_telemetry_is_explicit_opt_in(self):
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory(dir=FIXTURE_DIR) as td:
             with mock.patch.object(selector.metrics, 'CONFIG', pathlib.Path(td)):
                 code, _, err, _, _ = self.run_sel(
                     'qwen3.8:27b', '--vram-limit', '16G', '--no-interactive',
@@ -144,7 +148,7 @@ class SelectorTests(unittest.TestCase):
 
     def test_per_model_capacities_and_precision_survive_preview_replan(self):
         code, out, _, launch, _ = self.run_sel(
-            "q38@context=8192,slots=3,output=1024,client_context=7000,compact=4500,kv_k=q8_0",
+            "q38@context=8192,slots=3,output=1024,client_context=7000,compact=4500,safety=128,kv_k=q8_0",
             "--slots", "2", "--json", gpus=selector.workers.synthetic_v100(2))
         obj = json.loads(out)
         self.assertEqual(code, 0, obj)
@@ -191,6 +195,48 @@ class SelectorTests(unittest.TestCase):
         self.assertEqual(code, 0, out)
         args = json.loads(out)["launch_argv"]
         self.assertLess(args.index("--slots"), args.index("--"))
+
+    def test_requested_throughput_is_not_promised_by_preview(self):
+        code, out, _, launch, _ = self.run_sel(
+            "q38@context=8192,min_tps=25", "--no-interactive",
+            gpus=selector.workers.synthetic_v100(2))
+        self.assertEqual(code, 0, out)
+        self.assertIn("min_tps=25.0 is requested, not proven", out)
+        launch.assert_not_called()
+
+    def test_capacity_specific_rows_match_joint_plan_memory_and_quant(self):
+        code, out, _, _, _ = self.run_sel(
+            "q38@gpu=0,context=8192,slots=3,quant=UD-Q4_K_M,kv_k=q8_0",
+            "--json", gpus=selector.workers.synthetic_v100(2))
+        obj = json.loads(out)
+        self.assertEqual(code, 0, obj)
+        worker = obj["plan"]["workers"][0]
+        rows = obj["instances"][0]["rows"]
+        selected = next(row for row in rows if row["artifact"] == worker["profile"]["quant"])
+        self.assertEqual(selected["req"], worker["required_mib"])
+        self.assertEqual(selected["status"], "FIT")
+        self.assertEqual(selected["capacity"]["slots"], 3)
+        self.assertEqual(selected["capacity"]["kv_k"], "q8_0")
+        self.assertTrue(all(row["status"] == "UNAVAILABLE" for row in rows
+                            if row["backend"] == "llama.cpp" and row is not selected))
+        self.assertTrue(all(row["status"] == "UNAVAILABLE" for row in rows
+                            if row["backend"] != "llama.cpp"))
+        self.assertTrue(all(row["evidence"] == "UNKNOWN" for row in rows))
+
+    def test_repeated_model_instances_have_distinct_capacity_tables(self):
+        code, out, _, _, _ = self.run_sel(
+            "q38@gpu=0,context=8192,slots=2,quant=UD-Q4_K_M",
+            "q38@gpu=1,context=65536,slots=3,quant=UD-Q4_K_M",
+            "--json", gpus=selector.workers.synthetic_v100(2))
+        obj = json.loads(out)
+        self.assertEqual(code, 0, obj)
+        self.assertEqual([i["capacity"]["context"] for i in obj["instances"]], [8192, 65536])
+        self.assertEqual([i["capacity"]["slots"] for i in obj["instances"]], [2, 3])
+        selected = [next(r for r in i["rows"] if r["backend"] == "llama.cpp" and
+                         r["artifact"] == "UD-Q4_K_M") for i in obj["instances"]]
+        self.assertNotEqual(selected[0]["req"], selected[1]["req"])
+        self.assertEqual([r["req"] for r in selected],
+                         [w["required_mib"] for w in obj["plan"]["workers"]])
 
     def test_claude_and_hermes_share_roles_not_replicas(self):
         for frontend in ('claude-local', 'hermes-local'):
@@ -337,7 +383,7 @@ class SelectorTests(unittest.TestCase):
         self.assertEqual(selector.evidence_label(obs, summary), 'UPSTREAM REFERENCE')
 
     def test_telemetry_only_no_model_is_explicit_and_nonblocking(self):
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory(dir=FIXTURE_DIR) as td:
             with mock.patch.object(selector.metrics, 'CONFIG', pathlib.Path(td)):
                 code, _, _, launch, inventory = self.run_sel('--telemetry-opt-in', '--json')
             self.assertTrue(json.loads((pathlib.Path(td) / 'telemetry.json').read_text())['enabled'])

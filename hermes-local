@@ -59,7 +59,7 @@ Harness options:
   --select              choose models interactively before provisioning
   --local-cache DIR
   --no-parallel           Force sequential Hugging Face downloads
-  --local-context N
+  --local-context N           fallback hard context per slot
   --slots N                  fallback parallel slots per model
   MODEL@context=N,slots=N,output=N,client_context=N,compact=N,quant=Q,kv_k=K,kv_v=V,min_tps=N,admission=N
   --local-client-context N
@@ -311,6 +311,21 @@ for s in p['servers']:
     print(f"  {s['id']}: {x['hf_spec']}\n    {gs}\n    KV={x['kv_k']}/{x['kv_v']} batch={x['batch']}/{x['ubatch']} FA={x['flash_attn']} quality-tier={x['quality']}")
     c=s['capacity']
     print(f"    slots={c['slots']} hard={c['context']} input={c['input_tokens']} output={c['output_tokens']} client={c['client_context']} compact={c['compact_trigger']} estimated-memory={s['required_mib']/1024:.2f} GiB")
+    if c.get('min_tps') is not None:
+        print(f"    WARNING: min_tps={c['min_tps']} is requested, not proven; no matching runtime throughput SLA evidence is verified by this launcher.")
+PY
+}
+
+verify_capacity() {
+python3 - "$ROOT/lib" "$1" "$2" <<'PY'
+import json,sys
+sys.path.insert(0,sys.argv[1])
+from pushbutton_request_budget import verify_backend_capacity
+try:
+ verify_backend_capacity(f'http://127.0.0.1:{sys.argv[2]}',json.loads(sys.argv[3]))
+except Exception as error:
+ print(f'Capacity readiness failed: {error}',file=sys.stderr)
+ raise SystemExit(1)
 PY
 }
 
@@ -356,6 +371,27 @@ print(json.load(open(sys.argv[1]))['role_ids'][sys.argv[2]])
 PY
 }
 
+start_capacity_proxy() {
+    CAPACITY_PROXY_CONFIG="$STATE_DIR/hermes-capacity.$$.json"
+    CAPACITY_PROXY_PORT="$(free_port "$PORT_BASE")"
+    python3 - "$BACKENDS_TSV" "$CAPACITY_PROXY_CONFIG" <<'PY'
+import json,sys
+routes={}
+for line in open(sys.argv[1]):
+ mid,port,hf,raw=line.rstrip('\n').split('\t')
+ routes[mid]={'model_id':mid,'backend_alias':mid,'url':f'http://127.0.0.1:{port}','capacity':{**json.loads(raw),'no_context_shift':True}}
+json.dump({'routes':routes},open(sys.argv[2],'w'),indent=2)
+PY
+    local pid log="$STATE_DIR/logs/hermes-capacity.log"
+    python3 "$ROOT/lib/pushbutton_capacity_proxy.py" --config "$CAPACITY_PROXY_CONFIG" --port "$CAPACITY_PROXY_PORT" >"$log" 2>&1 &
+    pid=$!; PIDS+=("$pid")
+    until curl -fsS "http://127.0.0.1:$CAPACITY_PROXY_PORT/health" >/dev/null 2>&1; do
+        kill -0 "$pid" 2>/dev/null || { tail -80 "$log" >&2 || true; die "capacity guard failed"; }
+        sleep 1
+    done
+    say "Guarded OpenAI endpoint ready: http://127.0.0.1:$CAPACITY_PROXY_PORT/v1"
+}
+
 backend_url() {
     printf 'http://127.0.0.1:%s/v1\n' "$CAPACITY_PROXY_PORT"
 }
@@ -376,18 +412,25 @@ ensure_profile() {
 
 configure_profile() {
     local name="$1" model_id="$2" url="$3" effort="$4"
-    local client_context
-    client_context="$(python3 - "$PLAN_FILE" "$model_id" <<'PY'
+    local client_context compact_trigger output_tokens role_budget
+    role_budget="$(python3 - "$PLAN_FILE" "$model_id" <<'PY'
 import json,sys
 p=json.load(open(sys.argv[1]))
-print(next(s['capacity']['client_context'] for s in p['servers'] if s['id']==sys.argv[2]))
+c=next(s['capacity'] for s in p['servers'] if s['id']==sys.argv[2])
+print(c['client_context'],c['compact_trigger'],c['output_tokens'])
 PY
 )"
-    hermes -p "$name" config set model.provider custom >/dev/null
+    read -r client_context compact_trigger output_tokens <<<"$role_budget"
+    hermes -p "$name" config set model.provider custom:pushbutton >/dev/null
     hermes -p "$name" config set model.default "$model_id" >/dev/null
     hermes -p "$name" config set model.base_url "$url" >/dev/null
     hermes -p "$name" config set model.api_mode chat_completions >/dev/null
+    hermes -p "$name" config set providers.pushbutton.base_url "$url" >/dev/null
+    hermes -p "$name" config set providers.pushbutton.transport chat_completions >/dev/null
+    hermes -p "$name" config set providers.pushbutton.extra_body.max_tokens "$output_tokens" >/dev/null
     hermes -p "$name" config set model.context_length "$client_context" >/dev/null
+    hermes -p "$name" config set compression.enabled true >/dev/null
+    hermes -p "$name" config set compression.threshold_tokens "$compact_trigger" >/dev/null
     hermes -p "$name" config set terminal.cwd . >/dev/null
     hermes -p "$name" config set agent.reasoning_effort "$effort" >/dev/null || true
     hermes -p "$name" config set web.search_backend "$WEB_SEARCH_BACKEND" >/dev/null || true
@@ -519,7 +562,7 @@ ensure_llamacpp
 grep -q '"template": "qwen-fixed"' "$PLAN_FILE" && fetch_qwen_template || true
 start_backends
 start_capacity_proxy
-warn "Hermes profiles use their own client context budgets; output limits are enforced by the guarded endpoint. Configured compact triggers are exposed in the plan; explicit frontend compaction thresholds are not supported by this integration."
+say "Hermes profiles use their own client context, output limits, and absolute compression thresholds."
 configure_bots
 release_startup_lock
 launch_hermes

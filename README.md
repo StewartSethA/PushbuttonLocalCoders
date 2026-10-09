@@ -81,6 +81,14 @@ Optional spec keys are `client_context`, `compact`, `quant`, `kv_k`, `kv_v`,
 and `vram`. Weight quantization and K/V-cache precision are separate choices.
 Explicit choices that cannot fit are rejected rather than silently reducing
 context or slots. Unspecified quantization is selected from supported profiles.
+Coder placement configuration accepts the same per-model capacity defaults:
+
+```json
+{"models":{"qwen3.8:27b":{"gpus":[0],"vram_limit":"16G","slots":2,"context":65536,"output":4096}}}
+```
+
+Use `--placement-config` to select that file. Explicit model-spec fields override
+configuration defaults and global fallback settings.
 
 The plan reports each server's hard context, input limit, output reserve,
 compaction trigger, slots, memory envelope, and headroom. Memory estimates use
@@ -91,8 +99,28 @@ calibration-based; allocating slots does not automatically prove they are fast.
 Input budgets reserve output and a safety margin. Compaction triggers leave
 additional headroom for the next turn. Frontend adapters advertise resolved
 budgets per model where supported; a shared session uses the smallest compatible
-budget. Framework-specific compaction behavior is not assumed to enforce a hard
-limit, and a requested trigger is not necessarily a supported frontend setting.
+budget. Current upstream framework mappings are:
+
+| Frontend | Budget/compaction mapping |
+| --- | --- |
+| Qwen Code | Per-model `contextWindowSize` and `samplingParams.max_tokens`; session `context.autoCompactThreshold` uses the earliest safe model ratio. Its built-in reserves may compact earlier. |
+| Hermes | Per-role `model.context_length`; `compression.threshold_tokens` applies the absolute trigger, avoiding small-window ratio floors. |
+| OpenCode | Per-model `limit.context`, `limit.input`, and `limit.output`; session `compaction.reserved` leaves enough room for every model's trigger. |
+| Claude Code | Smallest shared-role client budget through the existing context hint; `CLAUDE_CODE_MAX_OUTPUT_TOKENS` limits output. The context hint and an explicit autocompact override are not verified hard limits. |
+| mini-SWE / DeepSeek Harness | Requests use guarded endpoints; mini-SWE receives per-worker output limits. No verified framework autocompact override is assumed for these adapters. |
+
+These mappings follow current upstream
+[Qwen compression](https://github.com/QwenLM/qwen-code/blob/main/packages/core/src/services/chatCompressionService.ts),
+[Hermes compression](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/developer-guide/context-compression-and-caching.md),
+and [OpenCode overflow handling](https://github.com/anomalyco/opencode/blob/dev/packages/opencode/src/session/overflow.ts).
+Older frontend versions may have different semantics or ignore these settings.
+Framework-specific compaction behavior is not assumed to enforce a hard limit;
+the serving guard remains authoritative.
+Direct frontend guards default to admission at C1; explicit `admission` may raise
+that bound up to the allocated slots, without proving a throughput SLA.
+The broker may promote default admission after calibration, while an explicit
+admission cap remains binding. `min_tps` is checked against broker calibration
+evidence; direct frontend launches warn when its throughput is unproven.
 Large tool results can cross a threshold in one turn: summarize or limit them
 before retrying an oversized request. History is never silently discarded by
 the request guard.
@@ -103,6 +131,10 @@ paths must not be mistaken for exact token counts; backend context enforcement
 and disabled llama.cpp context shifting provide the final safety boundary.
 Changing to a smaller-context model requires its own budget check and may require
 compacting first.
+Unconfigured `pushbutton` launches retain measured backend selection and automatic
+slot reservation; explicit placement, slots, quant, or cache overrides use the
+llama.cpp capacity planner. Unsupported specialized token-counting paths fail
+closed with an actionable error instead of silently changing the chosen backend.
 
 ### Qwen3.8 Flash-Next: existing support, not locally measured speed
 

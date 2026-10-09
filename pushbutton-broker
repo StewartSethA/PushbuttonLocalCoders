@@ -208,28 +208,29 @@ class Handler(BaseHTTPRequestHandler):
         if path not in {'/v1/chat/completions','/v1/completions'}:
             return self.json_error(404,'unknown broker endpoint')
         model=str(obj.get('model') or 'pushbutton/auto')
-        try:out_budget=budget.output_tokens(obj,{'output_tokens': max([4096, *[x.budget().get('output_tokens',4096) for x in RUNTIME.models()]])})
+        try:budget.output_tokens(obj,{'output_tokens': max([4096, *[x.budget().get('output_tokens',4096) for x in RUNTIME.models()]])})
         except budget.BudgetError as exc:return self.json_error(400,str(exc))
-        admissions={}; failures=[]
+        admissions={}; failures=[]; context_cache={}
         for candidate in RUNTIME._all_candidates(model,1):
             routed=dict(obj,model=resolve_served_model(candidate))
             try:
-                checked=budget.enforce(routed,candidate.budget(),candidate.endpoint,headers=self.headers_for_upstream())
+                checked=budget.enforce(routed,candidate.budget(),candidate.endpoint,headers=self.headers_for_upstream(),context_cache=context_cache,backend=candidate.backend)
                 admissions[candidate.id]=(candidate.endpoint,candidate.budget(),checked)
+                if candidate.id not in RUNTIME.maintenance and candidate.active<candidate.capacity(candidate.context_limit()):
+                    break
             except budget.BudgetError as exc:
                 failures.append(str(exc))
         if not admissions and failures:return self.json_error(400,failures[0])
-        needed=out_budget+1
         inst,decision,admitted_concurrency=RUNTIME.acquire(model,1,set(admissions))
         if not inst:
             code=429 if decision in {'REJECT_BUSY','QUEUE_TIMEOUT'} else 503
-            return self.json_error(code,f'{decision}: no resident configuration can safely serve model={model!r} at about {needed:,} tokens')
+            return self.json_error(code,f'{decision}: no available resident route can safely serve model={model!r} with this request budget')
         try:
             obj['model']=resolve_served_model(inst)
             try:
                 endpoint,capacity,admission=admissions[inst.id]
                 if endpoint!=inst.endpoint or capacity!=inst.budget():
-                    admission=budget.enforce(obj,inst.budget(),inst.endpoint,headers=self.headers_for_upstream())
+                    admission=budget.enforce(obj,inst.budget(),inst.endpoint,headers=self.headers_for_upstream(),backend=inst.backend)
             except budget.BudgetError as exc:return self.json_error(400,str(exc))
             if not any(k in obj for k in ('max_tokens','max_completion_tokens','max_output_tokens')):
                 obj['max_tokens']=admission.output_tokens
@@ -247,7 +248,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(r.status,r.reason)
         self.send_header('X-Pushbutton-Token-Source',token_source)
         for k,v in r.getheaders():
-            if k.lower() not in HOP and k.lower()!='content-length':self.send_header(k,v)
+            if k.lower() not in HOP and k.lower()!='content-length':self.send_header(k.replace('\r','').replace('\n',''),v.replace('\r','').replace('\n',''))
         if warn:self.send_header('X-Pushbutton-Speed-Warning',warn[:240]); sys.stderr.write('[pushbutton-broker] WARNING: '+warn+'\n')
         if stream:self.send_header('Connection','close'); self.end_headers()
         if stream:
@@ -278,7 +279,7 @@ class Handler(BaseHTTPRequestHandler):
         measured_ct=usage.get('completion_tokens',usage.get('output_tokens'))
         pt=measured_pt if measured_pt is not None else prompt_est
         ct=measured_ct if measured_ct is not None else None
-        estimated_pt=measured_pt is None and token_source!='backend-tokenizer'
+        estimated_pt=measured_pt is None and not token_source.startswith('backend-tokenizer')
         ttft=(first-start) if first else None
         obs={'schema_version':1,'timestamp_utc':now_iso(),'model':inst.model,'backend':inst.backend,'artifact':inst.artifact,'context':inst.context_limit(),'prompt_tokens':pt,'completion_tokens':ct,'prompt_tokens_estimated':estimated_pt,'completion_tokens_estimated':measured_ct is None,'pp':(pt/ttft if ttft and not estimated_pt else None),'tg':((ct-1)/(end-first) if ct is not None and first and end>first and ct>1 else None),'ttft':ttft,'elapsed_s':end-start,'concurrency':max(1,int(admitted_concurrency)),'source':'normal-use','method':'broker','status_code':status}
         metrics.save_observation(obs); metrics.queue_observation(obs); metrics.maybe_upload()

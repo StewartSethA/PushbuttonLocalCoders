@@ -30,6 +30,9 @@ if [[ -d "$DEST/.git" ]]; then
 else
   git clone --depth=1 --branch "$REF" "$REPO_URL" "$DEST"
 fi
+for asset in lib/pushbutton_capacity.py lib/pushbutton_request_budget.py lib/pushbutton_capacity_proxy.py; do
+  [[ -f "$DEST/$asset" ]] || { echo "missing capacity runtime asset: $asset" >&2; exit 1; }
+done
 chmod +x \
   "$DEST/pushbutton" "$DEST/pushbutton-instance" "$DEST/pushbutton-broker" "$DEST/pushbutton-proxy" \
   "$DEST/claude-local" "$DEST/claude-local-safe" "$DEST/coder-local" "$DEST/qwen-local" \

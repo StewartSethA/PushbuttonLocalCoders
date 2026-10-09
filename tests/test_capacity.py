@@ -36,15 +36,28 @@ class CapacityBudgetTests(unittest.TestCase):
         self.assertEqual(budget["input_tokens"], 228352)
         self.assertEqual(capacity.resolve_budget(8192, compact="2K")["compact_trigger"], 2048)
 
+    def test_admission_defaults_to_one_without_reducing_requested_slots(self):
+        settings = capacity.resolve_options({"slots": 4}, 32768)
+        self.assertEqual(settings["slots"], 4)
+        self.assertEqual(settings["admission_limit"], 1)
+        self.assertFalse(settings["admission_explicit"])
+        explicit = capacity.resolve_options({"slots": 4, "admission": 3}, 32768)
+        self.assertEqual(explicit["admission_limit"], 3)
+        self.assertTrue(explicit["admission_explicit"])
+        explicit_one = capacity.resolve_options({"slots": 4, "admission": 1}, 32768)
+        self.assertEqual(explicit_one["admission_limit"], 1)
+        self.assertTrue(explicit_one["admission_explicit"])
+
     def test_rejects_invalid_scalar_options(self):
         cases = [
-            {"slots": 0}, {"slots": True}, {"slots": 1.5},
+            {"slots": 0}, {"slots": True}, {"slots": 1.5}, {"slots": 129},
             {"context": "-1"}, {"output": "unlimited"}, {"client_context": None},
             {"admission": -1}, {"safety": 0}, {"min_tps": "nan"},
             {"min_tps": "inf"}, {"min_tps": True}, {"min_tps": 0},
             {"compact": "0%"}, {"compact": "100%"}, {"compact": 1.5},
             {"compact": "nan"}, {"kv_k": "q2_k"}, {"kv_v": ""},
             {"quant": "bad/value"}, {"quant": None}, {"quant": 123}, {"bogus": 1},
+            {"admission_explicit": False},
             {"admission": 1, "admission_limit": 1},
         ]
         for options in cases:
@@ -55,12 +68,15 @@ class CapacityBudgetTests(unittest.TestCase):
         for kwargs in [
             {"client_context": 8193}, {"output": 8192},
             {"output": 4096, "client_context": 4096},
-            {"compact": 8192}, {"safety": 8192},
+            {"compact": 8192}, {"compact": 6912}, {"safety": 8192},
         ]:
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 capacity.resolve_budget(8192, **kwargs)
         with self.assertRaisesRegex(ValueError, "admission"):
             capacity.resolve_options({"admission": 3, "slots": 2}, 8192)
+        with self.assertRaisesRegex(ValueError, "128"):
+            capacity.resolve_options({"slots": 1}, 8192, slots=129)
+        self.assertEqual(capacity.parse_options({"slots": 128})["slots"], 128)
 
     def test_memory_estimate_accounts_for_slots_and_precision(self):
         profile = base.PROFILES["qwen3.8:27b"][-3]
@@ -148,6 +164,12 @@ class InstanceCapacityTests(unittest.TestCase):
         self.assertEqual([w["capacity"]["client_context"] for w in plan["workers"]],
                          [24576, 20480])
         self.assertNotIn("client_context", requests[0].capacity)
+
+    def test_global_client_context_checked_even_when_overridden(self):
+        request = coder.parse_model_spec("q38@context=32K,client_context=20K")
+        with self.assertRaisesRegex(ValueError, "global client_context"):
+            coder.build_plan([request], 1, coder.synthetic_3090(1), 262144,
+                             client_context=65536)
 
     def test_exact_pin_can_include_more_cards_than_necessary(self):
         request = coder.parse_model_spec("q38@gpu=0+1,context=32K,quant=IQ3_XXS")

@@ -513,13 +513,11 @@ def ordered_group_for_layer_split(candidate: Candidate, gpus: list[GPU]) -> list
 def plan(models: list[str], gpus: list[GPU], context: int, slots: int = 1,
          defaults: dict | None = None, client_context: int | None = None) -> dict:
     # Lazy import keeps the existing coder -> base API import cycle harmless.
-    from coder_local_plan import parse_model_spec, candidates_for_request, request_capacity
+    from coder_local_plan import (parse_model_spec, candidates_for_request,
+                                  request_capacity, apply_client_context)
     capacity.resolve_options({}, context, slots)
-    requests = [parse_model_spec(m, defaults) for m in models]
-    if client_context is not None:
-        client_context = capacity.positive_int(client_context, "client_context")
-        requests = [replace(r, capacity={"client_context": client_context, **r.capacity})
-                    for r in requests]
+    requests = apply_client_context([parse_model_spec(m, defaults) for m in models],
+                                    context, client_context)
     rm = role_map([r.model for r in requests])
     by_model = {}
     def shared_settings(request):

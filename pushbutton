@@ -14,6 +14,7 @@ sys.path.insert(0,str(ROOT/'lib'))
 import claude_local_plan as plan
 import coder_local_plan as worker_plan
 import pushbutton_capacity as capacity
+import pushbutton_request_budget as request_budget
 import pushbutton_metrics as metrics
 import pushbutton_policy as policy
 import pushbutton_registry as registry_store
@@ -82,9 +83,11 @@ def configure(cfg,args):
     model=canon(spec.partition('@')[0]);cfg['model']=model;cfg['model_spec']=spec
     defaults=cfg.get('models',{})
     options=dict(defaults.get(model,{}))
-    for key in ('slots','output','client_context','compact','quant','kv_k','kv_v','min_tps','admission'):
+    options={**{k:v for k,v in options.items() if k not in capacity.OPTION_KEYS},
+             **capacity.parse_options({k:v for k,v in options.items() if k in capacity.OPTION_KEYS})}
+    for key in ('context','slots','output','client_context','compact','quant','kv_k','kv_v','min_tps','admission'):
         value=getattr(args,key,None)
-        if value is not None:options[key]=value
+        if value is not None:options.update(capacity.parse_options({key:value}))
     cfg['models']={**defaults,model:options}
     default_ctx=min(model_context(model),int(cfg.get('context') or 65536))
     ctx=int(args.context or default_ctx)
@@ -99,6 +102,12 @@ def configure(cfg,args):
         req=worker_plan.parse_model_spec(spec,cfg['models'])
         resolved=capacity.resolve_options(req.capacity,ctx)
         if resolved['context']>model_context(model):raise ValueError('per-model context exceeds supported model context')
+        options={k:v for k,v in options.items() if k not in capacity.OPTION_KEYS}
+        options.update(req.capacity)
+        if req.gpu_indices is not None:options['gpus']=list(req.gpu_indices)
+        if req.vram_limit_mib is not None:options['vram_limit']=req.vram_limit_mib
+        cfg['models'][model]=options
+        cfg['model_spec']=model
     elif '@' in spec or options:
         raise ValueError('per-model capacity options require a supported llama.cpp planner profile')
     if args.frontend:cfg['frontend']=args.frontend
@@ -198,7 +207,9 @@ def healthy_resident(model,context,requested_capacity=None,artifact=None,request
             if request.vram_limit_mib is not None and x.get('vram_limit_mib_per_gpu')!=request.vram_limit_mib:continue
         if requested_capacity is not None:
             if int(x.get('framework_max_concurrency') or 1)<requested_capacity['slots']:continue
-            if any(x.get('capacity',{}).get(k)!=v for k,v in requested_capacity.items()):continue
+            automatic_slots=request is not None and 'slots' not in request.capacity
+            omitted={'slots','admission_limit'} if automatic_slots and 'admission_limit' not in request.capacity else set()
+            if any(x.get('capacity',{}).get(k)!=v for k,v in requested_capacity.items() if k not in omitted):continue
         return x
     return None
 
@@ -232,6 +243,24 @@ def served_model(endpoint,fallback):
     obj=get_json(endpoint.rstrip('/')+'/models',1.5)
     try:return str((obj.get('data') or [{}])[0].get('id') or fallback)
     except Exception:return fallback
+def check_vram_lease(pid,gpus,cap):
+    if cap is None:return True
+    try:
+        devices=subprocess.check_output(['nvidia-smi','--query-gpu=index,uuid','--format=csv,noheader,nounits'],text=True,stderr=subprocess.DEVNULL)
+        apps=subprocess.check_output(['nvidia-smi','--query-compute-apps=pid,gpu_uuid,used_memory','--format=csv,noheader,nounits'],text=True,stderr=subprocess.DEVNULL)
+        indices={uuid.strip():int(index.strip()) for index,uuid in (line.split(',',1) for line in devices.splitlines())}
+        selected={int(index) for index in str(gpus).split(',')}
+        usage={}
+        for line in apps.splitlines():
+            app_pid,uuid,memory=(x.strip() for x in line.split(','))
+            index=indices.get(uuid)
+            if int(app_pid)==pid and index in selected:usage[index]=usage.get(index,0)+int(float(memory))
+        if not usage:raise ValueError('allocation not reported')
+    except (OSError,ValueError,subprocess.SubprocessError):
+        warn('Could not verify actual per-GPU VRAM lease; allocation remains estimated.')
+        return True
+    say('actual VRAM lease: '+', '.join(f'GPU {i}: {m:,}/{cap:,} MiB' for i,m in sorted(usage.items())))
+    return all(memory<=cap for memory in usage.values())
 def commission(model,context,row):
     gpu=row.get('gpu');backend=row['backend'];artifact=row.get('artifact');port=free_port(20880);endpoint=backend_endpoint(port);logs=STATE/'logs';logs.mkdir(parents=True,exist_ok=True);slots=1
     if backend=='llama.cpp':
@@ -249,27 +278,34 @@ def commission(model,context,row):
     if slots>1:say(f'pre-provisioning {slots} native llama.cpp slots; broker admission remains C1 until calibrated')
     proc=start_detached(cmd,logs/f'{model.replace(":","-")}-{backend}-{port}.log',f'{model} / {backend}')
     if not wait_endpoint(proc,endpoint):
-        if backend=='llama.cpp' and slots>1 and not row.get('capacity'):
+        if backend=='llama.cpp' and slots>1 and (not row.get('capacity') or row.get('slots_automatic')):
             try:proc.terminate();proc.wait(timeout=5)
             except Exception:
                 try:proc.kill()
                 except Exception:pass
             warn(f'{slots}-slot memory provisioning did not start cleanly; falling back automatically to C1')
             slots=1;cmd=[sys.executable,ROOT/'pushbutton-instance','--hf-spec',spec,'--alias',model,'--port',port,'--context',context,'--parallel',1]
+            if row.get('capacity'):
+                row['capacity']={**row['capacity'],'slots':1,'admission_limit':1}
+                profile=next(p for p in plan.PROFILES[model] if p.quant==artifact)
+                row['capacity']['memory_estimate']=capacity.memory_estimate(profile,row['capacity'])
+                row['req']=row['capacity']['memory_estimate']['required_mib']
+                cmd += ['--kv-k',row['kv_k'],'--kv-v',row['kv_v']]
             if gpu is not None:cmd += ['--gpus',str(gpu)]
             proc=start_detached(cmd,logs/f'{model.replace(":","-")}-{backend}-{port}-c1.log',f'{model} / {backend} C1 fallback')
             if not wait_endpoint(proc,endpoint):raise SystemExit(f'backend failed to become ready even at C1; inspect {logs}')
         else:raise SystemExit(f'backend failed to become ready; inspect {logs}')
+    if not check_vram_lease(proc.pid,gpu,row.get('vram_limit_mib_per_gpu')):
+        proc.terminate()
+        raise SystemExit('backend exceeded its per-GPU VRAM lease; lower quant, context, or slots')
     inst={'id':f'{model}-{backend}-{port}','model':model,'served_model':served_model(endpoint,model),'aliases':[model],'backend':backend,'artifact':artifact,'endpoint':endpoint,'pid':proc.pid,'max_context':context,'framework_max_concurrency':slots,'measured_envelopes':[{'concurrency':1,'max_context':context,'safe':True,'evidence':'PROVEN'}],'tg':row.get('tg'),'tg_measured':row.get('evidence')=='LOCAL MEASURED','healthy':True,'gpu':gpu,'required_mib':row.get('req'),'provisioned_slots':slots,'calibration_safe':bool(backend=='llama.cpp' and slots>1)}
     if row.get('capacity'):
-        props=get_json(endpoint.removesuffix('/v1')+'/props',5)
-        if props:
-            actual=(props.get('default_generation_settings') or {}).get('n_ctx') or props.get('n_ctx')
-            parallel=props.get('total_slots') or props.get('n_parallel')
-            if (actual is not None and int(actual)<context) or (parallel is not None and int(parallel)<slots):
+        if backend=='llama.cpp':
+            try:inst['capacity_proof']=request_budget.verify_backend_capacity(endpoint,row['capacity'])
+            except request_budget.BudgetError as exc:
                 proc.terminate()
-                raise SystemExit('backend provisioned less context/slots than requested; inspect /props and restart with a fitting configuration')
-        inst['capacity']={**row['capacity'],'no_context_shift':True}
+                raise SystemExit(f'backend capacity verification failed: {exc}') from exc
+        inst['capacity']={**row['capacity'],'no_context_shift':backend=='llama.cpp'}
     if row.get('vram_limit_mib_per_gpu') is not None:inst['vram_limit_mib_per_gpu']=row['vram_limit_mib_per_gpu']
     registry_store.append_instance(inst,REGISTRY);return inst
 
@@ -280,6 +316,15 @@ def capacity_candidate(req,context):
          'req':worker['required_mib'],'capacity':worker['capacity'],'kv_k':worker['profile']['kv_k'],
          'kv_v':worker['profile']['kv_v'],'vram_limit_mib_per_gpu':worker.get('vram_limit_mib_per_gpu'),'evidence':'ESTIMATED'}
     return proposed,row
+
+def automatic_capacity_row(model,req,context,row):
+    if row['backend']!='llama.cpp':
+        return {**row,'capacity':capacity.resolve_options(req.capacity,context)}
+    profile=next(p for p in plan.PROFILES[model] if p.quant==row['artifact'])
+    slots=provisioned_parallel(model,context,row)
+    resolved=worker_plan.request_capacity(req,profile,context,slots)
+    return {**row,'capacity':resolved,'kv_k':profile.kv_k,'kv_v':profile.kv_v,
+            'slots_automatic':True,'req':resolved['memory_estimate']['required_mib']}
 
 def ensure_qwen():
     q=shutil.which('qwen')
@@ -293,10 +338,11 @@ def ensure_qwen():
         subprocess.run('curl -fsSL https://qwen-code-assets.oss-cn-hangzhou.aliyuncs.com/installation/install-qwen-standalone.sh | bash',shell=True,check=True)
         if p.exists():return str(p)
         return shutil.which('qwen') or (_ for _ in ()).throw(SystemExit('Qwen Code install finished but qwen was not found'))
-def launch_qwen(port,context,extra,model='pushbutton/auto',output=32768):
+def launch_qwen(port,context,extra,model='pushbutton/auto',output=32768,compact=None):
     qwen=ensure_qwen();qhome=STATE/'frontends/qwen';qhome.mkdir(parents=True,exist_ok=True)
     settings={'modelProviders':{'openai':[{'id':model,'name':'Pushbutton resident model','envKey':'PUSHBUTTON_LOCAL_API_KEY','baseUrl':f'http://127.0.0.1:{port}/v1','streamIdleTimeoutMs':0,'generationConfig':{'contextWindowSize':context,'maxRetries':2}}]},'security':{'auth':{'selectedType':'openai'}},'model':{'name':model},'experimental':{'agentTeam':True},'privacy':{'usageStatisticsEnabled':False},'telemetry':{'enabled':False}}
-    settings['modelProviders']['openai'][0]['generationConfig']['maxOutputTokens']=output
+    settings['modelProviders']['openai'][0]['generationConfig']['samplingParams']={'max_tokens':output}
+    settings['context']={'autoCompactThreshold':(compact or int(context*.8))/context}
     write_json(qhome/'settings.json',settings);env=os.environ.copy();env.update({'QWEN_HOME':str(qhome),'PUSHBUTTON_LOCAL_API_KEY':'pushbutton-local','QWEN_CODE_ENABLE_AGENT_TEAM':'1','QWEN_USAGE_STATISTICS_ENABLED':'0','QWEN_TELEMETRY_ENABLED':'0'})
     os.execvpe(qwen,[qwen,'--auth-type','openai','--model',model,*extra],env)
 def ensure_opencode():
@@ -309,11 +355,14 @@ def ensure_opencode():
         if p.exists():return str(p)
         subprocess.run('curl -fsSL https://opencode.ai/install | bash',shell=True,check=True)
         return shutil.which('opencode') or (str(p) if p.exists() else (_ for _ in ()).throw(SystemExit('OpenCode install finished but opencode was not found')))
-def launch_opencode(port,context,extra,model='pushbutton/auto',output=32768):
+def launch_opencode(port,context,extra,model='pushbutton/auto',output=32768,input_tokens=None,compact=None):
     exe=ensure_opencode();p=STATE/'frontends/opencode/opencode.json';p.parent.mkdir(parents=True,exist_ok=True)
     obj={'$schema':'https://opencode.ai/config.json','model':'pushbutton/pushbutton/auto','provider':{'pushbutton':{'npm':'@ai-sdk/openai-compatible','name':'Pushbutton','options':{'baseURL':f'http://127.0.0.1:{port}/v1','apiKey':'pushbutton-local'},'models':{'pushbutton/auto':{'name':'Pushbutton automatic resident pool','limit':{'context':context,'output':32768},'capabilities':{'tools':True,'input':['text'],'output':['text']}}}}}}
     entry=obj['provider']['pushbutton']['models'].pop('pushbutton/auto')
     entry['limit']['output']=output
+    if input_tokens is not None:
+        entry['limit']['input']=input_tokens
+        obj['compaction']={'auto':True,'reserved':input_tokens-(compact or int(input_tokens*.8))}
     obj['provider']['pushbutton']['models'][model]=entry;obj['model']='pushbutton/'+model
     write_json(p,obj);env=os.environ.copy();env.update({'OPENCODE_CONFIG':str(p),'OPENCODE_DISABLE_AUTOUPDATE':'1'});os.execvpe(exe,[exe,*extra],env)
 def show_status(cfg):
@@ -334,12 +383,19 @@ def main():
     if a.status:return show_status(cfg)
     try:
         cfg=configure(cfg,a);model=cfg['model'];ctx=int(cfg['context'])
-        requested=None;row=None
+        requested=None;row=None;custom_placement=False
         if model in plan.PROFILES:
             req=worker_plan.parse_model_spec(cfg['model_spec'],cfg.get('models',{}))
             requested=capacity.resolve_options(req.capacity,ctx);ctx=requested['context']
+            custom_placement=req.gpu_indices is not None or req.vram_limit_mib is not None or any(k in req.capacity for k in ('slots','quant','kv_k','kv_v'))
             if a.plan_only:
-                proposed,row=capacity_candidate(req,ctx);print(json.dumps(proposed,indent=2));return
+                if custom_placement:
+                    proposed,row=capacity_candidate(req,ctx);print(json.dumps(proposed,indent=2))
+                else:
+                    row=choose_candidate(selector_views(model,ctx),a.allow_slow)
+                    if not row:raise ValueError(f'no fitting local configuration found for {model}')
+                    print(json.dumps({'model':model,'context':ctx,'selected':automatic_capacity_row(model,req,ctx,row)},indent=2))
+                return
         elif '@' in cfg['model_spec'] or cfg.get('models',{}).get(model):
             raise ValueError('per-model capacity options require a supported llama.cpp planner profile')
         elif a.plan_only:
@@ -352,7 +408,7 @@ def main():
         resident=healthy_resident(model,ctx,requested,requested.get('quant') if requested else None,req if requested else None)
         if resident:say(f"reusing {resident['model']} at {resident['endpoint']}")
         else:
-            if requested:
+            if custom_placement:
                 try:
                     proposed,row=capacity_candidate(req,ctx)
                 except ValueError as exc:raise SystemExit(str(exc))
@@ -361,6 +417,11 @@ def main():
             if row is None:
                 rows=selector_views(model,ctx);row=choose_candidate(rows,a.allow_slow)
             if not row:raise SystemExit(f'no fitting local configuration found for {model} at {ctx:,} context')
+            if requested and not custom_placement:
+                row=automatic_capacity_row(model,req,ctx,row)
+            if requested and not custom_placement:
+                resolved=row['capacity']
+                say(f"{model}: slots={resolved['slots']}, context/slot={ctx:,}, input={resolved['input_tokens']:,}, output={resolved['output_tokens']:,}, compact={resolved['compact_trigger']:,}; estimated {row.get('req') or '?'} MiB")
             label,msg=policy.speed_label(row.get('tg'),measured=row.get('evidence')=='LOCAL MEASURED')
             if label in {'SLOW','VERY_SLOW'}:warn(msg or f'{model} is expected to decode below {policy.MIN_DECODE_TOK_S:.0f} tok/s')
             say(f"selected {model} / {row['backend']} / {row['artifact']} on GPU {row.get('gpu')} — TG {row.get('tg') or '?'} tok/s ({row.get('evidence')})")
@@ -370,7 +431,7 @@ def main():
     if frontend=='none':print(f'http://127.0.0.1:{broker_port}/v1');return
     extra=list(a.frontend_args);extra=extra[1:] if extra[:1]==['--'] else extra
     budget=resident.get('capacity') or capacity.resolve_budget(ctx)
-    if frontend=='opencode':launch_opencode(broker_port,budget['client_context'],extra,model,budget['output_tokens'])
-    launch_qwen(broker_port,budget['client_context'],extra,model,budget['output_tokens'])
+    if frontend=='opencode':launch_opencode(broker_port,budget['client_context'],extra,model,budget['output_tokens'],budget['input_tokens'],budget['compact_trigger'])
+    launch_qwen(broker_port,budget['client_context'],extra,model,budget['output_tokens'],budget['compact_trigger'])
 
 if __name__=='__main__':main()

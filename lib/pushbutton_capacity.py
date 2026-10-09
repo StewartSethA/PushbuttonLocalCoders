@@ -61,6 +61,8 @@ def parse_options(options: dict) -> dict:
             raise ValueError(f"duplicate capacity key '{name}'")
         if name in {"slots", "context", "output", "client_context", "admission_limit", "safety"}:
             result[name] = positive_int(value, name)
+            if name == "slots" and result[name] > 128:
+                raise ValueError("slots must be between 1 and 128")
         elif name == "compact":
             result[name] = _compact(value)
         elif name == "min_tps":
@@ -98,8 +100,8 @@ def resolve_budget(context, output=None, client_context=None, compact=None, safe
         raise ValueError("output and safety must leave room for input within client_context")
     threshold = 0.8 if compact is None else _compact(compact)
     trigger = max(1, int(input_tokens * threshold)) if isinstance(threshold, float) else threshold
-    if trigger > input_tokens:
-        raise ValueError("compact trigger cannot exceed the input budget")
+    if trigger >= input_tokens:
+        raise ValueError("compact trigger must be strictly below the input budget")
     return {"context": context, "output_tokens": output, "client_context": client,
             "compact_trigger": trigger, "input_tokens": input_tokens, "safety_tokens": safety}
 
@@ -109,11 +111,15 @@ def resolve_options(options: dict, context: int, slots: int = 1) -> dict:
     budget = resolve_budget(settings.get("context", context), settings.get("output"),
                             settings.get("client_context"), settings.get("compact"),
                             settings.get("safety"))
-    count = settings.get("slots", positive_int(slots, "slots"))
-    admission = settings.get("admission_limit", count)
+    fallback_slots = positive_int(slots, "slots")
+    if fallback_slots > 128:
+        raise ValueError("slots must be between 1 and 128")
+    count = settings.get("slots", fallback_slots)
+    admission = settings.get("admission_limit", 1)
     if admission > count:
         raise ValueError("admission limit cannot exceed slots")
     return {**settings, **budget, "slots": count, "admission_limit": admission,
+            "admission_explicit": "admission_limit" in settings,
             "min_tps": settings.get("min_tps")}
 
 

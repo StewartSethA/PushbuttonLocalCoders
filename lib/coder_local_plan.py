@@ -234,6 +234,19 @@ def request_capacity(req: WorkerRequest, profile: base.Profile, context: int,
     return settings
 
 
+def apply_client_context(requests: list[WorkerRequest], context: int,
+                         client_context: int | None) -> list[WorkerRequest]:
+    """Apply an explicit global client hint without overriding instance settings."""
+    if client_context is None:
+        return requests
+    client_context = capacity.positive_int(client_context, "client_context")
+    for request in requests:
+        if client_context > request.capacity.get("context", context):
+            raise ValueError(f"global client_context cannot exceed server context for {request.model}")
+    return [replace(r, capacity={"client_context": client_context, **r.capacity})
+            for r in requests]
+
+
 def choose_workers(requests: list[WorkerRequest], gpus: list[base.GPU], context: int, slots: int = 1) -> list[base.Candidate]:
     candidates = [candidates_for_request(r, gpus, context, slots) for r in requests]
     if any(not x for x in candidates):
@@ -275,11 +288,7 @@ def choose_workers(requests: list[WorkerRequest], gpus: list[base.GPU], context:
 def build_plan(requests: list[WorkerRequest], agents: int | None, gpus: list[base.GPU],
                context: int, slots: int = 1, client_context: int | None = None) -> dict:
     capacity.resolve_options({}, context, slots)
-    workers = expand_workers(requests, agents)
-    if client_context is not None:
-        client_context = capacity.positive_int(client_context, "client_context")
-        workers = [replace(r, capacity={"client_context": client_context, **r.capacity})
-                   for r in workers]
+    workers = apply_client_context(expand_workers(requests, agents), context, client_context)
     choices = choose_workers(workers, gpus, context, slots)
     out = []
     used = 0

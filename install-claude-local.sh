@@ -94,8 +94,8 @@ fi
 [[ -x "$DEST/claude-local" ]] || chmod +x "$DEST/claude-local"
 [[ -x "$DEST/lib/claude_local_entry.sh" ]] || chmod +x "$DEST/lib/claude_local_entry.sh"
 chmod +x "$DEST/pushbutton-select"
-for asset in lib/pushbutton_metrics.py lib/coder_local_plan.py lib/claude_local_plan.py configs/backend-registry.json; do
-    [[ -f "$DEST/$asset" ]] || die "missing selector asset: $asset"
+for asset in lib/pushbutton_metrics.py lib/coder_local_plan.py lib/claude_local_plan.py lib/pushbutton_capacity.py lib/pushbutton_request_budget.py lib/pushbutton_capacity_proxy.py configs/backend-registry.json; do
+    [[ -f "$DEST/$asset" ]] || die "missing launcher asset: $asset"
 done
 install_command_shims
 

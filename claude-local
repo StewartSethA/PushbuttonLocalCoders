@@ -56,10 +56,10 @@ Harness options (put before ordinary Claude Code flags):
   --select                   choose models interactively before provisioning
   --local-cache DIR          llama.cpp/Hugging Face model cache
   --no-parallel              Force sequential Hugging Face downloads
-  --local-context N          physical backend context (default 262144)
+  --local-context N          fallback hard context per slot (default 262144)
   --slots N                  fallback parallel slots per model
   MODEL@context=N,slots=N,output=N,client_context=N,compact=N,quant=Q,kv_k=K,kv_v=V,min_tps=N,admission=N
-  --local-client-context N   Claude Code budget (default 200000)
+  --local-client-context N   explicit client budget; checked against every model
   --local-port-base N        starting port for gateway/backends
   --local-no-teams           disable experimental Claude agent teams
   --local-keep-servers       leave model servers running after Claude exits
@@ -349,6 +349,19 @@ stop_log_follower() {
     wait "$follower" 2>/dev/null || true
 }
 
+verify_capacity() {
+python3 - "$ROOT/lib" "$1" "$2" <<'PY'
+import json,sys
+sys.path.insert(0,sys.argv[1])
+from pushbutton_request_budget import verify_backend_capacity
+try:
+ verify_backend_capacity(f'http://127.0.0.1:{sys.argv[2]}',json.loads(sys.argv[3]))
+except Exception as error:
+ print(f'Capacity readiness failed: {error}',file=sys.stderr)
+ raise SystemExit(1)
+PY
+}
+
 start_backends() {
     mkdir -p "$STATE_DIR/logs" "$CACHE_DIR"; export LLAMA_CACHE="$CACHE_DIR" GGML_CUDA_ENABLE_UNIFIED_MEMORY="$ALLOW_OFFLOAD" CUDA_SCALE_LAUNCH_QUEUES=4x
     local next=$((PORT_BASE+1)); BACKENDS_TSV="$STATE_DIR/backends.$$"; : > "$BACKENDS_TSV"
@@ -389,7 +402,7 @@ import json,sys
 p=json.load(open(sys.argv[1])); ports={}; capacities={}
 for line in open(sys.argv[2]):
  mid,port,hf,capacity=line.rstrip('\n').split('\t'); ports[mid]=int(port); capacities[mid]=json.loads(capacity)
-roles={r:{'model_id':mid,'backend_alias':mid,'url':f'http://127.0.0.1:{ports[mid]}','capacity':capacities[mid]} for r,mid in p['role_ids'].items()}
+roles={r:{'model_id':mid,'backend_alias':mid,'url':f'http://127.0.0.1:{ports[mid]}','capacity':{**capacities[mid],'no_context_shift':True}} for r,mid in p['role_ids'].items()}
 json.dump({'roles':roles},open(sys.argv[3],'w'),indent=2)
 PY
 }
@@ -442,6 +455,8 @@ for s in p['servers']:
  print(f"  {s['id']}: {x['hf_spec']}\n    {gs}\n    KV={x['kv_k']}/{x['kv_v']} batch={x['batch']}/{x['ubatch']} FA={x['flash_attn']} quality-tier={x['quality']}")
  c=s['capacity']
  print(f"    slots={c['slots']} hard={c['context']} input={c['input_tokens']} output={c['output_tokens']} client={c['client_context']} compact={c['compact_trigger']} estimated-memory={s['required_mib']/1024:.2f} GiB")
+ if c.get('min_tps') is not None:
+  print(f"    WARNING: min_tps={c['min_tps']} is requested, not proven; no matching runtime throughput SLA evidence is verified by this launcher.")
 PY
 }
 
@@ -460,8 +475,13 @@ show_runtime_errors() {
 }
 
 run_claude() {
-    local key="claude-local-$RANDOM-$$" role id sonnet_id rc
-    export ANTHROPIC_BASE_URL="http://127.0.0.1:$GATEWAY_PORT" ANTHROPIC_AUTH_TOKEN="$key" ANTHROPIC_API_KEY="$key" CLAUDE_CODE_MAX_CONTEXT_TOKENS="$CLIENT_CTX"
+    local key="claude-local-$RANDOM-$$" role id sonnet_id rc max_output
+    max_output="$(python3 - "$PLAN_FILE" <<'PY'
+import json,sys
+print(min(s['capacity']['output_tokens'] for s in json.load(open(sys.argv[1]))['servers']))
+PY
+)"
+    export ANTHROPIC_BASE_URL="http://127.0.0.1:$GATEWAY_PORT" ANTHROPIC_AUTH_TOKEN="$key" ANTHROPIC_API_KEY="$key" CLAUDE_CODE_MAX_CONTEXT_TOKENS="$CLIENT_CTX" CLAUDE_CODE_MAX_OUTPUT_TOKENS="$max_output"
     unset CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY ANTHROPIC_BEDROCK_BASE_URL ANTHROPIC_VERTEX_BASE_URL || true
     while IFS=$'\t' read -r role id; do
         case "$role" in
@@ -565,7 +585,7 @@ p=json.load(open(sys.argv[1]))
 print(min(s['capacity']['client_context'] for s in p['servers']))
 PY
 )"
-warn "Claude Code uses a global context budget ($CLIENT_CTX); configured per-model compact triggers are exposed in the plan, but explicit compaction thresholds are not supported by this integration."
+warn "Claude Code global context hint ($CLIENT_CTX) uses legacy CLAUDE_CODE_MAX_CONTEXT_TOKENS, not verified in current upstream docs. Runtime hard budgets remain enforced; no unverified auto-compaction threshold is configured."
 print_plan; [[ $DRY_RUN -eq 1 ]] && exit 0
 install_claude_code; prepare_host_compiler; activate_cuda; ensure_llamacpp
 grep -q '"template": "qwen-fixed"' "$PLAN_FILE" && fetch_qwen_template || true

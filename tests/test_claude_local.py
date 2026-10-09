@@ -83,7 +83,7 @@ class GatewayTests(unittest.TestCase):
         server.verbose = False
         threading.Thread(target=server.serve_forever, daemon=True).start()
         def backend(endpoint, path, body=None, headers=None):
-            return None if path == "/props" else {"input_tokens": 40}
+            return {"n_ctx_per_slot": 128} if path == "/props" else {"input_tokens": 40}
         try:
             with patch.object(gwmod.request_budget, "backend_json", side_effect=backend):
                 for model, expected in (("large", 200), ("small", 400)):

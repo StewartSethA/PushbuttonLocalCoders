@@ -73,7 +73,7 @@ Options:
   --resume
   --placement-config FILE       default: ~/.config/pushbutton-local/placement.json
   --plan-only                   print placement/quant and exit before provisioning
-  --local-context N
+  --local-context N              fallback hard context per slot
   --slots N                     fallback parallel slots per model
   --local-client-context N
   --local-cache DIR
@@ -188,6 +188,8 @@ for w in p['workers']:
  print(f"  agent {w['worker']}: {w['model']} / {x['quant']} -> GPU[{gs}] ({len(w['gpus'])} GPU{'s' if len(w['gpus'])!=1 else ''}){lease}")
  c=w['capacity']
  print(f"    slots={c['slots']} hard={c['context']} input={c['input_tokens']} output={c['output_tokens']} client={c['client_context']} compact={c['compact_trigger']} estimated-memory={w['required_mib']/1024:.2f} GiB")
+ if c.get('min_tps') is not None:
+  print(f"    WARNING: min_tps={c['min_tps']} is requested, not proven; no matching runtime throughput SLA evidence is verified by this launcher.")
 print(f"  spare GPUs: {[g['index'] for g in p['unused_gpus']]}")
 PY
 }
@@ -224,6 +226,19 @@ print("VRAM lease actual: "+", ".join(f"GPU{i}={m/1024:.2f}GiB/{cap/1024:.2f}GiB
 if over: raise SystemExit(1)
 PY
 }
+verify_capacity(){
+python3 - "$ROOT/lib" "$1" "$2" <<'PY'
+import json,sys
+sys.path.insert(0,sys.argv[1])
+from pushbutton_request_budget import verify_backend_capacity
+try:
+ verify_backend_capacity(f'http://127.0.0.1:{sys.argv[2]}',json.loads(sys.argv[3]))
+except Exception as error:
+ print(f'Capacity readiness failed: {error}',file=sys.stderr)
+ raise SystemExit(1)
+PY
+}
+
 start_backends(){
  mkdir -p "$STATE_DIR/logs" "$CACHE_DIR"; BACKENDS="$STATE_DIR/coder-backends.$$.tsv"; : >"$BACKENDS"
  export LLAMA_CACHE="$CACHE_DIR" GGML_CUDA_ENABLE_UNIFIED_MEMORY=0 CUDA_SCALE_LAUNCH_QUEUES=4x
@@ -252,6 +267,28 @@ start_backends(){
    printf '%s\t%s\t%s\t%s\t%s\n' "$worker" "$id" "$port" "$hf" "$capacity" >>"$BACKENDS"
  done < <(worker_rows)
 }
+start_capacity_proxy(){
+  CAPACITY_PROXY_CONFIG="$STATE_DIR/coder-capacity.$$.json"
+  export PUSHBUTTON_CAPACITY_CONFIG="$CAPACITY_PROXY_CONFIG"
+  CAPACITY_PROXY_PORT="$(free_port "$PORT_BASE")"
+  python3 - "$BACKENDS" "$CAPACITY_PROXY_CONFIG" <<'PY'
+import json,sys
+routes={}
+for line in open(sys.argv[1]):
+ worker,mid,port,hf,raw=line.rstrip('\n').split('\t')
+ routes[mid]={'model_id':mid,'backend_alias':mid,'url':f'http://127.0.0.1:{port}','capacity':{**json.loads(raw),'no_context_shift':True}}
+json.dump({'routes':routes},open(sys.argv[2],'w'),indent=2)
+PY
+  local pid log="$STATE_DIR/logs/coder-capacity.log"
+  python3 "$ROOT/lib/pushbutton_capacity_proxy.py" --config "$CAPACITY_PROXY_CONFIG" --port "$CAPACITY_PROXY_PORT" >"$log" 2>&1 &
+  pid=$!; PIDS+=("$pid")
+  until curl -fsS "http://127.0.0.1:$CAPACITY_PROXY_PORT/health" >/dev/null 2>&1; do
+    kill -0 "$pid" 2>/dev/null || { tail -80 "$log" >&2 || true; die "capacity guard failed"; }
+    sleep 1
+  done
+  say "Guarded OpenAI endpoint ready: http://127.0.0.1:$CAPACITY_PROXY_PORT/v1"
+}
+
 ensure_qwen(){
  if have qwen; then return; fi
  say "Installing official Qwen Code standalone CLI..."
@@ -270,8 +307,8 @@ for line in open(sys.argv[1]):
  w,mid,port,hf,capacity=line.rstrip('\n').split('\t'); rows.append((int(w),mid,int(port),hf,json.loads(capacity)))
 models=[]
 for w,mid,port,hf,c in rows:
- models.append({"id":mid,"name":f"Pushbutton agent {w}: {hf}","envKey":"PUSHBUTTON_LOCAL_API_KEY","baseUrl":f"http://127.0.0.1:{sys.argv[3]}/v1","streamIdleTimeoutMs":0,"generationConfig":{"contextWindowSize":c['client_context'],"maxOutputTokens":c['output_tokens'],"maxRetries":1}})
-obj={"modelProviders":{"openai":models},"security":{"auth":{"selectedType":"openai"}},"model":{"name":rows[0][1]},"experimental":{"agentTeam":True},"privacy":{"usageStatisticsEnabled":False},"telemetry":{"enabled":False}}
+ models.append({"id":mid,"name":f"Pushbutton agent {w}: {hf}","envKey":"PUSHBUTTON_LOCAL_API_KEY","baseUrl":f"http://127.0.0.1:{sys.argv[3]}/v1","streamIdleTimeoutMs":0,"generationConfig":{"contextWindowSize":c['client_context'],"samplingParams":{"max_tokens":c['output_tokens']},"maxRetries":1}})
+obj={"modelProviders":{"openai":models},"security":{"auth":{"selectedType":"openai"}},"model":{"name":rows[0][1]},"context":{"autoCompactThreshold":min(c['compact_trigger']/c['client_context'] for w,mid,port,hf,c in rows)},"experimental":{"agentTeam":True},"privacy":{"usageStatisticsEnabled":False},"telemetry":{"enabled":False}}
 open(sys.argv[2],'w').write(json.dumps(obj,indent=2)+'\n')
 PY
  local n; n="$(wc -l <"$BACKENDS")"
@@ -364,6 +401,6 @@ fi
 source "$ROOT/lib/pushbutton_download.sh"
 source "$HOSTCC_SH"; claude_local_prepare_hostcc; activate_cuda; ensure_llamacpp; grep -q '"template": "qwen-fixed"' "$PLAN_FILE" && fetch_qwen_template || true; start_backends
 start_capacity_proxy
-warn "Qwen uses per-model client/output budgets. Configured compact triggers are exposed in the plan; explicit frontend compaction thresholds are not supported by this integration."
+say "Qwen uses per-model client/output budgets and the earliest configured global auto-compaction threshold."
 flock -u "$STARTUP_LOCK_FD"; eval "exec ${STARTUP_LOCK_FD}>&-"; STARTUP_LOCK_FD=""
 launch_qwen

@@ -36,20 +36,21 @@ class Instance:
             requested_context=context,
             framework_max=self.framework_max_concurrency,
             measured_envelopes=self.measured_envelopes,
-            min_client_tg=float(self.request_capacity.get("min_tps", policy.MIN_DECODE_TOK_S)),
+            min_client_tg=float(self.request_capacity.get("min_tps") or policy.MIN_DECODE_TOK_S),
         )
-        return min(proven, int(self.request_capacity.get("admission_limit", proven)))
+        return min(proven, int(self.request_capacity.get("admission_limit") or proven))
 
     def context_limit(self) -> int:
         limit = policy.backend_limits(self.backend,declared_context=self.max_context).max_context
         return min(limit, int(self.request_capacity.get("context", limit)))
 
     def budget(self) -> dict:
-        return {"context": self.context_limit(), "output_tokens": 4096,
+        return {"output_tokens": 4096,
                 **self.request_capacity, "context": self.context_limit()}
 
     def speed(self) -> tuple[str,str|None]:
-        return policy.speed_label(self.tg,measured=self.tg_measured)
+        return policy.speed_label(self.tg,measured=self.tg_measured,
+                                  min_client_tg=float(self.request_capacity.get("min_tps") or policy.MIN_DECODE_TOK_S))
 
 
 def instance_from_dict(x: dict) -> Instance:

@@ -80,7 +80,7 @@ class Router:
             self.alias_map[role] = route
         self.gates = {}
         for route in self.unique_routes():
-            limit = request_budget.integer((route.get("capacity") or {}).get("admission_limit", 1), "admission_limit")
+            limit = request_budget.direct_admission_limit(route.get("capacity") or {})
             self.gates[(route["url"], route["backend_alias"])] = threading.BoundedSemaphore(limit)
 
     def resolve(self, model: str) -> dict:
@@ -363,13 +363,15 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"object": "list", "data": data})
         return self._json(404, {"type": "error", "error": {"type": "not_found_error", "message": "local gateway route not found"}})
 
-    def _forward_headers(self, resp: http.client.HTTPResponse, content_length: str | None):
+    def _forward_headers(self, resp: http.client.HTTPResponse, content_length: str | None, token_source: str):
         self.send_response(resp.status, resp.reason)
+        self.send_header("X-Pushbutton-Token-Source", token_source)
+        self.send_header("X-Pushbutton-SLA-Warning", request_budget.SLA_WARNING)
         for k, v in resp.getheaders():
             kl = k.lower()
             if kl in HOP_HEADERS or kl == "content-length":
                 continue
-            self.send_header(k, v)
+            self.send_header(k.replace("\r", "").replace("\n", ""), v.replace("\r", "").replace("\n", ""))
         if content_length:
             self.send_header("content-length", content_length)
         else:
@@ -389,6 +391,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": "request body must be an object"}})
 
         route = self.router.resolve(str(body.get("model", "")))
+        if path.endswith("/count_tokens"):
+            return self._dispatch(route, body, path)
         gate = self.router.gates[(route["url"], route["backend_alias"])]
         if not gate.acquire(timeout=60):
             return self._json(429, {"type": "error", "error": {"type": "rate_limit_error", "message": "route admission limit reached; retry later"}})
@@ -403,12 +407,12 @@ class Handler(BaseHTTPRequestHandler):
         capacity = route.get("capacity") or {"context": route.get("context", 65536), "output_tokens": 4096}
         try:
             admission = request_budget.enforce(body, capacity, route["url"], "anthropic",
-                                               headers=dict(self.headers),
+                                               headers={k: v for k, v in self.headers.items() if k.lower() not in HOP_HEADERS},
                                                count_only=path.endswith("/count_tokens"))
         except request_budget.BudgetError as exc:
             return self._json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": str(exc)}})
         if path.endswith("/count_tokens"):
-            if admission.source != "backend-tokenizer":
+            if not admission.source.startswith("backend-tokenizer"):
                 return self._json(503, {"type": "error", "error": {"type": "api_error", "message": "authoritative token count unavailable; estimate is not a token count"}})
             return self._json(200, {"input_tokens": admission.input_tokens})
         if "max_tokens" not in body:
@@ -446,11 +450,13 @@ class Handler(BaseHTTPRequestHandler):
                             continue
                         break
                     self.send_response(resp.status, resp.reason)
+                    self.send_header("X-Pushbutton-Token-Source", admission.source)
+                    self.send_header("X-Pushbutton-SLA-Warning", request_budget.SLA_WARNING)
                     for k, v in resp.getheaders():
                         kl = k.lower()
                         if kl in HOP_HEADERS or kl == "content-length":
                             continue
-                        self.send_header(k, v)
+                        self.send_header(k.replace("\r", "").replace("\n", ""), v.replace("\r", "").replace("\n", ""))
                     self.send_header("content-length", str(len(payload)))
                     self.end_headers(); committed = True
                     self.wfile.write(payload); self.wfile.flush(); return
@@ -460,7 +466,7 @@ class Handler(BaseHTTPRequestHandler):
                     first = resp.read1(65536)
                     if not first:
                         raise ConnectionError("backend closed SSE stream before first event")
-                self._forward_headers(resp, content_length); committed = True
+                self._forward_headers(resp, content_length, admission.source); committed = True
                 if first:
                     self.wfile.write(first); self.wfile.flush()
                 while True:
@@ -496,6 +502,7 @@ def main() -> int:
         config = json.load(f)
     router = Router(config)
     probe_all_routes(router)
+    print(f"claude-local gateway: {request_budget.SLA_WARNING}; unproven admission defaults to C1", file=sys.stderr, flush=True)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.router = router  # type: ignore[attr-defined]
     server.verbose = args.verbose  # type: ignore[attr-defined]
