@@ -382,8 +382,8 @@ def main():
   if a.frontend in CODER_FRONTENDS:
    a.agents=positive_input('Independent workers',a.agents or len(models),8)
    if not a.ram_limit and not a.vram_limit:ram_cap,cap=ask_caps()
- client_context=min(200000,a.context) if a.client_context is None else a.client_context
- if client_context<=0:raise ValueError('client context must be positive')
+ client_context=(None if a.frontend=='claude-local' else min(200000,a.context)) if a.client_context is None else a.client_context
+ if client_context is not None and client_context<=0:raise ValueError('client context must be positive')
  if ram_cap is None:_,ram_cap=ram_info()
  tables={};instance_tables=[]
  defaults=workers.load_placement_config(a.placement_config) if a.frontend in CODER_FRONTENDS else {}
@@ -421,11 +421,11 @@ def main():
  try:
   result,launch_models=joint_preview(models,a.frontend,a.agents,inv,a.context,cap,indices,a.placement_config,a.slots,a.client_context)
   capacities=[w['capacity'] for w in result.get('workers',result.get('servers',[]))]
-  client_context=min(c['client_context'] for c in capacities)
+  client_context=a.client_context if a.frontend=='claude-local' else min(c['client_context'] for c in capacities)
   # Default budgets are already pinned in per-model specs; only forward an
   # explicitly requested global budget (or legacy default when unchanged).
   launch_budget=a.client_context
-  if a.client_context is None and all(c['client_context']==min(200000,a.context) for c in capacities):
+  if a.frontend!='claude-local' and a.client_context is None and all(c['client_context']==min(200000,a.context) for c in capacities):
    launch_budget=client_context
   command=launch_command(a.frontend,launch_models,result,a.context,launch_budget,a.launch_arg,a.slots)
   if a.frontend in CODER_FRONTENDS:
@@ -453,7 +453,7 @@ def main():
   if 'roles' in result:print('  Shared roles: '+json.dumps(result['roles']))
   if launch_env:print('  Launch GPU pool: '+launch_env['PUSHBUTTON_SELECTOR_GPU_INDICES']+' (role planner rechecks this pool only)')
   print('  Spare GPUs: '+str([g['index'] for g in result['unused_gpus']]))
-  print(f'  Physical context: {a.context}; client context: {client_context}')
+  print(f'  Physical context: {a.context}; client context: {client_context if client_context is not None else "derived after backend capacity verification"}')
   print('  Host RAM minimum unknown; RAM ceiling is advisory, not enforcement.')
   print('  Resident endpoints are not automatically reused. Launchers choose free ports and recheck placement.')
   printable=['env',*(f'{key}={value}' for key,value in launch_env.items()),*command] if launch_env else command

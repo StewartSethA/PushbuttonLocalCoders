@@ -63,6 +63,8 @@ STATE_DIR={shlex.quote(str(self.root))}
 CACHE_DIR="$STATE_DIR/cache"
 ROOT={shlex.quote(str(ROOT))}
 PLAN_FILE={shlex.quote(str(self.plan))}
+BUDGET_PY="$ROOT/lib/claude_local_budget.py"
+CLAUDE_ARGS=()
 PORT_BASE=18000
 CTX=262144
 CLIENT_CTX=200000
@@ -85,6 +87,7 @@ CAPTURE="$STATE_DIR/capture"
                 row_function = "worker_rows" if frontend == "coder-local" else "server_rows"
                 body = """
 say(){ :; }; die(){ echo "$*" >&2; exit 1; }
+validate_download_space(){ :; }
 download_model_fast(){ printf -v "$3" '%s' model.gguf; }
 free_port(){ echo 18001; }; curl(){ return 0; }
 verify_capacity(){ printf '%s' "$2" >"$STATE_DIR/verified"; }
@@ -105,12 +108,51 @@ wait
                 self.assertEqual(json.loads(registry.read_text().strip().split("\t")[-1]), self.capacity)
 
     def test_gateway_routes_carry_capacity(self):
+        capacity = {**self.capacity, "context":262144, "client_context":200000,
+                    "compact_trigger":150000, "input_tokens":198720}
+        plan = json.loads(self.plan.read_text())
+        plan["servers"][0]["capacity"] = capacity
+        self.plan.write_text(json.dumps(plan))
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.reply(dict(default_generation_settings=dict(n_ctx=262144), total_slots=3))
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                self.reply(dict(input_tokens=20))
+
+            def reply(self, data):
+                raw = json.dumps(data).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        claude = self.root / "claude"
+        claude.write_text(
+            "#!/bin/sh\n"
+            "# CLAUDE_CODE_AUTO_COMPACT_WINDOW CLAUDE_CODE_MAX_CONTEXT_TOKENS CLAUDE_CODE_MAX_OUTPUT_TOKENS\n"
+            'case "$1" in --version) echo "2.1.221";; --help) echo "--autocompact --setting-sources --settings";; esac\n')
+        claude.chmod(0o755)
         backends = self.root / "backends"
-        backends.write_text("model-a\t18001\trepo:quant\t" + json.dumps(self.capacity) + "\n")
+        backends.write_text(f"model-a\t{server.server_port}\trepo:quant\t" + json.dumps(capacity) + "\n")
         self.run_functions("claude-local", ["write_gateway_config"],
+                           f'export PATH={shlex.quote(str(self.root))}:"$PATH"\n'
                            f'BACKENDS_TSV={shlex.quote(str(backends))}\nwrite_gateway_config')
         config = json.loads(next(self.root.glob("gateway.*.json")).read_text())
-        self.assertTrue(all(route["capacity"] == {**self.capacity, "no_context_shift":True}
+        self.assertTrue(all(route["capacity"] == {**capacity, "no_context_shift":True}
+                            for route in config["roles"].values()))
+        self.assertEqual(config["budget"]["max_output_tokens"], 1024)
+        self.assertEqual(config["budget"]["compact_window"], 150000)
+        self.assertTrue(all(route["context_capacity"] == 262144 and route["prompt_reserve"] == 8192
                             for route in config["roles"].values()))
 
     def test_startup_requested_throughput_warns_not_proven(self):
@@ -159,13 +201,18 @@ wait
         second = {**self.server, "id":"model-b", "capacity":{**self.capacity, "output_tokens":512}}
         plan["servers"].append(second)
         self.plan.write_text(json.dumps(plan))
+        config = self.root / "gateway.json"
+        config.write_text(json.dumps({"budget":{"client_context":131072,
+                                               "compact_window":100000,
+                                               "max_output_tokens":512}}))
         result = self.run_functions("claude-local", ["run_claude"],
-            'GATEWAY_PORT=19000\nCLIENT_CTX=6000\nENABLE_TEAMS=0\nCLAUDE_ARGS=()\n'
+            f'GATEWAY_CONFIG={shlex.quote(str(config))}\n'
+            'GATEWAY_PORT=19000\nENABLE_TEAMS=0\nCLAUDE_ARGS=()\n'
             'say(){ :; }; contains_claude_flag(){ return 0; }\n'
             'role_rows(){ printf "sonnet\\tmodel-a\\n"; }\n'
-            'claude(){ printf "BUDGET:%s/%s\\n" "$CLAUDE_CODE_MAX_CONTEXT_TOKENS" "$CLAUDE_CODE_MAX_OUTPUT_TOKENS"; }\n'
+            'claude(){ printf "BUDGET:%s/%s/%s\\n" "$CLAUDE_CODE_MAX_CONTEXT_TOKENS" "$CLAUDE_CODE_MAX_OUTPUT_TOKENS" "$CLAUDE_CODE_AUTO_COMPACT_WINDOW"; }\n'
             'run_claude')
-        self.assertIn("BUDGET:6000/512", result.stdout)
+        self.assertIn("BUDGET:131072/512/100000", result.stdout)
 
     def test_readiness_refuses_reduced_or_unproven_per_slot_context(self):
         props = {}
@@ -243,7 +290,7 @@ class StartupTests(unittest.TestCase):
         self.root = pathlib.Path(self.scratch.name)
         self.bin = self.root / "bin"
         self.bin.mkdir()
-        for name in ("bash", "cat", "dirname", "basename", "readlink", "mkdir", "chmod", "ln", "mv", "rm"):
+        for name in ("bash", "cat", "dirname", "basename", "readlink", "mkdir", "chmod", "ln", "mv", "rm", "stat", "df"):
             (self.bin / name).symlink_to(shutil.which(name))
         (self.bin / "python3").symlink_to(sys.executable)
         for name in FRONTENDS + WRAPPERS + ("claude-local-safe",):
@@ -427,6 +474,48 @@ class StartupTests(unittest.TestCase):
                 self.assertIn("--launch-arg=--no-parallel", record["argv"])
                 self.assertFalse((self.root / "state").exists())
 
+    def test_storage_options_survive_selection_without_creating_folders(self):
+        self.selector_recorder()
+        cache = self.root / "chosen model cache"
+        for name in FRONTENDS + WRAPPERS:
+            with self.subTest(frontend=name):
+                record = self.recorded(name, ["--select", "q38", "--quiet",
+                                             "--local-cache", str(cache)])
+                for arg in ("--quiet", "--local-cache", str(cache)):
+                    self.assertIn("--launch-arg=" + arg, record["argv"])
+                self.assertFalse(cache.exists())
+                self.assertFalse((self.root / "state").exists())
+
+    def test_selector_uses_relocated_placement_without_writing_state(self):
+        self.selector_recorder()
+        (self.root / "lib").mkdir()
+        shutil.copy2(ROOT / "lib/pushbutton_folders.sh",
+                     self.root / "lib/pushbutton_folders.sh")
+        config = self.root / "custom config"
+        config.mkdir()
+        folders = config / "folders.json"
+        original = json.dumps({
+            "schema_version": 1,
+            "folders": {"state_dir": str(self.root / "state"),
+                        "cache_dir": str(self.root / "cache"),
+                        "config_dir": str(config)},
+            "created_at": "2026-10-09T00:00:00+00:00",
+        })
+        folders.write_text(original)
+        self.env["PUSHBUTTON_CONFIG_DIR"] = str(config)
+        for name in ("coder-local", "qwen-local"):
+            with self.subTest(frontend=name):
+                argv = self.recorded(name, ["--select", "q38"])["argv"]
+                self.assertEqual(argv[argv.index("--placement-config") + 1],
+                                 str(config / "placement.json"))
+                argv = self.recorded(name, ["--select", "q38", "--placement-config",
+                                           "explicit-placement.json"])["argv"]
+                self.assertEqual(argv[argv.index("--placement-config") + 1],
+                                 "explicit-placement.json")
+                self.assertEqual(folders.read_text(), original)
+                self.assertFalse((self.root / "state").exists())
+                self.assertFalse((self.root / "cache").exists())
+
     def test_safe_claude_wrapper_has_menu_and_help_before_gpu_probe(self):
         self.selector_recorder()
         nvidia = self.bin / "nvidia-smi"
@@ -453,6 +542,8 @@ class StartupTests(unittest.TestCase):
             "'swarm':os.environ.get('MINI_SWE_SWARM_TASK')}))\n")
         coder.chmod(0o755)
         (self.root / "lib").mkdir()
+        shutil.copy2(ROOT / "lib/pushbutton_folders.sh",
+                     self.root / "lib/pushbutton_folders.sh")
         (self.root / "lib" / "claude_local_hostcc.sh").write_text(
             "claude_local_prepare_hostcc() { :; }\n")
         for tool in ("cmake", "opencode", "npm", "dsh", "pnpm", "mini", "grep"):
@@ -546,6 +637,8 @@ class StartupTests(unittest.TestCase):
 
     def test_claude_entry_confirmed_models_keep_hardened_policy(self):
         entry = self.prepare_claude_entry()
+        shutil.copy2(ROOT / "lib/pushbutton_folders.sh",
+                     self.root / "lib/pushbutton_folders.sh")
         frontend = self.root / "claude-local"
         frontend.write_text(
             "#!" + sys.executable + "\nimport json, os, sys\n"
@@ -622,6 +715,8 @@ class StartupTests(unittest.TestCase):
                       "pushbutton-backend", "pushbutton-bench", "pushbutton-observe", "pushbutton-select"):
             (template / extra).write_text("#!/bin/bash\necho UNEXPECTED_TOOL\nexit 91\n")
         (template / "lib").mkdir(exist_ok=True)
+        shutil.copy2(ROOT / "lib/pushbutton_folders.sh",
+                     template / "lib/pushbutton_folders.sh")
         for asset in ("pushbutton_metrics.py", "coder_local_plan.py", "claude_local_plan.py",
                       "pushbutton_capacity.py", "pushbutton_request_budget.py", "pushbutton_capacity_proxy.py"):
             (template / "lib" / asset).touch()
@@ -629,12 +724,32 @@ class StartupTests(unittest.TestCase):
         shutil.copy2(ROOT / "lib" / "claude_local_entry.sh", entry)
         (template / "configs").mkdir(exist_ok=True)
         (template / "configs" / "backend-registry.json").write_text("{}")
+        (template / ".git").mkdir(exist_ok=True)
         git = self.bin / "git"
-        git.write_text("#!" + sys.executable + "\nimport os, shutil, sys\n"
-                       "if sys.argv[1] == 'clone': shutil.copytree(os.environ['TEMPLATE'], sys.argv[-1])\n")
+        git.write_text("#!" + sys.executable + "\nimport os, pathlib, shutil, sys\n"
+                       "args = sys.argv[1:]\n"
+                       "if 'clone' in args: shutil.copytree(os.environ['TEMPLATE'], args[-1])\n"
+                       "elif 'checkout' in args:\n"
+                       "  if '-f' not in args: sys.exit(1)\n"
+                       "  dest = pathlib.Path(args[args.index('-C') + 1])\n"
+                       "  shutil.copy2(pathlib.Path(os.environ['TEMPLATE']) / 'lib/claude_local_entry.sh', "
+                       "dest / 'lib/claude_local_entry.sh')\n")
         git.chmod(0o755)
         self.env.update(PUSHBUTTON_DIR=str(self.root / "installed"), TEMPLATE=str(template))
         return installer
+
+    def test_claude_installer_update_replaces_local_edits(self):
+        installer = self.prepare_installer("claude-local")
+        result = self.run_script(installer)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        installed_entry = self.root / "installed/PushbuttonLocalCoders/lib/claude_local_entry.sh"
+        installed_entry.write_text("local edit\n")
+        result = self.run_script(installer)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(installed_entry.read_text(),
+                         (self.root / "template/lib/claude_local_entry.sh").read_text())
 
     def test_piped_installer_noargs_installs_and_prints_help(self):
         for name in FRONTENDS:
@@ -644,7 +759,10 @@ class StartupTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("Usage:", result.stdout)
                 self.assertNotIn("UNEXPECTED_TOOL", result.stdout)
-                self.assertFalse((self.root / "state").exists())
+                self.assertFalse((self.root / "state/web-mcp.json").exists())
+                self.assertFalse((self.root / "state/frontends").exists())
+                if name != "hermes-local":
+                    self.assertTrue((self.root / "home/.config/pushbutton-local/folders.json").exists())
                 shutil.rmtree(self.root / "installed")
 
     def test_coder_installer_install_only_retains_runtime_installation(self):
@@ -677,7 +795,7 @@ class StartupTests(unittest.TestCase):
                 result = self.run_script(shim, args)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("interactive terminal", result.stderr)
-                self.assertFalse((self.root / "state").exists())
+                self.assertFalse((self.root / "state/web-mcp.json").exists())
 
     def test_piped_installer_select_and_help_exit_before_git(self):
         for name in FRONTENDS:

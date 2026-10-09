@@ -8,6 +8,7 @@ ROOT="$(cd "$(dirname "$SELF")" && pwd)"
 LIB="$ROOT/lib"
 PLAN_PY="$LIB/claude_local_plan.py"
 GATEWAY_PY="$LIB/claude_local_gateway.py"
+BUDGET_PY="$LIB/claude_local_budget.py"
 HOSTCC_SH="$LIB/claude_local_hostcc.sh"
 
 STATE_DIR="${CLAUDE_LOCAL_STATE:-$HOME/.local/share/pushbutton/claude-local}"
@@ -15,7 +16,7 @@ CACHE_DIR="${CLAUDE_LOCAL_CACHE:-$HOME/.cache/pushbutton/llama}"
 LOCK_FILE="${CLAUDE_LOCAL_LOCK_FILE:-$HOME/.local/share/pushbutton/claude-local/startup.lock}"
 CTX="${CLAUDE_LOCAL_CONTEXT:-262144}"
 SLOTS=1
-CLIENT_CTX="${CLAUDE_LOCAL_CLIENT_CONTEXT:-200000}"
+CLIENT_CTX="${CLAUDE_LOCAL_CLIENT_CONTEXT:-}"
 CLIENT_CTX_EXPLICIT=0
 [[ -z "${CLAUDE_LOCAL_CLIENT_CONTEXT+x}" ]] || CLIENT_CTX_EXPLICIT=1
 PORT_BASE="${CLAUDE_LOCAL_PORT_BASE:-18180}"
@@ -24,6 +25,8 @@ KEEP_SERVERS=0
 ENABLE_TEAMS=1
 DRY_RUN=0
 VERBOSE=0
+QUIET=0
+FOLDERS_ONLY=0
 SELECT=0
 SELECT_ARGS=()
 MODELS=()
@@ -55,11 +58,13 @@ Built-ins: nemotron-3.5-lightning qwen3.6:35b qwen3.8:27b glm-5.3-flash
 Harness options (put before ordinary Claude Code flags):
   --select                   choose models interactively before provisioning
   --local-cache DIR          llama.cpp/Hugging Face model cache
+  --folders, --system-info   show storage paths and disk usage, then exit
+  --quiet                    suppress the startup folder banner
   --no-parallel              Force sequential Hugging Face downloads
   --local-context N          fallback hard context per slot (default 262144)
   --slots N                  fallback parallel slots per model
   MODEL@context=N,slots=N,output=N,client_context=N,compact=N,quant=Q,kv_k=K,kv_v=V,min_tps=N,admission=N
-  --local-client-context N   explicit client budget; checked against every model
+  --local-client-context N   assumed client window (default derived, <=200000)
   --local-port-base N        starting port for gateway/backends
   --local-no-teams           disable experimental Claude agent teams
   --local-keep-servers       leave model servers running after Claude exits
@@ -68,14 +73,15 @@ Harness options (put before ordinary Claude Code flags):
   --local-verbose            verbose local gateway logging
   --                         stop harness parsing; pass rest to Claude Code
 
-All ordinary Claude Code flags, including --resume/--continue/--permission-mode,
-are passed through unchanged.
+Ordinary Claude flags (including --resume/--continue/--permission-mode) pass
+through. Unsafe context, provider, or settings overrides are rejected.
 EOF
 }
 
 require_files() {
     [[ -f "$PLAN_PY" ]] || die "missing $PLAN_PY"
     [[ -f "$GATEWAY_PY" ]] || die "missing $GATEWAY_PY"
+    [[ -f "$BUDGET_PY" ]] || die "missing $BUDGET_PY"
 }
 
 base_deps_missing() {
@@ -367,7 +373,8 @@ start_backends() {
     local next=$((PORT_BASE+1)); BACKENDS_TSV="$STATE_DIR/backends.$$"; : > "$BACKENDS_TSV"
     while IFS=$'\x1f' read -r id hf gpus multi kvk kvv batch ubatch fa template envpairs note context slots capacity; do
         local port log pid follower model_path failed=0 waited=0
-        download_model_fast "$hf" "$CACHE_DIR" model_path || die "failed to download $hf"
+        validate_download_space "$CACHE_DIR" "$hf" "${hf##*:}" || exit 2
+        download_model_fast "$hf" "$CACHE_DIR" model_path || { rc=$?; [[ $rc != 2 ]] || exit 2; die "failed to download $hf"; }
         port="$(free_port "$next")"; next=$((port+1)); log="$STATE_DIR/logs/${id}.log"; : > "$log"
         local -a cmd=("$LLAMA_SERVER" -m "$model_path" --alias "$id" --no-mmproj -ngl 999 -c "$((context * slots))" -np "$slots" --cache-type-k "$kvk" --cache-type-v "$kvv" -b "$batch" -ub "$ubatch" -fa "$fa" --jinja --no-context-shift --host 127.0.0.1 --port "$port")
         [[ "$multi" == 1 ]] && cmd+=(--split-mode layer)
@@ -375,6 +382,7 @@ start_backends() {
         local -a envcmd=(env "CUDA_VISIBLE_DEVICES=$gpus" "LLAMA_CACHE=$CACHE_DIR" "GGML_CUDA_ENABLE_UNIFIED_MEMORY=$ALLOW_OFFLOAD" "CUDA_SCALE_LAUNCH_QUEUES=4x")
         if [[ -n "$envpairs" ]]; then local -a pairs; IFS=';' read -ra pairs <<< "$envpairs"; local pair; for pair in "${pairs[@]}"; do envcmd+=("$pair"); done; fi
         say "Starting $id on GPU(s) [$gpus], $hf, hard=$context slots=$slots${note:+ — $note}"
+        printf '[claude-local] Follow %s logs in another terminal:\n  tail -n 50 -F -- %q\n' "$id" "$log" >&2
         "${envcmd[@]}" "${cmd[@]}" >"$log" 2>&1 & pid=$!; PIDS+=("$pid")
         follower="$(start_log_follower "$log")"
         while ! curl -fsS "http://127.0.0.1:$port/health" >/dev/null 2>&1; do
@@ -397,14 +405,8 @@ start_backends() {
 
 write_gateway_config() {
     GATEWAY_CONFIG="$STATE_DIR/gateway.$$.json"
-python3 - "$PLAN_FILE" "$BACKENDS_TSV" "$GATEWAY_CONFIG" <<'PY'
-import json,sys
-p=json.load(open(sys.argv[1])); ports={}; capacities={}
-for line in open(sys.argv[2]):
- mid,port,hf,capacity=line.rstrip('\n').split('\t'); ports[mid]=int(port); capacities[mid]=json.loads(capacity)
-roles={r:{'model_id':mid,'backend_alias':mid,'url':f'http://127.0.0.1:{ports[mid]}','capacity':{**capacities[mid],'no_context_shift':True}} for r,mid in p['role_ids'].items()}
-json.dump({'roles':roles},open(sys.argv[3],'w'),indent=2)
-PY
+    python3 "$BUDGET_PY" --requested "$CTX" --client "$CLIENT_CTX" --check-claude \
+        --plan "$PLAN_FILE" --backends "$BACKENDS_TSV" --config "$GATEWAY_CONFIG" -- "${CLAUDE_ARGS[@]}"
 }
 
 start_gateway() {
@@ -475,13 +477,20 @@ show_runtime_errors() {
 }
 
 run_claude() {
-    local key="claude-local-$RANDOM-$$" role id sonnet_id rc max_output
-    max_output="$(python3 - "$PLAN_FILE" <<'PY'
+    local key="claude-local-$RANDOM-$$" role id sonnet_id rc
+    local compact output
+    read -r CLIENT_CTX compact output < <(python3 - "$GATEWAY_CONFIG" <<'PY'
 import json,sys
-print(min(s['capacity']['output_tokens'] for s in json.load(open(sys.argv[1]))['servers']))
+p=json.load(open(sys.argv[1]))['budget']
+print(p['client_context'],p['compact_window'],p['max_output_tokens'])
 PY
-)"
-    export ANTHROPIC_BASE_URL="http://127.0.0.1:$GATEWAY_PORT" ANTHROPIC_AUTH_TOKEN="$key" ANTHROPIC_API_KEY="$key" CLAUDE_CODE_MAX_CONTEXT_TOKENS="$CLIENT_CTX" CLAUDE_CODE_MAX_OUTPUT_TOKENS="$max_output"
+)
+    export ANTHROPIC_BASE_URL="http://127.0.0.1:$GATEWAY_PORT" ANTHROPIC_AUTH_TOKEN="$key" ANTHROPIC_API_KEY="$key"
+    export CLAUDE_CODE_MAX_CONTEXT_TOKENS="$CLIENT_CTX" CLAUDE_CODE_AUTO_COMPACT_WINDOW="$compact" CLAUDE_CODE_MAX_OUTPUT_TOKENS="$output"
+    [[ -z "${CLAUDE_CONFIG_DIR:-}" || "$CLAUDE_CONFIG_DIR" == "$STATE_DIR/claude-config" ]] || warn "Ignoring inherited CLAUDE_CONFIG_DIR; using isolated local settings/session storage."
+    export CLAUDE_CONFIG_DIR="$STATE_DIR/claude-config"
+    mkdir -p "$CLAUDE_CONFIG_DIR"
+    say "Claude settings/sessions: $CLAUDE_CONFIG_DIR (user/project settings sources disabled for context-policy isolation)"
     unset CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY ANTHROPIC_BEDROCK_BASE_URL ANTHROPIC_VERTEX_BASE_URL || true
     while IFS=$'\t' read -r role id; do
         case "$role" in
@@ -497,7 +506,7 @@ import json,sys
 print(json.load(open(sys.argv[1]))['role_ids']['sonnet'])
 PY
 )"
-    local -a args=("${CLAUDE_ARGS[@]}")
+    local -a args=(--setting-sources "" --settings '{"autoCompactEnabled":true}' "${CLAUDE_ARGS[@]}")
     contains_claude_flag --model || args=(--model "$sonnet_id" "${args[@]}")
     contains_claude_flag --agents || args=(--agents "$(agents_json)" "${args[@]}")
     say "All local services ready. Launching Claude Code from $PWD"
@@ -519,12 +528,14 @@ doctor() {
     have_cmd nvidia-smi && nvidia-smi --query-gpu=index,name,memory.total,memory.free,compute_cap,pcie.link.gen.current,pcie.link.width.current --format=csv,noheader 2>/dev/null || warn "nvidia-smi unavailable"
     have_cmd nvcc && nvcc --version | tail -4 || warn "nvcc unavailable (bootstrapped on first run)"
     have_cmd claude && claude --version || warn "Claude Code unavailable (installed on first run)"
+    say "Requested context: $CTX; client: ${CLIENT_CTX:-derived}; live per-slot capacity is verified after backend startup."
+    python3 "$BUDGET_PY" --requested "$CTX" --client "$CLIENT_CTX" --check-claude || return $?
 }
 
 case "${1:-}" in
   help|-h|--help) usage; exit 0;;
   install) shift; install_base_deps; install_claude_code; install_command "${1:-}"; exit 0;;
-  doctor) doctor; exit 0;;
+  doctor) source "$LIB/pushbutton_folders.sh"; load_folder_config; check_folders_exist; print_folder_summary 0; doctor; exit 0;;
   models) python3 "$PLAN_PY" catalogue; exit 0;;
 esac
 
@@ -533,11 +544,13 @@ while (($#)); do
       -h|--help) usage; exit 0;;
       --select) SELECT=1; shift;;
       --) shift; CLAUDE_ARGS+=("$@"); break;;
-      --local-cache) [[ $# -ge 2 ]] || die "--local-cache needs a directory"; CACHE_DIR="$2"; SELECT_ARGS+=("$1" "$2"); shift 2;;
+      --local-cache) [[ $# -ge 2 ]] || die "--local-cache needs a directory"; export CLAUDE_LOCAL_CACHE="$2"; SELECT_ARGS+=("$1" "$2"); shift 2;;
+      --folders|--system-info) FOLDERS_ONLY=1; shift;;
+      --quiet) QUIET=1; SELECT_ARGS+=("$1"); shift;;
       --no-parallel) PUSHBUTTON_NO_PARALLEL=1; SELECT_ARGS+=("$1"); shift;;
-      --local-context) CTX="$2"; shift 2;;
+      --local-context) [[ $# -ge 2 ]] || die "--local-context needs an integer"; CTX="$2"; shift 2;;
       --slots) [[ $# -ge 2 ]] || die "--slots needs a value"; SLOTS="$2"; shift 2;;
-      --local-client-context) CLIENT_CTX="$2"; CLIENT_CTX_EXPLICIT=1; shift 2;;
+      --local-client-context) [[ $# -ge 2 ]] || die "--local-client-context needs an integer"; CLIENT_CTX="$2"; CLIENT_CTX_EXPLICIT=1; shift 2;;
       --local-port-base) PORT_BASE="$2"; SELECT_ARGS+=("$1" "$2"); shift 2;;
       --local-no-teams) ENABLE_TEAMS=0; SELECT_ARGS+=("$1"); shift;;
       --local-keep-servers) KEEP_SERVERS=1; SELECT_ARGS+=("$1"); shift;;
@@ -549,6 +562,14 @@ while (($#)); do
     esac
 done
 
+if ((FOLDERS_ONLY)); then
+    source "$LIB/pushbutton_folders.sh"
+    load_folder_config
+    check_folders_exist
+    print_folder_summary 1
+    printf '  Claude Code user data: %s (isolated local settings/sessions)\n' "$STATE_DIR/claude-config"
+    exit 0
+fi
 if ((SELECT)) || ((${#MODELS[@]} == 0)); then
     if [[ ! -t 0 || ! -t 1 ]]; then
         usage >&2
@@ -568,7 +589,17 @@ fi
 [[ "${CLAUDE_LOCAL_STARTUP_ONLY:-0}" != 1 ]] || exit 125
 source "$LIB/pushbutton_download.sh"
 require_files
-[[ "$CTX" =~ ^[0-9]+$ && "$CLIENT_CTX" =~ ^[0-9]+$ ]] || die "context values must be integers"
+if ! have_cmd python3; then
+    [[ $DRY_RUN -eq 0 ]] || die "python3 required for dry run"
+    install_base_deps
+fi
+budget_args=(--requested "$CTX" --client "$CLIENT_CTX" --slots "$SLOTS")
+for model in "${MODELS[@]}"; do budget_args+=("--model-spec=$model"); done
+python3 "$BUDGET_PY" "${budget_args[@]}" -- "${CLAUDE_ARGS[@]}" || exit $?
+source "$LIB/pushbutton_folders.sh"
+initialize_folders "$QUIET"
+((QUIET)) || say "Claude Code user data: $STATE_DIR/claude-config (isolated local settings/sessions)"
+LOCK_FILE="${CLAUDE_LOCAL_LOCK_FILE:-$STATE_DIR/startup.lock}"
 if [[ $DRY_RUN -eq 0 ]]; then install_base_deps; ensure_nvidia_driver; else have_cmd nvidia-smi || die "nvidia-smi required for dry run"; fi
 mkdir -p "$STATE_DIR" "$CACHE_DIR"; PLAN_FILE="$STATE_DIR/plan.$$.json"
 
@@ -579,15 +610,12 @@ plan_args=(plan --context "$CTX" --slots "$SLOTS")
 ((CLIENT_CTX_EXPLICIT == 0)) || plan_args+=(--client-context "$CLIENT_CTX")
 if ((${#MODELS[@]})); then plan_args+=("${MODELS[@]}"); else plan_args+=(--smart); fi
 python3 "$PLAN_PY" "${plan_args[@]}" > "$PLAN_FILE" || exit $?
-CLIENT_CTX="$(python3 - "$PLAN_FILE" <<'PY'
-import json,sys
-p=json.load(open(sys.argv[1]))
-print(min(s['capacity']['client_context'] for s in p['servers']))
-PY
-)"
-warn "Claude Code global context hint ($CLIENT_CTX) uses legacy CLAUDE_CODE_MAX_CONTEXT_TOKENS, not verified in current upstream docs. Runtime hard budgets remain enforced; no unverified auto-compaction threshold is configured."
+python3 "$BUDGET_PY" --requested "$CTX" --client "$CLIENT_CTX" --plan "$PLAN_FILE" -- "${CLAUDE_ARGS[@]}" || exit $?
 print_plan; [[ $DRY_RUN -eq 1 ]] && exit 0
-install_claude_code; prepare_host_compiler; activate_cuda; ensure_llamacpp
+validate_plan_download_space "$PLAN_FILE" "$CACHE_DIR" || exit 2
+install_claude_code
+python3 "$BUDGET_PY" --requested "$CTX" --client "$CLIENT_CTX" --plan "$PLAN_FILE" --check-claude -- "${CLAUDE_ARGS[@]}" || exit $?
+prepare_host_compiler; activate_cuda; ensure_llamacpp
 grep -q '"template": "qwen-fixed"' "$PLAN_FILE" && fetch_qwen_template || true
 start_backends; write_gateway_config; start_gateway
 release_startup_lock

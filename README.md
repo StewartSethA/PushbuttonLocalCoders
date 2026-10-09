@@ -33,6 +33,53 @@ curl -fL https://raw.githubusercontent.com/StewartSethA/PushbuttonLocalCoders/ma
 
 ---
 
+## Data Storage
+
+| Environment variable | Default | Contents |
+| --- | --- | --- |
+| `PUSHBUTTON_DIR` | `~/.local/share/pushbutton` | Repository in `PushbuttonLocalCoders/` |
+| `CLAUDE_LOCAL_STATE` | `~/.local/share/pushbutton/claude-local` | Logs, CUDA, llama.cpp builds, templates, Qwen state |
+| `CLAUDE_LOCAL_CACHE` | `~/.cache/pushbutton/llama` | Model weights (space critical) |
+| `PUSHBUTTON_CONFIG_DIR` | `~/.config/pushbutton-local` | `folders.json`, placement configuration |
+
+Installers and first startup offer folder customization in a terminal. Piped
+installs use defaults without prompting and still save `folders.json`. Environment
+overrides take precedence over saved paths; `--local-cache DIR` takes highest cache
+precedence. Startup choices are saved for later sessions. State, cache, and config
+paths must not overlap.
+
+```bash
+claude-local --folders    # paths, used space, free space
+qwen-local --system-info  # same report; no GPU or model download required
+hermes-local --folders
+```
+
+Normal startup prints storage paths (`--quiet` suppresses that banner) and each
+backend prints a safely quoted `tail -n 50 -F -- ...` log-follow command.
+Before model downloads, exact Hugging Face file metadata is checked against
+remaining disk space plus at least a 10 GiB reserve (the downloader also reserves
+5% of the filesystem if larger). Unknown sizes or insufficient space
+stop startup with status 2 rather than retrying a doomed download. VRAM planning
+is separate from this disk-space check.
+
+For a two-GPU setup with a separate model disk:
+
+```bash
+export CLAUDE_LOCAL_CACHE=/mnt/nvme/pushbutton-models
+qwen-local 'qwen3.8:27b@gpu=0,vram=16G' 'qwen3.6:35b@gpu=1,vram=16G' --agents 2
+```
+
+For multiple users, each can set `CLAUDE_LOCAL_CACHE=/srv/models/pushbutton`
+while keeping private state/config directories. Use a trusted group-writable
+cache and serialize downloads; different users' startup locks do not coordinate.
+Do not make state or config world-writable.
+
+To move data, stop all backends, copy the entire cache (including blobs and
+symlinks) to the new disk, set `CLAUDE_LOCAL_CACHE` or edit `folders.json`, and
+verify with `--folders` before removing the old copy. See [STORAGE.md](STORAGE.md)
+for the schema, migration steps, and troubleshooting. Third-party frontend
+installations may retain their own data: Claude Code in `~/.claude` and Hermes
+profiles/sessions in `~/.hermes`.
 ## Start here: help and model selection
 
 Run an installed frontend with no model in a terminal (`qwen-local`,
@@ -66,8 +113,8 @@ Model specs accept capacity overrides alongside GPU placement:
 ```bash
 qwen-local 'qwen3.8:27b@gpu=0,slots=2,context=65536,output=4096' \
   'qwen3.6:35b@gpu=1,slots=1,context=32768,output=4096' --agents 2
-claude-local 'qwen3.8:27b@slots=2,context=65536' \
-  'qwen3.6:35b@slots=1,context=32768'
+claude-local 'qwen3.8:27b@slots=2,context=196608,output=8192,compact=120000' \
+  'qwen3.6:35b@slots=1,context=131072,output=8192,compact=100000'
 pushbutton --slots 2 --context 65536 --frontend none 'qwen3.8:27b'
 ```
 
@@ -110,7 +157,7 @@ budget. Current upstream framework mappings are:
 | Qwen Code | Per-model `contextWindowSize` and `samplingParams.max_tokens`; session `context.autoCompactThreshold` uses the earliest safe model ratio. Its built-in reserves may compact earlier. |
 | Hermes | Per-role `model.context_length`; `compression.threshold_tokens` applies the absolute trigger, avoiding small-window ratio floors. |
 | OpenCode | Per-model `limit.context`, `limit.input`, and `limit.output`; session `compaction.reserved` leaves enough room for every model's trigger. |
-| Claude Code | Smallest shared-role client budget through the existing context hint; `CLAUDE_CODE_MAX_OUTPUT_TOKENS` limits output. The context hint and an explicit autocompact override are not verified hard limits. |
+| Claude Code | Shared-role budgets are bounded by verified per-slot capacity; `CLAUDE_CODE_AUTO_COMPACT_WINDOW` and `CLAUDE_CODE_MAX_OUTPUT_TOKENS` are configured explicitly in isolated settings. The supported compact window must be at least 100,000 tokens; smaller configurations fail with guidance rather than clamping upward. |
 | mini-SWE / DeepSeek Harness | Requests use guarded endpoints; mini-SWE receives per-worker output limits. No verified framework autocompact override is assumed for these adapters. |
 
 These mappings follow current upstream
@@ -175,7 +222,13 @@ claude-local nemotron-3.5-lightning qwen3.6:35b qwen3.8:27b --resume
 
 `claude-local` maps one to four positional models onto Haiku/Sonnet/Opus/Fable,
 starts the needed local backends, injects local subagents, and passes normal
-Claude Code flags through unchanged.
+Claude Code flags through, with validation of context-policy overrides.
+
+It verifies live llama.cpp **per-slot capacity**, derives explicit Claude
+auto-compaction/output budgets, and checks the full native-tokenized request
+before inference. Auto-compaction alone cannot prevent every oversized tool
+result or resumed transcript. See [context budgeting and recovery](CLAUDE_LOCAL.md#context-budgeting-and-auto-compaction)
+for version requirements, isolated settings, and safe overrides.
 
 ### Hermes Bot Mode
 
@@ -464,10 +517,22 @@ tradeoff than allocating 262K merely because it fits:
 
 ```bash
 claude-local qwen3.8:27b \
-  --local-context 131072 \
-  --local-client-context 100000 \
-  --resume
+  --local-context 131072
 ```
+
+The client budget is derived automatically from verified backend capacity.
+With a 131,072-token slot, defaults are a 114,688-token custom-model window,
+106,496-token compaction window and 8,192-token output budget, plus reserves.
+Claude Code 2.1.221+ and native llama.cpp Anthropic counting are required.
+Settings/sessions are isolated under `$CLAUDE_LOCAL_STATE/claude-config`;
+ordinary user/project settings (including permission customizations) are not loaded.
+
+`147023 > 131072` is a context-budget error, **not a network error**.
+The old client-budget ≤ requested-context check was insufficient.
+Lowering a threshold does not retroactively fix an oversized saved transcript:
+even `/compact` may fail. Start a **new session** with a saved handoff summary,
+without `--resume`/`--continue`; only use a temporary larger backend when its
+model/hardware fit has been verified. Do not blindly increase context or VRAM.
 
 ---
 

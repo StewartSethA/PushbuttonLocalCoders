@@ -15,11 +15,14 @@ CLIENT_CTX="${CLAUDE_LOCAL_CLIENT_CONTEXT:-200000}"
 CLIENT_CTX_EXPLICIT=0
 [[ -z "${CLAUDE_LOCAL_CLIENT_CONTEXT+x}" ]] || CLIENT_CTX_EXPLICIT=1
 PORT_BASE="${CODER_LOCAL_PORT_BASE:-20180}"
-PLACEMENT_CONFIG="${PUSHBUTTON_PLACEMENT_CONFIG:-$HOME/.config/pushbutton-local/placement.json}"
+PLACEMENT_CONFIG="${PUSHBUTTON_PLACEMENT_CONFIG:-}"
+PLACEMENT_CONFIG_EXPLICIT=0
 FRONTEND="${CODER_LOCAL_FRONTEND:-}"
 AGENTS=""
 RESUME=0
 PLAN_ONLY=0
+QUIET=0
+FOLDERS_ONLY=0
 SELECT=0
 SELECT_ARGS=()
 MENU_FRONTEND=coder-local
@@ -77,6 +80,8 @@ Options:
   --slots N                     fallback parallel slots per model
   --local-client-context N
   --local-cache DIR
+  --folders, --system-info       show storage paths and disk usage, then exit
+  --quiet                       suppress the startup folder banner
   --no-parallel              Force sequential Hugging Face downloads
   --local-port-base N
   --self-test
@@ -245,7 +250,8 @@ start_backends(){
  local next=$((PORT_BASE+1))
  while IFS=$'\x1f' read -r worker id hf gpus multi kvk kvv batch ubatch fa template envpairs note vramcap context slots capacity; do
    local port log pid model_path waited=0 failed=0
-   download_model_fast "$hf" "$CACHE_DIR" model_path || die "failed to download $hf"
+   validate_download_space "$CACHE_DIR" "$hf" "${hf##*:}" || exit 2
+   download_model_fast "$hf" "$CACHE_DIR" model_path || { rc=$?; [[ $rc != 2 ]] || exit 2; die "failed to download $hf"; }
    port="$(free_port "$next")"; next=$((port+1)); log="$STATE_DIR/logs/coder-$id.log"; : >"$log"
    local -a cmd=("$LLAMA_SERVER" -m "$model_path" --alias "$id" --no-mmproj -ngl 999 -c "$((context * slots))" -np "$slots" --cache-type-k "$kvk" --cache-type-v "$kvv" -b "$batch" -ub "$ubatch" -fa "$fa" --jinja --no-context-shift --host 127.0.0.1 --port "$port")
    [[ "$multi" == 1 ]] && cmd+=(--split-mode layer)
@@ -253,6 +259,7 @@ start_backends(){
    local -a envcmd=(env "CUDA_VISIBLE_DEVICES=$gpus" "LLAMA_CACHE=$CACHE_DIR" "GGML_CUDA_ENABLE_UNIFIED_MEMORY=0")
    if [[ -n "$envpairs" ]]; then local -a pairs; IFS=';' read -ra pairs<<<"$envpairs"; local pair; for pair in "${pairs[@]}";do envcmd+=("$pair");done;fi
    say "Starting agent $worker: $hf on GPU(s) [$gpus]${vramcap:+ with ${vramcap} MiB/GPU lease}${note:+ — $note}"
+   printf '[coder-local] Follow agent %s logs in another terminal:\n  tail -n 50 -F -- %q\n' "$worker" "$log" >&2
    "${envcmd[@]}" "${cmd[@]}" > >(tee -a "$log" >&2) 2>&1 & pid=$!; PIDS+=("$pid")
    until curl -fsS "http://127.0.0.1:$port/health" >/dev/null 2>&1; do
      kill -0 "$pid" 2>/dev/null || { failed=1;break;}; sleep 1; waited=$((waited+1)); ((waited%30==0))&&say "Still loading agent $worker (${waited}s)..."
@@ -347,11 +354,13 @@ while (($#));do
   --frontend) [[ $# -ge 2 ]]||die "--frontend needs a value";FRONTEND="$2";MENU_FRONTEND="$2-local";shift 2;;
   --agents) [[ $# -ge 2 ]]||die "--agents needs a value";AGENTS="$2";shift 2;;
   --resume) RESUME=1;SELECT_ARGS+=("$1");shift;;
-  --placement-config) [[ $# -ge 2 ]]||die "--placement-config needs a file";PLACEMENT_CONFIG="$2";SELECT_PLACEMENT=1;shift 2;;
+  --placement-config) [[ $# -ge 2 ]]||die "--placement-config needs a file";PLACEMENT_CONFIG="$2";PLACEMENT_CONFIG_EXPLICIT=1;SELECT_PLACEMENT=1;shift 2;;
   --plan-only) PLAN_ONLY=1;shift;;
   --local-context) CTX="$2";shift 2;; --local-client-context) CLIENT_CTX="$2";CLIENT_CTX_EXPLICIT=1;shift 2;;
   --slots) [[ $# -ge 2 ]]||die "--slots needs a value";SLOTS="$2";shift 2;;
-  --local-cache) CACHE_DIR="$2";SELECT_ARGS+=("$1" "$2");shift 2;; --local-port-base) PORT_BASE="$2";SELECT_ARGS+=("$1" "$2");shift 2;;
+  --local-cache) [[ $# -ge 2 ]]||die "--local-cache needs a directory";export CLAUDE_LOCAL_CACHE="$2";SELECT_ARGS+=("$1" "$2");shift 2;; --local-port-base) PORT_BASE="$2";SELECT_ARGS+=("$1" "$2");shift 2;;
+  --folders|--system-info) FOLDERS_ONLY=1;shift;;
+  --quiet) QUIET=1;SELECT_ARGS+=("$1");shift;;
   --no-parallel) PUSHBUTTON_NO_PARALLEL=1;SELECT_ARGS+=("$1");shift;;
   --self-test) self_test;exit 0;;
   --) shift;FRONTEND_ARGS+=("$@");break;;
@@ -359,6 +368,13 @@ while (($#));do
   *) MODELS+=("$1");shift;;
  esac
 done
+if ((FOLDERS_ONLY)); then
+  source "$ROOT/lib/pushbutton_folders.sh"
+  load_folder_config
+  check_folders_exist
+  print_folder_summary 1
+  exit 0
+fi
 [[ "$FRONTEND" == qwen ]] || die "frontend '$FRONTEND' is not installed in this revision"
 if ((SELECT)) || ((${#MODELS[@]} == 0)); then
   if [[ ! -t 0 || ! -t 1 ]]; then
@@ -375,6 +391,14 @@ if ((SELECT)) || ((${#MODELS[@]} == 0)); then
   ((CLIENT_CTX_EXPLICIT == 0)) || selector_args+=(--client-context "$CLIENT_CTX")
   ((PLAN_ONLY == 0)) || selector_args+=(--plan-only)
   [[ -z "$AGENTS" ]] || selector_args+=(--agents "$AGENTS")
+  if ((SELECT_PLACEMENT == 0)) && [[ -f "$ROOT/lib/pushbutton_folders.sh" ]]; then
+    source "$ROOT/lib/pushbutton_folders.sh"
+    load_folder_config
+    if [[ -z "$PLACEMENT_CONFIG" && "$CONFIG_DIR" != "$HOME/.config/pushbutton-local" ]]; then
+      PLACEMENT_CONFIG="$CONFIG_DIR/placement.json"
+      SELECT_PLACEMENT=1
+    fi
+  fi
   ((SELECT_PLACEMENT == 0)) || selector_args+=(--placement-config "$PLACEMENT_CONFIG")
   selector_args+=("${MODELS[@]}")
   if ((${#FRONTEND_ARGS[@]})); then SELECT_ARGS+=(-- "${FRONTEND_ARGS[@]}"); fi
@@ -387,6 +411,10 @@ fi
 [[ -z "$AGENTS" ]]||[[ "$AGENTS" =~ ^[1-8]$ ]]||die "--agents must be 1..8"
 [[ "$CTX" =~ ^[0-9]+$ && "$CLIENT_CTX" =~ ^[0-9]+$ ]]||die "context values must be integers"
 for c in git cmake ninja python3 curl tar flock nvidia-smi;do have "$c"||die "$c is required";done
+source "$ROOT/lib/pushbutton_folders.sh"
+initialize_folders "$QUIET"
+LOCK_FILE="${CLAUDE_LOCAL_LOCK_FILE:-$STATE_DIR/startup.lock}"
+[[ -n "$PLACEMENT_CONFIG" || $PLACEMENT_CONFIG_EXPLICIT == 1 ]] || PLACEMENT_CONFIG="$CONFIG_DIR/placement.json"
 mkdir -p "$STATE_DIR" "$CACHE_DIR" "$(dirname "$LOCK_FILE")"
 exec {STARTUP_LOCK_FD}>"$LOCK_FILE"; flock "$STARTUP_LOCK_FD"
 PLAN_FILE="$STATE_DIR/coder-plan.$$.json"
@@ -398,6 +426,7 @@ if ((PLAN_ONLY)); then
   flock -u "$STARTUP_LOCK_FD"; eval "exec ${STARTUP_LOCK_FD}>&-"; STARTUP_LOCK_FD=""
   exit 0
 fi
+validate_plan_download_space "$PLAN_FILE" "$CACHE_DIR" || exit 2
 source "$ROOT/lib/pushbutton_download.sh"
 source "$HOSTCC_SH"; claude_local_prepare_hostcc; activate_cuda; ensure_llamacpp; grep -q '"template": "qwen-fixed"' "$PLAN_FILE" && fetch_qwen_template || true; start_backends
 start_capacity_proxy

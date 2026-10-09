@@ -23,6 +23,8 @@ WEB_EXTRACT_BACKEND="${HERMES_LOCAL_WEB_EXTRACT_BACKEND:-firecrawl}"
 UI=desktop
 RESUME=0
 KEEP_SERVERS=0
+QUIET=0
+FOLDERS_ONLY=0
 SELECT=0
 SELECT_ARGS=()
 MODELS=()
@@ -58,6 +60,8 @@ Hermes frontends:
 Harness options:
   --select              choose models interactively before provisioning
   --local-cache DIR
+  --folders, --system-info   Show storage paths and disk usage, then exit
+  --quiet                   Suppress the startup folder banner
   --no-parallel           Force sequential Hugging Face downloads
   --local-context N           fallback hard context per slot
   --slots N                  fallback parallel slots per model
@@ -336,7 +340,8 @@ start_backends() {
     BACKENDS_TSV="$STATE_DIR/hermes-backends.$$"; : > "$BACKENDS_TSV"
     while IFS=$'\x1f' read -r id hf gpus multi kvk kvv batch ubatch fa template envpairs note context slots capacity; do
         local port log pid model_path failed=0 waited=0
-        download_model_fast "$hf" "$CACHE_DIR" model_path || die "failed to download $hf"
+        validate_download_space "$CACHE_DIR" "$hf" "${hf##*:}" || exit 2
+        download_model_fast "$hf" "$CACHE_DIR" model_path || { rc=$?; [[ $rc != 2 ]] || exit 2; die "failed to download $hf"; }
         port="$(free_port "$next")"; next=$((port+1)); log="$STATE_DIR/logs/hermes-${id}.log"; : > "$log"
         local -a cmd=("$LLAMA_SERVER" -m "$model_path" --alias "$id" --no-mmproj -ngl 999 -c "$((context * slots))" -np "$slots" --cache-type-k "$kvk" --cache-type-v "$kvv" -b "$batch" -ub "$ubatch" -fa "$fa" --jinja --no-context-shift --host 127.0.0.1 --port "$port")
         [[ "$multi" == 1 ]] && cmd+=(--split-mode layer)
@@ -347,6 +352,7 @@ start_backends() {
             for pair in "${pairs[@]}"; do envcmd+=("$pair"); done
         fi
         say "Starting $id on GPU(s) [$gpus], $hf, hard=$context slots=$slots${note:+ — $note}"
+        printf '[hermes-local] Follow %s logs in another terminal:\n  tail -n 50 -F -- %q\n' "$id" "$log" >&2
         "${envcmd[@]}" "${cmd[@]}" > >(tee -a "$log" >&2) 2>&1 & pid=$!; PIDS+=("$pid")
         while ! curl -fsS "http://127.0.0.1:$port/health" >/dev/null 2>&1; do
             kill -0 "$pid" 2>/dev/null || { failed=1; break; }
@@ -511,7 +517,9 @@ while (($#)); do
         --tui) UI=tui; SELECT_ARGS+=("$1"); shift ;;
         --cli) UI=cli; SELECT_ARGS+=("$1"); shift ;;
         --resume) RESUME=1; SELECT_ARGS+=("$1"); shift ;;
-        --local-cache) [[ $# -ge 2 ]] || die "--local-cache needs a directory"; CACHE_DIR="$2"; SELECT_ARGS+=("$1" "$2"); shift 2 ;;
+        --local-cache) [[ $# -ge 2 ]] || die "--local-cache needs a directory"; export CLAUDE_LOCAL_CACHE="$2"; SELECT_ARGS+=("$1" "$2"); shift 2 ;;
+        --folders|--system-info) FOLDERS_ONLY=1; shift ;;
+        --quiet) QUIET=1; SELECT_ARGS+=("$1"); shift ;;
         --no-parallel) PUSHBUTTON_NO_PARALLEL=1; SELECT_ARGS+=("$1"); shift ;;
         --local-context) [[ $# -ge 2 ]] || die "--local-context needs a value"; CTX="$2"; shift 2 ;;
         --slots) [[ $# -ge 2 ]] || die "--slots needs a value"; SLOTS="$2"; shift 2 ;;
@@ -526,6 +534,14 @@ while (($#)); do
     esac
 done
 
+if ((FOLDERS_ONLY)); then
+    source "$ROOT/lib/pushbutton_folders.sh"
+    load_folder_config
+    check_folders_exist
+    print_folder_summary 1
+    printf '  Hermes profiles: %s/.hermes/profiles\n' "$HOME"
+    exit 0
+fi
 if ((SELECT)) || ((${#MODELS[@]} == 0)); then
     if [[ ! -t 0 || ! -t 1 ]]; then
         usage >&2
@@ -542,6 +558,10 @@ if ((SELECT)) || ((${#MODELS[@]} == 0)); then
 fi
 [[ -f "$PLAN_PY" ]] || die "missing $PLAN_PY"
 source "$ROOT/lib/pushbutton_download.sh"
+source "$ROOT/lib/pushbutton_folders.sh"
+initialize_folders "$QUIET"
+((QUIET)) || say "Hermes profiles and sessions: $HOME/.hermes (managed by Hermes)"
+LOCK_FILE="${CLAUDE_LOCAL_LOCK_FILE:-$STATE_DIR/startup.lock}"
 [[ "$CTX" =~ ^[0-9]+$ && "$CLIENT_CTX" =~ ^[0-9]+$ ]] || die "context values must be integers"
 ((${#MODELS[@]} <= 4)) || die "at most four model selectors may be supplied"
 
@@ -556,6 +576,7 @@ plan_args=(plan --context "$CTX" --slots "$SLOTS")
 if ((${#MODELS[@]})); then plan_args+=("${MODELS[@]}"); else plan_args+=(--smart); fi
 python3 "$PLAN_PY" "${plan_args[@]}" > "$PLAN_FILE"
 print_plan
+validate_plan_download_space "$PLAN_FILE" "$CACHE_DIR" || exit 2
 prepare_host_compiler
 activate_cuda
 ensure_llamacpp
