@@ -119,7 +119,9 @@ class MetadataTests(unittest.TestCase):
             blob = pathlib.Path(tmp) / "blobs" / digest
             blob.parent.mkdir()
             blob.write_bytes(b"x" * 16)
-            with contextlib.redirect_stderr(io.StringIO()):
+            with contextlib.redirect_stderr(io.StringIO()), \
+                    mock.patch.object(pathlib.Path, "is_relative_to",
+                                      side_effect=AttributeError("not available"), create=True):
                 download.reuse_blobs(directory, [{"name": "model.gguf", "size": 16, "sha256": digest}])
             self.assertEqual(blob.stat().st_ino, (directory / "model.gguf").stat().st_ino)
 
@@ -159,7 +161,9 @@ class MetadataTests(unittest.TestCase):
             directory = pathlib.Path(tmp) / "cache"
             directory.mkdir()
             (directory / "escape").symlink_to(tmp, target_is_directory=True)
-            with self.assertRaisesRegex(ValueError, "escapes cache"):
+            with self.assertRaisesRegex(ValueError, "escapes cache"), \
+                    mock.patch.object(pathlib.Path, "is_relative_to",
+                                      side_effect=AttributeError("not available"), create=True):
                 download.reuse_blobs(directory, [{"name": "escape/model.gguf", "size": 16}])
 
 
