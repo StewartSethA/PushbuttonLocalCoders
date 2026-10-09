@@ -59,6 +59,51 @@ context, and spare GPUs. A smaller selected physical context also lowers the
 default client budget; an explicitly larger client budget is rejected.
 See [selector and Flash-Next validation details](docs/BACKEND_SELECTOR.md).
 
+### Per-model slots and token budgets
+
+Model specs accept capacity overrides alongside GPU placement:
+
+```bash
+qwen-local 'qwen3.8:27b@gpu=0,slots=2,context=65536,output=4096' \
+  'qwen3.6:35b@gpu=1,slots=1,context=32768,output=4096' --agents 2
+claude-local 'qwen3.8:27b@slots=2,context=65536' \
+  'qwen3.6:35b@slots=1,context=32768'
+pushbutton --slots 2 --context 65536 --frontend none 'qwen3.8:27b'
+```
+
+`context` is the **total input plus output limit per slot**, not the sum across
+slots. Slots share one model's weights; `--agents` creates independent replicas.
+Repeating model specs with different overrides configures individual coder
+replicas. Claude/Hermes roles sharing a server must agree on its settings.
+
+Optional spec keys are `client_context`, `compact`, `quant`, `kv_k`, `kv_v`,
+`min_tps`, and `admission`, in addition to `slots`, `context`, `output`, `gpu`,
+and `vram`. Weight quantization and K/V-cache precision are separate choices.
+Explicit choices that cannot fit are rejected rather than silently reducing
+context or slots. Unspecified quantization is selected from supported profiles.
+
+The plan reports each server's hard context, input limit, output reserve,
+compaction trigger, slots, memory envelope, and headroom. Memory estimates use
+the profiles' conservative context-dependent envelope, **not an architecture-
+exact KV allocation or a measured throughput guarantee**. Admission remains
+calibration-based; allocating slots does not automatically prove they are fast.
+
+Input budgets reserve output and a safety margin. Compaction triggers leave
+additional headroom for the next turn. Frontend adapters advertise resolved
+budgets per model where supported; a shared session uses the smallest compatible
+budget. Framework-specific compaction behavior is not assumed to enforce a hard
+limit, and a requested trigger is not necessarily a supported frontend setting.
+Large tool results can cross a threshold in one turn: summarize or limit them
+before retrying an oversized request. History is never silently discarded by
+the request guard.
+
+The serving guards count fully rendered requests with backend tokenization where
+available, including tool definitions and template overhead. Unsupported counting
+paths must not be mistaken for exact token counts; backend context enforcement
+and disabled llama.cpp context shifting provide the final safety boundary.
+Changing to a smaller-context model requires its own budget check and may require
+compacting first.
+
 ### Qwen3.8 Flash-Next: existing support, not locally measured speed
 
 Flash-Next is already in the llama.cpp planner with six profiles. At 262,144

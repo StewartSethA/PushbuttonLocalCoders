@@ -14,6 +14,7 @@ STATE_DIR="${CLAUDE_LOCAL_STATE:-$HOME/.local/share/pushbutton/claude-local}"
 CACHE_DIR="${CLAUDE_LOCAL_CACHE:-$HOME/.cache/pushbutton/llama}"
 LOCK_FILE="${CLAUDE_LOCAL_LOCK_FILE:-$HOME/.local/share/pushbutton/claude-local/startup.lock}"
 CTX="${CLAUDE_LOCAL_CONTEXT:-262144}"
+SLOTS=1
 CLIENT_CTX="${CLAUDE_LOCAL_CLIENT_CONTEXT:-200000}"
 CLIENT_CTX_EXPLICIT=0
 [[ -z "${CLAUDE_LOCAL_CLIENT_CONTEXT+x}" ]] || CLIENT_CTX_EXPLICIT=1
@@ -56,6 +57,8 @@ Harness options (put before ordinary Claude Code flags):
   --local-cache DIR          llama.cpp/Hugging Face model cache
   --no-parallel              Force sequential Hugging Face downloads
   --local-context N          physical backend context (default 262144)
+  --slots N                  fallback parallel slots per model
+  MODEL@context=N,slots=N,output=N,client_context=N,compact=N,quant=Q,kv_k=K,kv_v=V,min_tps=N,admission=N
   --local-client-context N   Claude Code budget (default 200000)
   --local-port-base N        starting port for gateway/backends
   --local-no-teams           disable experimental Claude agent teams
@@ -318,7 +321,8 @@ import json,sys
 sep='\x1f'
 for s in json.load(open(sys.argv[1]))['servers']:
  x=s['profile']; env=';'.join(f'{k}={v}' for k,v in x.get('extra_env',{}).items())
- print(sep.join(map(str,[s['id'],x['hf_spec'],s['cuda_visible_devices'],int(s['multi_gpu']),x['kv_k'],x['kv_v'],x['batch'],x['ubatch'],x['flash_attn'],x['template'],env,x.get('note','')])))
+ c=s['capacity']
+ print(sep.join(map(str,[s['id'],x['hf_spec'],s['cuda_visible_devices'],int(s['multi_gpu']),x['kv_k'],x['kv_v'],x['batch'],x['ubatch'],x['flash_attn'],x['template'],env,x.get('note',''),c['context'],c['slots'],json.dumps(c,separators=(',',':'))])))
 PY
 }
 
@@ -348,16 +352,16 @@ stop_log_follower() {
 start_backends() {
     mkdir -p "$STATE_DIR/logs" "$CACHE_DIR"; export LLAMA_CACHE="$CACHE_DIR" GGML_CUDA_ENABLE_UNIFIED_MEMORY="$ALLOW_OFFLOAD" CUDA_SCALE_LAUNCH_QUEUES=4x
     local next=$((PORT_BASE+1)); BACKENDS_TSV="$STATE_DIR/backends.$$"; : > "$BACKENDS_TSV"
-    while IFS=$'\x1f' read -r id hf gpus multi kvk kvv batch ubatch fa template envpairs note; do
+    while IFS=$'\x1f' read -r id hf gpus multi kvk kvv batch ubatch fa template envpairs note context slots capacity; do
         local port log pid follower model_path failed=0 waited=0
         download_model_fast "$hf" "$CACHE_DIR" model_path || die "failed to download $hf"
         port="$(free_port "$next")"; next=$((port+1)); log="$STATE_DIR/logs/${id}.log"; : > "$log"
-        local -a cmd=("$LLAMA_SERVER" -m "$model_path" --alias "$id" --no-mmproj -ngl 999 -c "$CTX" -np 1 --cache-type-k "$kvk" --cache-type-v "$kvv" -b "$batch" -ub "$ubatch" -fa "$fa" --jinja --no-context-shift --host 127.0.0.1 --port "$port")
+        local -a cmd=("$LLAMA_SERVER" -m "$model_path" --alias "$id" --no-mmproj -ngl 999 -c "$((context * slots))" -np "$slots" --cache-type-k "$kvk" --cache-type-v "$kvv" -b "$batch" -ub "$ubatch" -fa "$fa" --jinja --no-context-shift --host 127.0.0.1 --port "$port")
         [[ "$multi" == 1 ]] && cmd+=(--split-mode layer)
         [[ "$template" == qwen-fixed ]] && cmd+=(--chat-template-file "$QWEN_TEMPLATE")
         local -a envcmd=(env "CUDA_VISIBLE_DEVICES=$gpus" "LLAMA_CACHE=$CACHE_DIR" "GGML_CUDA_ENABLE_UNIFIED_MEMORY=$ALLOW_OFFLOAD" "CUDA_SCALE_LAUNCH_QUEUES=4x")
         if [[ -n "$envpairs" ]]; then local -a pairs; IFS=';' read -ra pairs <<< "$envpairs"; local pair; for pair in "${pairs[@]}"; do envcmd+=("$pair"); done; fi
-        say "Starting $id on GPU(s) [$gpus], $hf, ctx=$CTX${note:+ — $note}"
+        say "Starting $id on GPU(s) [$gpus], $hf, hard=$context slots=$slots${note:+ — $note}"
         "${envcmd[@]}" "${cmd[@]}" >"$log" 2>&1 & pid=$!; PIDS+=("$pid")
         follower="$(start_log_follower "$log")"
         while ! curl -fsS "http://127.0.0.1:$port/health" >/dev/null 2>&1; do
@@ -371,8 +375,9 @@ start_backends() {
             tail -80 "$log" >&2 || true
             die "failed to start $id"
         fi
+        verify_capacity "$port" "$capacity" || die "$id effective per-slot capacity is unsafe"
         say "Backend ready: $id on http://127.0.0.1:$port"
-        printf '%s\t%s\t%s\n' "$id" "$port" "$hf" >> "$BACKENDS_TSV"
+        printf '%s\t%s\t%s\t%s\n' "$id" "$port" "$hf" "$capacity" >> "$BACKENDS_TSV"
     done < <(server_rows)
     say "All model backends ready."
 }
@@ -381,10 +386,10 @@ write_gateway_config() {
     GATEWAY_CONFIG="$STATE_DIR/gateway.$$.json"
 python3 - "$PLAN_FILE" "$BACKENDS_TSV" "$GATEWAY_CONFIG" <<'PY'
 import json,sys
-p=json.load(open(sys.argv[1])); ports={}
+p=json.load(open(sys.argv[1])); ports={}; capacities={}
 for line in open(sys.argv[2]):
- mid,port,*_=line.rstrip('\n').split('\t'); ports[mid]=int(port)
-roles={r:{'model_id':mid,'backend_alias':mid,'url':f'http://127.0.0.1:{ports[mid]}'} for r,mid in p['role_ids'].items()}
+ mid,port,hf,capacity=line.rstrip('\n').split('\t'); ports[mid]=int(port); capacities[mid]=json.loads(capacity)
+roles={r:{'model_id':mid,'backend_alias':mid,'url':f'http://127.0.0.1:{ports[mid]}','capacity':capacities[mid]} for r,mid in p['role_ids'].items()}
 json.dump({'roles':roles},open(sys.argv[3],'w'),indent=2)
 PY
 }
@@ -435,6 +440,8 @@ print('Servers:')
 for s in p['servers']:
  x=s['profile']; gs=', '.join(f"GPU{g['index']} {g['name']} ({g['free_mib']/1024:.1f} GiB free, PCIe Gen{g['pcie_gen']} x{g['pcie_width']})" for g in s['gpus'])
  print(f"  {s['id']}: {x['hf_spec']}\n    {gs}\n    KV={x['kv_k']}/{x['kv_v']} batch={x['batch']}/{x['ubatch']} FA={x['flash_attn']} quality-tier={x['quality']}")
+ c=s['capacity']
+ print(f"    slots={c['slots']} hard={c['context']} input={c['input_tokens']} output={c['output_tokens']} client={c['client_context']} compact={c['compact_trigger']} estimated-memory={s['required_mib']/1024:.2f} GiB")
 PY
 }
 
@@ -509,6 +516,7 @@ while (($#)); do
       --local-cache) [[ $# -ge 2 ]] || die "--local-cache needs a directory"; CACHE_DIR="$2"; SELECT_ARGS+=("$1" "$2"); shift 2;;
       --no-parallel) PUSHBUTTON_NO_PARALLEL=1; SELECT_ARGS+=("$1"); shift;;
       --local-context) CTX="$2"; shift 2;;
+      --slots) [[ $# -ge 2 ]] || die "--slots needs a value"; SLOTS="$2"; shift 2;;
       --local-client-context) CLIENT_CTX="$2"; CLIENT_CTX_EXPLICIT=1; shift 2;;
       --local-port-base) PORT_BASE="$2"; SELECT_ARGS+=("$1" "$2"); shift 2;;
       --local-no-teams) ENABLE_TEAMS=0; SELECT_ARGS+=("$1"); shift;;
@@ -529,6 +537,7 @@ if ((SELECT)) || ((${#MODELS[@]} == 0)); then
     have_cmd python3 || die "python3 is required for the interactive selector"
     [[ -f "$ROOT/pushbutton-select" ]] || die "missing $ROOT/pushbutton-select; reinstall claude-local"
     selector_args=(--frontend claude-local --menu --context "$CTX")
+    [[ "$SLOTS" == 1 ]] || selector_args+=(--slots "$SLOTS")
     ((CLIENT_CTX_EXPLICIT == 0)) || selector_args+=(--client-context "$CLIENT_CTX")
     selector_args+=("${MODELS[@]}")
     if ((${#CLAUDE_ARGS[@]})); then SELECT_ARGS+=(-- "${CLAUDE_ARGS[@]}"); fi
@@ -540,15 +549,23 @@ fi
 source "$LIB/pushbutton_download.sh"
 require_files
 [[ "$CTX" =~ ^[0-9]+$ && "$CLIENT_CTX" =~ ^[0-9]+$ ]] || die "context values must be integers"
-(( CLIENT_CTX <= CTX )) || die "client context ($CLIENT_CTX) exceeds physical context ($CTX)"
 if [[ $DRY_RUN -eq 0 ]]; then install_base_deps; ensure_nvidia_driver; else have_cmd nvidia-smi || die "nvidia-smi required for dry run"; fi
 mkdir -p "$STATE_DIR" "$CACHE_DIR"; PLAN_FILE="$STATE_DIR/plan.$$.json"
 
 # Serialize only startup/allocation. Existing sessions remain concurrent, but a
 # second launch cannot observe the same free VRAM/port state and race the first.
 [[ $DRY_RUN -eq 0 ]] && acquire_startup_lock
-plan_args=(plan --context "$CTX"); if ((${#MODELS[@]})); then plan_args+=("${MODELS[@]}"); else plan_args+=(--smart); fi
+plan_args=(plan --context "$CTX" --slots "$SLOTS")
+((CLIENT_CTX_EXPLICIT == 0)) || plan_args+=(--client-context "$CLIENT_CTX")
+if ((${#MODELS[@]})); then plan_args+=("${MODELS[@]}"); else plan_args+=(--smart); fi
 python3 "$PLAN_PY" "${plan_args[@]}" > "$PLAN_FILE" || exit $?
+CLIENT_CTX="$(python3 - "$PLAN_FILE" <<'PY'
+import json,sys
+p=json.load(open(sys.argv[1]))
+print(min(s['capacity']['client_context'] for s in p['servers']))
+PY
+)"
+warn "Claude Code uses a global context budget ($CLIENT_CTX); configured per-model compact triggers are exposed in the plan, but explicit compaction thresholds are not supported by this integration."
 print_plan; [[ $DRY_RUN -eq 1 ]] && exit 0
 install_claude_code; prepare_host_compiler; activate_cuda; ensure_llamacpp
 grep -q '"template": "qwen-fixed"' "$PLAN_FILE" && fetch_qwen_template || true

@@ -121,7 +121,8 @@ class SelectorTests(unittest.TestCase):
         self.assertEqual(obj['plan']['workers'][0]['profile']['quant'], 'UD-IQ4_XS')
         self.assertEqual(obj['plan']['workers'][1]['vram_limit_mib_per_gpu'], 30720)
         self.assertEqual(len(obj['plan']['unused_gpus']), 1)
-        self.assertIn('qwen3.8:27b@gpu=4,vram=30720MiB', obj['launch_argv'])
+        self.assertTrue(any(arg.startswith('qwen3.8:27b@gpu=4,vram=30720MiB,')
+                            for arg in obj['launch_argv']))
         flash = obj['rows']['qwen3.8-flash-next']
         self.assertEqual(len([r for r in flash if r['backend'] == 'llama.cpp']), 6)
         self.assertTrue(all(r['pp'] is None and r['tg'] is None for r in flash))
@@ -140,6 +141,56 @@ class SelectorTests(unittest.TestCase):
         self.assertEqual([len(w['gpus']) for w in ws], [4, 4])
         self.assertTrue(set(g['index'] for g in ws[0]['gpus']).isdisjoint(
             g['index'] for g in ws[1]['gpus']))
+
+    def test_per_model_capacities_and_precision_survive_preview_replan(self):
+        code, out, _, launch, _ = self.run_sel(
+            "q38@context=8192,slots=3,output=1024,client_context=7000,compact=4500,kv_k=q8_0",
+            "--slots", "2", "--json", gpus=selector.workers.synthetic_v100(2))
+        obj = json.loads(out)
+        self.assertEqual(code, 0, obj)
+        worker = obj["plan"]["workers"][0]
+        self.assertEqual(worker["capacity"]["slots"], 3)
+        self.assertEqual(worker["capacity"]["context"], 8192)
+        self.assertEqual(worker["capacity"]["client_context"], 7000)
+        self.assertEqual(worker["profile"]["kv_k"], "q8_0")
+        model_spec = next(arg for arg in obj["launch_argv"] if "@gpu=" in arg)
+        request = selector.workers.parse_model_spec(model_spec)
+        replanned = selector.workers.build_plan([request], 1, selector.workers.synthetic_v100(2), 262144, 2)
+        self.assertEqual(replanned["workers"][0]["capacity"], worker["capacity"])
+        launch.assert_not_called()
+
+    def test_role_capacity_suffix_is_not_stripped(self):
+        for frontend in ("claude-local", "hermes-local"):
+            with self.subTest(frontend=frontend):
+                model = "q38@context=8192,slots=2,output=1024,client_context=7000,compact=4000"
+                code, out, _, launch, _ = self.run_sel(
+                    model, "--frontend", frontend, "--json",
+                    gpus=selector.workers.synthetic_v100(2))
+                obj = json.loads(out)
+                self.assertEqual(code, 0, obj)
+                self.assertEqual(obj["plan"]["servers"][0]["capacity"]["slots"], 2)
+                self.assertIn(model.replace("q38", "qwen3.8:27b"), obj["launch_argv"])
+                self.assertNotIn("--local-client-context", obj["launch_argv"])
+                launch.assert_not_called()
+
+    def test_explicit_global_client_context_validates_each_model_hard_limit(self):
+        for frontend in ("qwen-local", "claude-local", "hermes-local"):
+            with self.subTest(frontend=frontend):
+                code, out, _, launch, _ = self.run_sel(
+                    "q38@context=8192,client_context=7000", "--client-context", "12000",
+                    "--frontend", frontend, "--json",
+                    gpus=selector.workers.synthetic_v100(2))
+                self.assertEqual(code, 2, out)
+                self.assertIsNotNone(json.loads(out)["error"])
+                launch.assert_not_called()
+
+    def test_slots_are_controlled_before_forwarded_client_separator(self):
+        code, out, _, _, _ = self.run_sel(
+            "q38@context=8192", "--slots", "2", "--json", "--launch-arg=--",
+            "--launch-arg=a prompt", gpus=selector.workers.synthetic_v100(2))
+        self.assertEqual(code, 0, out)
+        args = json.loads(out)["launch_argv"]
+        self.assertLess(args.index("--slots"), args.index("--"))
 
     def test_claude_and_hermes_share_roles_not_replicas(self):
         for frontend in ('claude-local', 'hermes-local'):
@@ -212,7 +263,7 @@ class SelectorTests(unittest.TestCase):
             'qwen3.8:27b', '--context', '8192', '--client-context', '200000',
             gpus=selector.workers.synthetic_3090(1))
         self.assertEqual(code, 2)
-        self.assertIn('no larger', err)
+        self.assertIn('exceed', err)
         launch.assert_not_called()
 
     def test_confirmation_preserves_frontend_cwd_and_argv_without_shell(self):

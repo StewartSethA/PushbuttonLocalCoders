@@ -4,6 +4,7 @@
 Model selectors may carry placement constraints:
   qwen3.8:27b@gpu=0,vram=16G
   qwen3.8-flash-next@gpu=0+1+2+3,vram=30G
+  q38@slots=2,context=64K,output=8K,compact=80%,quant=IQ3_XXS
 
 `vram` is a per-selected-GPU planning lease.  The planner behaves as if each
 selected GPU had at most that much free VRAM, so quant selection automatically
@@ -11,7 +12,7 @@ falls to the best profile that fits the lease.  `gpu=` is exact: when present,
 the worker must use exactly those physical GPU indices.
 """
 from __future__ import annotations
-import argparse, json, os, re, sys
+import argparse, json, math, os, re, sys
 from dataclasses import asdict, dataclass, field, replace
 from functools import lru_cache
 
@@ -46,7 +47,7 @@ def parse_memory_mib(value: str | int | float | None) -> int | None:
     if value is None or value == "":
         return None
     if isinstance(value, (int, float)):
-        if isinstance(value, bool) or not __import__("math").isfinite(value) or value < 1:
+        if isinstance(value, bool) or not math.isfinite(value) or value < 1:
             raise ValueError("VRAM limit must be positive")
         # Numeric config values are MiB to avoid an implicit unit surprise.
         return int(value)
@@ -55,7 +56,7 @@ def parse_memory_mib(value: str | int | float | None) -> int | None:
     if not m:
         raise ValueError(f"invalid VRAM size '{value}' (examples: 16G, 15360MiB)")
     number = float(m.group(1)); unit = m.group(2) or "mib"
-    if number <= 0:
+    if not math.isfinite(number) or number <= 0:
         raise ValueError("VRAM limit must be positive")
     if unit in {"g", "gb", "gib"}:
         number *= 1024
@@ -72,7 +73,7 @@ def parse_gpu_indices(value) -> tuple[int, ...] | None:
     elif isinstance(value, tuple):
         vals = list(value)
     else:
-        vals = [x for x in re.split(r"[+,;]", str(value)) if x != ""]
+        vals = re.split(r"[+,;]", str(value))
     try:
         if any(isinstance(x, bool) or not re.fullmatch(r"[0-9]+", str(x)) for x in vals):
             raise ValueError("GPU indices must be nonnegative integers")
@@ -93,7 +94,8 @@ def load_placement_config(path: str | None) -> dict[str, dict]:
     if not os.path.exists(p):
         return {}
     try:
-        obj = json.load(open(p))
+        with open(p) as handle:
+            obj = json.load(handle)
     except Exception as exc:
         raise ValueError(f"cannot read placement config {p}: {exc}") from exc
     if not isinstance(obj, dict):
@@ -196,7 +198,8 @@ def _near_best(candidates: list[base.Candidate], quality_slack: int = 3) -> list
     return kept or candidates
 
 
-def candidates_for_request(req: WorkerRequest, gpus: list[base.GPU], context: int, slots: int = 1) -> list[base.Candidate]:
+def candidates_for_request(req: WorkerRequest, gpus: list[base.GPU], context: int,
+                           slots: int = 1, quality_filter: bool = True) -> list[base.Candidate]:
     settings = capacity.resolve_options(req.capacity, context, slots)
     physical = {g.index for g in gpus}
     if req.gpu_indices is not None:
@@ -217,7 +220,18 @@ def candidates_for_request(req: WorkerRequest, gpus: list[base.GPU], context: in
         exact_positions = tuple(i for i, g in enumerate(gpus) if g.index in set(req.gpu_indices))
         exact_set = set(exact_positions)
         candidates = [c for c in candidates if set(c.gpu_positions) == exact_set]
-    return _near_best(candidates)
+    return _near_best(candidates) if quality_filter else candidates
+
+
+def request_capacity(req: WorkerRequest, profile: base.Profile, context: int,
+                     slots: int = 1) -> dict:
+    """Resolve a selected instance's capacity; WorkerRequest.capacity holds options."""
+    settings = capacity.resolve_options(req.capacity, context, slots)
+    settings.update(quant=profile.quant, kv_k=settings.get("kv_k", profile.kv_k),
+                    kv_v=settings.get("kv_v", profile.kv_v))
+    original = next((p for p in base.PROFILES[req.model] if p.quant == profile.quant), profile)
+    settings["memory_estimate"] = capacity.memory_estimate(original, settings)
+    return settings
 
 
 def choose_workers(requests: list[WorkerRequest], gpus: list[base.GPU], context: int, slots: int = 1) -> list[base.Candidate]:
@@ -258,9 +272,14 @@ def choose_workers(requests: list[WorkerRequest], gpus: list[base.GPU], context:
     return list(found[1])
 
 
-def build_plan(requests: list[WorkerRequest], agents: int | None, gpus: list[base.GPU], context: int, slots: int = 1) -> dict:
+def build_plan(requests: list[WorkerRequest], agents: int | None, gpus: list[base.GPU],
+               context: int, slots: int = 1, client_context: int | None = None) -> dict:
     capacity.resolve_options({}, context, slots)
     workers = expand_workers(requests, agents)
+    if client_context is not None:
+        client_context = capacity.positive_int(client_context, "client_context")
+        workers = [replace(r, capacity={"client_context": client_context, **r.capacity})
+                   for r in workers]
     choices = choose_workers(workers, gpus, context, slots)
     out = []
     used = 0
@@ -268,9 +287,7 @@ def build_plan(requests: list[WorkerRequest], agents: int | None, gpus: list[bas
         used |= c.mask
         group = base.ordered_group_for_layer_split(c, gpus)
         alias = f"local-coder-{i}-{req.model.replace(':','-').replace('.','').replace('_','-')}"
-        settings = capacity.resolve_options(req.capacity, context, slots)
-        settings.update(quant=c.profile.quant, kv_k=c.profile.kv_k, kv_v=c.profile.kv_v)
-        settings["memory_estimate"] = capacity.memory_estimate(c.profile, settings)
+        settings = request_capacity(req, c.profile, context, slots)
         out.append({
             "worker": i,
             "id": alias,
@@ -345,6 +362,7 @@ def main() -> int:
     ap.add_argument("--agents", type=int)
     ap.add_argument("--context", type=int, default=262144)
     ap.add_argument("--slots", type=int, default=1)
+    ap.add_argument("--client-context", type=int)
     ap.add_argument("--placement-config", default=DEFAULT_PLACEMENT_CONFIG)
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
@@ -354,7 +372,8 @@ def main() -> int:
         defaults = load_placement_config(args.placement_config)
         requests = [parse_model_spec(x, defaults) for x in args.models]
         gpus = base.inventory()
-        print(json.dumps(build_plan(requests, args.agents, gpus, args.context, args.slots), indent=2))
+        print(json.dumps(build_plan(requests, args.agents, gpus, args.context, args.slots,
+                                    args.client_context), indent=2))
         return 0
     except ValueError as exc:
         print(f"coder-local planner: {exc}", file=sys.stderr)

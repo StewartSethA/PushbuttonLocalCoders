@@ -242,7 +242,7 @@ def adapter_eligibility(metadata,gpus,context,ram_cap):
 CODER_FRONTENDS=('qwen-local','coder-local','opencode-local','deepseek-local','mini-swe-local')
 FRONTENDS=CODER_FRONTENDS+('claude-local','hermes-local')
 
-def joint_preview(models,frontend,agents,gpus,context,cap=None,gpu_indices=None,placement_config=None):
+def joint_preview(models,frontend,agents,gpus,context,cap=None,gpu_indices=None,placement_config=None,slots=1,client_context=None):
  if context<1:raise ValueError('context must be positive')
  if not gpus:raise ValueError('No supported NVIDIA GPUs detected; no provisioning attempted.')
  supported=json.loads((ROOT/'configs/backend-registry.json').read_text())['backends']['llama.cpp']['gpu_arch']
@@ -255,23 +255,36 @@ def joint_preview(models,frontend,agents,gpus,context,cap=None,gpu_indices=None,
   requests=[workers.parse_model_spec(m,defaults) for m in models]
   requests=[replace(r,gpu_indices=r.gpu_indices if r.gpu_indices is not None else gpu_indices,
                     vram_limit_mib=r.vram_limit_mib if r.vram_limit_mib is not None else cap) for r in requests]
-  result=workers.build_plan(requests,agents,gpus,context)
+  if client_context is not None:
+   requests=[replace(r,capacity={**r.capacity, 'client_context':r.capacity.get('client_context',client_context)}) for r in requests]
+  result=workers.build_plan(requests,agents,gpus,context,slots)
   # Pin each independent worker to its previewed GPU set and lease.
   launch_models=[]
   for w in result['workers']:
    spec=w['model']+'@gpu='+w['cuda_visible_devices'].replace(',','+')
    if w['vram_limit_mib_per_gpu'] is not None:spec+=f",vram={w['vram_limit_mib_per_gpu']}MiB"
+   # Carry the exact capacity/precision plan into the launcher's replan.
+   c=w['capacity']
+   spec+=f",context={c['context']},slots={c['slots']},output={c['output_tokens']},client_context={c['client_context']},compact={c['compact_trigger']},kv_k={w['profile']['kv_k']},kv_v={w['profile']['kv_v']}"
+   if c.get('min_tps') is not None:spec+=f",min_tps={c['min_tps']}"
+   spec+=f",admission={c['admission_limit']},quant={w['profile']['quant']}"
    launch_models.append(spec)
  else:
   if agents is not None:raise ValueError('Claude/Hermes use shared roles, not independent --agents replicas')
-  if cap is not None or gpu_indices is not None or any('@' in m for m in models):
+  if cap is not None or gpu_indices is not None:
    raise ValueError('GPU pins/leases are supported by coder frontends only; Claude/Hermes use their role planner')
-  launch_models=[canon(m) for m in models]
-  result=plan.plan(launch_models,gpus,context)
+  launch_models=[canon(m.split('@',1)[0])+('@'+m.split('@',1)[1] if '@' in m else '') for m in models]
+  if client_context is not None:
+   launch_models=[m+(',' if '@' in m else '@')+f'client_context={client_context}'
+                  if not re.search(r'(?:@|,)client_context=',m) else m for m in launch_models]
+  result=plan.plan(launch_models,gpus,context,slots)
+ if client_context is not None:
+  if any(client_context>w['capacity']['context'] for w in result.get('workers',result.get('servers',[]))):
+   raise ValueError('explicit client context must be no larger than every per-model hard context')
  result['unused_gpus'] += [asdict(g) for g in unsupported]
  return result,launch_models
 
-def launch_command(frontend,models,result,context,client_context,launch_args):
+def launch_command(frontend,models,result,context,client_context,launch_args,slots=1):
  # The wrapper supplies an argv list; only recognized launchers are executable.
  target=ROOT/frontend
  if frontend=='claude-local':target=ROOT/'lib/claude_local_entry.sh'
@@ -280,7 +293,10 @@ def launch_command(frontend,models,result,context,client_context,launch_args):
  if frontend=='coder-local':command+=['--frontend','qwen']
  command+=models
  if frontend in CODER_FRONTENDS:command+=['--agents',str(result['agents'])]
- command+=['--local-context',str(context),'--local-client-context',str(client_context),*launch_args]
+ command+=['--local-context',str(context)]
+ if client_context is not None:command+=['--local-client-context',str(client_context)]
+ if slots!=1:command+=['--slots',str(slots)]
+ command+=launch_args
  return command
 
 def welcome(ap):
@@ -314,13 +330,14 @@ def main():
  ap.add_argument('--menu',action='store_true')
  ap.add_argument('--vram-limit'); ap.add_argument('--ram-limit')
  ap.add_argument('--context',type=int,default=262144)
+ ap.add_argument('--slots',type=int,default=1,help='fallback parallel slots per model; per-model @slots overrides')
  ap.add_argument('--json',action='store_true'); ap.add_argument('--no-interactive',action='store_true')
  ap.add_argument('--plan-only','--print-only',action='store_true',help='preview only; never launch')
  ap.add_argument('--telemetry-opt-in',action='store_true'); ap.add_argument('--telemetry-off',action='store_true'); ap.add_argument('--telemetry-upload-url')
  a=ap.parse_args()
  for arg in a.launch_arg:
   if arg=='--':break
-  if arg.split('=',1)[0] in ('--local-context','--local-client-context','--agents','--frontend','--placement-config','--select','--smart'):
+  if arg.split('=',1)[0] in ('--local-context','--local-client-context','--slots','--agents','--frontend','--placement-config','--select','--smart'):
    raise ValueError(f'{arg} changes the plan; use selector options instead of --launch-arg')
  interactive=sys.stdin.isatty() and sys.stdout.isatty() and not (a.no_interactive or a.json or a.plan_only)
  if a.telemetry_opt_in:
@@ -349,7 +366,7 @@ def main():
    a.agents=positive_input('Independent workers',a.agents or len(models),8)
    if not a.ram_limit and not a.vram_limit:ram_cap,cap=ask_caps()
  client_context=min(200000,a.context) if a.client_context is None else a.client_context
- if not 0<client_context<=a.context:raise ValueError('client context must be positive and no larger than physical context')
+ if client_context<=0:raise ValueError('client context must be positive')
  if ram_cap is None:_,ram_cap=ram_info()
  tables={selector_model(m):rows_for(selector_model(m),gpu,cap,ram_cap,a.context,[gpu] if gpu else inv) for m in models}
  if not a.json:
@@ -363,8 +380,15 @@ def main():
  error=None; result=None; command=None; launch_env={}
  try:
   indices=workers.parse_gpu_indices(a.gpus) if a.gpus else ((a.gpu,) if a.gpu is not None else None)
-  result,launch_models=joint_preview(models,a.frontend,a.agents,inv,a.context,cap,indices,a.placement_config)
-  command=launch_command(a.frontend,launch_models,result,a.context,client_context,a.launch_arg)
+  result,launch_models=joint_preview(models,a.frontend,a.agents,inv,a.context,cap,indices,a.placement_config,a.slots,a.client_context)
+  capacities=[w['capacity'] for w in result.get('workers',result.get('servers',[]))]
+  client_context=min(c['client_context'] for c in capacities)
+  # Default budgets are already pinned in per-model specs; only forward an
+  # explicitly requested global budget (or legacy default when unchanged).
+  launch_budget=a.client_context
+  if a.client_context is None and all(c['client_context']==min(200000,a.context) for c in capacities):
+   launch_budget=client_context
+  command=launch_command(a.frontend,launch_models,result,a.context,launch_budget,a.launch_arg,a.slots)
   if a.frontend in CODER_FRONTENDS:
    # Keep the same config source for the launcher's own validation.
    command[1:1]=['--placement-config',a.placement_config]
@@ -379,6 +403,8 @@ def main():
   print('\nJoint placement preview — baseline llama.cpp; planned memory, NOT measured allocation:')
   for w in result.get('workers',result.get('servers',[])):
    print(f"  {w['model']} {w['profile']['quant']}: GPUs {w['cuda_visible_devices']}, envelope {fmt_mib(w['required_mib'])}, free lease capacity {fmt_mib(w['allocated_mib'])}, per-GPU lease {fmt_mib(w.get('vram_limit_mib_per_gpu'))}")
+   c=w['capacity']
+   print(f"    slots={c['slots']} hard={c['context']} input={c['input_tokens']} output={c['output_tokens']} client={c['client_context']} compact={c['compact_trigger']}")
    row=next((r for r in tables[w['model']] if r['artifact']==w['profile']['quant']),None)
    if row and row['speed_status'] in {'SLOW','VERY_SLOW'}:
     print('\n*** SERIOUS SLOWNESS WARNING ***\n'+row['speed_warning'],file=sys.stderr)

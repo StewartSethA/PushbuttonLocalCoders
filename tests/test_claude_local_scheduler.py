@@ -62,6 +62,41 @@ class SchedulerPolicyTests(unittest.TestCase):
         self.assertEqual(by_model["qwen3.8:27b"]["cuda_visible_devices"], "1")
         self.assertEqual(by_model["qwen3.8:27b"]["profile"]["quant"], "IQ3_XXS")
 
+    def test_raw_specs_have_per_server_capacity_and_pins(self):
+        gpus = [planmod.GPU(i, "RTX 3090", 24576, 24576) for i in range(2)]
+        p = planmod.plan(["q38@gpu=0,context=32K,slots=2,output=4K",
+                          "q36@gpu=1,context=64K,quant=UD-IQ3_XXS"], gpus, 262144)
+        self.assertEqual([s["cuda_visible_devices"] for s in p["servers"]], ["0", "1"])
+        self.assertEqual([s["capacity"]["context"] for s in p["servers"]], [32768, 65536])
+        self.assertEqual(p["servers"][0]["capacity"]["slots"], 2)
+        self.assertEqual(p["servers"][1]["profile"]["quant"], "UD-IQ3_XXS")
+
+    def test_shared_role_conflicting_capacity_rejected(self):
+        gpus = [planmod.GPU(0, "RTX 3090", 24576, 24576)]
+        with self.assertRaisesRegex(ValueError, "conflicting shared-role"):
+            planmod.plan(["q38@slots=1", "q38@slots=2"], gpus, 262144)
+        p = planmod.plan(["q38@slots=1", "q38"], gpus, 262144)
+        self.assertEqual(len(p["servers"]), 1)
+        p = planmod.plan(["q38@context=32K,output=4K,kv_k=q4_0",
+                          "q38@context=32K"], gpus, 262144)
+        self.assertEqual(len(p["servers"]), 1)
+
+    def test_shared_role_config_defaults_and_cli_override(self):
+        gpus = [planmod.GPU(0, "RTX 3090", 24576, 24576)]
+        p = planmod.plan(["q38@slots=1"], gpus, 262144, slots=3,
+                         defaults={"qwen3.8:27b": {"context": "32K", "output": "4K"}})
+        self.assertEqual(p["servers"][0]["capacity"]["context"], 32768)
+        self.assertEqual(p["servers"][0]["capacity"]["output_tokens"], 4096)
+        self.assertEqual(p["servers"][0]["capacity"]["slots"], 1)
+
+    def test_global_client_context_is_explicit_fallback(self):
+        gpus = [planmod.GPU(0, "RTX 3090", 24576, 24576)]
+        p = planmod.plan(["q38@context=32K"], gpus, 262144, client_context=24576)
+        self.assertEqual(p["servers"][0]["capacity"]["client_context"], 24576)
+        p = planmod.plan(["q38@context=32K,client_context=20K"], gpus, 262144,
+                         client_context=24576)
+        self.assertEqual(p["servers"][0]["capacity"]["client_context"], 20480)
+
 
 if __name__ == "__main__":
     unittest.main()

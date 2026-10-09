@@ -12,6 +12,8 @@ import argparse, json, os, pathlib, shutil, socket, subprocess, sys, time, urlli
 ROOT=pathlib.Path(__file__).resolve().parent
 sys.path.insert(0,str(ROOT/'lib'))
 import claude_local_plan as plan
+import coder_local_plan as worker_plan
+import pushbutton_capacity as capacity
 import pushbutton_metrics as metrics
 import pushbutton_policy as policy
 import pushbutton_registry as registry_store
@@ -76,7 +78,14 @@ def choose_model(cfg,arg):
 
 def configure(cfg,args):
     first=not bool(cfg)
-    model=choose_model(cfg,args.model);cfg['model']=model
+    spec=args.model or cfg.get('model_spec') or choose_model(cfg,None)
+    model=canon(spec.partition('@')[0]);cfg['model']=model;cfg['model_spec']=spec
+    defaults=cfg.get('models',{})
+    options=dict(defaults.get(model,{}))
+    for key in ('slots','output','client_context','compact','quant','kv_k','kv_v','min_tps','admission'):
+        value=getattr(args,key,None)
+        if value is not None:options[key]=value
+    cfg['models']={**defaults,model:options}
     default_ctx=min(model_context(model),int(cfg.get('context') or 65536))
     ctx=int(args.context or default_ctx)
     if first and sys.stdin.isatty() and args.context is None:
@@ -84,7 +93,14 @@ def configure(cfg,args):
         if raw:
             try:ctx=int(raw)
             except ValueError:pass
-    cfg['context']=min(ctx,model_context(model))
+    if ctx < 1 or ctx > model_context(model):raise SystemExit(f'context must be between 1 and {model_context(model):,}')
+    cfg['context']=ctx
+    if model in plan.PROFILES:
+        req=worker_plan.parse_model_spec(spec,cfg['models'])
+        resolved=capacity.resolve_options(req.capacity,ctx)
+        if resolved['context']>model_context(model):raise ValueError('per-model context exceeds supported model context')
+    elif '@' in spec or options:
+        raise ValueError('per-model capacity options require a supported llama.cpp planner profile')
     if args.frontend:cfg['frontend']=args.frontend
     elif not cfg.get('frontend'):
         cfg['frontend']='qwen'
@@ -96,7 +112,8 @@ def configure(cfg,args):
     elif first and sys.stdin.isatty() and not metrics.telemetry_consent_recorded():
         raw=input('Contribute anonymous compact performance measurements? [y/N]: ').strip().lower()
         metrics.set_telemetry(raw in {'y','yes'},args.telemetry_url)
-    write_json(CONFIG,cfg);return cfg
+    if not getattr(args,'plan_only',False):write_json(CONFIG,cfg)
+    return cfg
 
 def selector_views(model,context):
     gpus=[]
@@ -162,7 +179,7 @@ def provisioned_parallel(model,context,row):
     return slots
 
 def registry():return registry_store.load(REGISTRY)
-def healthy_resident(model,context):
+def healthy_resident(model,context,requested_capacity=None,artifact=None,request=None):
     obj=registry()
     for x in obj.get('instances',[]):
         if not x.get('endpoint'):continue
@@ -172,7 +189,17 @@ def healthy_resident(model,context):
             continue
         if not x.get('healthy',True):registry_store.mark_health(str(x.get('id')),True,REGISTRY)
         names={canon(x.get('model','')),*[canon(a) for a in x.get('aliases',[])]}
-        if canon(model) in names and int(x.get('max_context') or 0)>=context:return x
+        if canon(model) not in names or int(x.get('max_context') or 0)<context:continue
+        if artifact is not None and x.get('artifact')!=artifact:continue
+        if request is not None:
+            if request.gpu_indices is not None:
+                actual={int(i) for i in str(x.get('gpu','')).split(',') if i.strip().isdigit()}
+                if actual!=set(request.gpu_indices):continue
+            if request.vram_limit_mib is not None and x.get('vram_limit_mib_per_gpu')!=request.vram_limit_mib:continue
+        if requested_capacity is not None:
+            if int(x.get('framework_max_concurrency') or 1)<requested_capacity['slots']:continue
+            if any(x.get('capacity',{}).get(k)!=v for k,v in requested_capacity.items()):continue
+        return x
     return None
 
 def start_detached(cmd,log,name):
@@ -210,8 +237,10 @@ def commission(model,context,row):
     if backend=='llama.cpp':
         spec=hf_spec(model,artifact)
         if not spec:raise SystemExit(f'cannot resolve GGUF artifact {model} / {artifact}')
-        slots=provisioned_parallel(model,context,row)
+        slots=int(row['capacity']['slots']) if row.get('capacity') else provisioned_parallel(model,context,row)
         cmd=[sys.executable,ROOT/'pushbutton-instance','--hf-spec',spec,'--alias',model,'--port',port,'--context',context,'--parallel',slots]
+        if row.get('capacity'):
+            cmd += ['--kv-k',row['kv_k'],'--kv-v',row['kv_v']]
         if gpu is not None:cmd += ['--gpus',str(gpu)]
     elif backend in {'llamampere','vllm-qwen38-3090','ninfer-3090','volta-llama','sglang-v100','vllm-flashnext-3090'}:
         cmd=[sys.executable,ROOT/'pushbutton-backend','serve',backend,model,'--port',port,'--context',context]
@@ -220,7 +249,7 @@ def commission(model,context,row):
     if slots>1:say(f'pre-provisioning {slots} native llama.cpp slots; broker admission remains C1 until calibrated')
     proc=start_detached(cmd,logs/f'{model.replace(":","-")}-{backend}-{port}.log',f'{model} / {backend}')
     if not wait_endpoint(proc,endpoint):
-        if backend=='llama.cpp' and slots>1:
+        if backend=='llama.cpp' and slots>1 and not row.get('capacity'):
             try:proc.terminate();proc.wait(timeout=5)
             except Exception:
                 try:proc.kill()
@@ -232,7 +261,25 @@ def commission(model,context,row):
             if not wait_endpoint(proc,endpoint):raise SystemExit(f'backend failed to become ready even at C1; inspect {logs}')
         else:raise SystemExit(f'backend failed to become ready; inspect {logs}')
     inst={'id':f'{model}-{backend}-{port}','model':model,'served_model':served_model(endpoint,model),'aliases':[model],'backend':backend,'artifact':artifact,'endpoint':endpoint,'pid':proc.pid,'max_context':context,'framework_max_concurrency':slots,'measured_envelopes':[{'concurrency':1,'max_context':context,'safe':True,'evidence':'PROVEN'}],'tg':row.get('tg'),'tg_measured':row.get('evidence')=='LOCAL MEASURED','healthy':True,'gpu':gpu,'required_mib':row.get('req'),'provisioned_slots':slots,'calibration_safe':bool(backend=='llama.cpp' and slots>1)}
+    if row.get('capacity'):
+        props=get_json(endpoint.removesuffix('/v1')+'/props',5)
+        if props:
+            actual=(props.get('default_generation_settings') or {}).get('n_ctx') or props.get('n_ctx')
+            parallel=props.get('total_slots') or props.get('n_parallel')
+            if (actual is not None and int(actual)<context) or (parallel is not None and int(parallel)<slots):
+                proc.terminate()
+                raise SystemExit('backend provisioned less context/slots than requested; inspect /props and restart with a fitting configuration')
+        inst['capacity']={**row['capacity'],'no_context_shift':True}
+    if row.get('vram_limit_mib_per_gpu') is not None:inst['vram_limit_mib_per_gpu']=row['vram_limit_mib_per_gpu']
     registry_store.append_instance(inst,REGISTRY);return inst
+
+def capacity_candidate(req,context):
+    proposed=worker_plan.build_plan([req],1,plan.inventory(),context)
+    worker=proposed['workers'][0]
+    row={'backend':'llama.cpp','artifact':worker['profile']['quant'],'gpu':worker['cuda_visible_devices'],
+         'req':worker['required_mib'],'capacity':worker['capacity'],'kv_k':worker['profile']['kv_k'],
+         'kv_v':worker['profile']['kv_v'],'vram_limit_mib_per_gpu':worker.get('vram_limit_mib_per_gpu'),'evidence':'ESTIMATED'}
+    return proposed,row
 
 def ensure_qwen():
     q=shutil.which('qwen')
@@ -246,11 +293,12 @@ def ensure_qwen():
         subprocess.run('curl -fsSL https://qwen-code-assets.oss-cn-hangzhou.aliyuncs.com/installation/install-qwen-standalone.sh | bash',shell=True,check=True)
         if p.exists():return str(p)
         return shutil.which('qwen') or (_ for _ in ()).throw(SystemExit('Qwen Code install finished but qwen was not found'))
-def launch_qwen(port,context,extra):
+def launch_qwen(port,context,extra,model='pushbutton/auto',output=32768):
     qwen=ensure_qwen();qhome=STATE/'frontends/qwen';qhome.mkdir(parents=True,exist_ok=True)
-    settings={'modelProviders':{'openai':[{'id':'pushbutton/auto','name':'Pushbutton automatic resident pool','envKey':'PUSHBUTTON_LOCAL_API_KEY','baseUrl':f'http://127.0.0.1:{port}/v1','streamIdleTimeoutMs':0,'generationConfig':{'contextWindowSize':context,'maxRetries':2}}]},'security':{'auth':{'selectedType':'openai'}},'model':{'name':'pushbutton/auto'},'experimental':{'agentTeam':True},'privacy':{'usageStatisticsEnabled':False},'telemetry':{'enabled':False}}
+    settings={'modelProviders':{'openai':[{'id':model,'name':'Pushbutton resident model','envKey':'PUSHBUTTON_LOCAL_API_KEY','baseUrl':f'http://127.0.0.1:{port}/v1','streamIdleTimeoutMs':0,'generationConfig':{'contextWindowSize':context,'maxRetries':2}}]},'security':{'auth':{'selectedType':'openai'}},'model':{'name':model},'experimental':{'agentTeam':True},'privacy':{'usageStatisticsEnabled':False},'telemetry':{'enabled':False}}
+    settings['modelProviders']['openai'][0]['generationConfig']['maxOutputTokens']=output
     write_json(qhome/'settings.json',settings);env=os.environ.copy();env.update({'QWEN_HOME':str(qhome),'PUSHBUTTON_LOCAL_API_KEY':'pushbutton-local','QWEN_CODE_ENABLE_AGENT_TEAM':'1','QWEN_USAGE_STATISTICS_ENABLED':'0','QWEN_TELEMETRY_ENABLED':'0'})
-    os.execvpe(qwen,[qwen,'--auth-type','openai','--model','pushbutton/auto',*extra],env)
+    os.execvpe(qwen,[qwen,'--auth-type','openai','--model',model,*extra],env)
 def ensure_opencode():
     exe=shutil.which('opencode')
     if exe:return exe
@@ -261,9 +309,12 @@ def ensure_opencode():
         if p.exists():return str(p)
         subprocess.run('curl -fsSL https://opencode.ai/install | bash',shell=True,check=True)
         return shutil.which('opencode') or (str(p) if p.exists() else (_ for _ in ()).throw(SystemExit('OpenCode install finished but opencode was not found')))
-def launch_opencode(port,context,extra):
+def launch_opencode(port,context,extra,model='pushbutton/auto',output=32768):
     exe=ensure_opencode();p=STATE/'frontends/opencode/opencode.json';p.parent.mkdir(parents=True,exist_ok=True)
     obj={'$schema':'https://opencode.ai/config.json','model':'pushbutton/pushbutton/auto','provider':{'pushbutton':{'npm':'@ai-sdk/openai-compatible','name':'Pushbutton','options':{'baseURL':f'http://127.0.0.1:{port}/v1','apiKey':'pushbutton-local'},'models':{'pushbutton/auto':{'name':'Pushbutton automatic resident pool','limit':{'context':context,'output':32768},'capabilities':{'tools':True,'input':['text'],'output':['text']}}}}}}
+    entry=obj['provider']['pushbutton']['models'].pop('pushbutton/auto')
+    entry['limit']['output']=output
+    obj['provider']['pushbutton']['models'][model]=entry;obj['model']='pushbutton/'+model
     write_json(p,obj);env=os.environ.copy();env.update({'OPENCODE_CONFIG':str(p),'OPENCODE_DISABLE_AUTOUPDATE':'1'});os.execvpe(exe,[exe,*extra],env)
 def show_status(cfg):
     port=int(cfg.get('broker_port') or DEFAULT_BROKER_PORT);x=get_json(f'http://127.0.0.1:{port}/pushbutton/status',2)
@@ -271,18 +322,44 @@ def show_status(cfg):
     print(json.dumps(x,indent=2))
 
 def main():
-    ap=argparse.ArgumentParser(prog='pushbutton');ap.add_argument('model',nargs='?');ap.add_argument('--context',type=int);ap.add_argument('--frontend',choices=['qwen','opencode','none']);ap.add_argument('--status',action='store_true');ap.add_argument('--allow-slow',action='store_true');ap.add_argument('--reconfigure',action='store_true');ap.add_argument('--telemetry-on',action='store_true');ap.add_argument('--telemetry-off',action='store_true');ap.add_argument('--telemetry-url');ap.add_argument('frontend_args',nargs=argparse.REMAINDER);a=ap.parse_args()
+    ap=argparse.ArgumentParser(prog='pushbutton');ap.add_argument('model',nargs='?');ap.add_argument('--context',type=int);ap.add_argument('--frontend',choices=['qwen','opencode','none']);ap.add_argument('--status',action='store_true');ap.add_argument('--allow-slow',action='store_true');ap.add_argument('--reconfigure',action='store_true');ap.add_argument('--telemetry-on',action='store_true');ap.add_argument('--telemetry-off',action='store_true');ap.add_argument('--telemetry-url')
+    for name in ('slots','output','client-context','compact','quant','kv-k','kv-v','min-tps','admission'):
+        ap.add_argument('--'+name)
+    ap.add_argument('--plan-only',action='store_true')
+    argv=sys.argv[1:]
+    separator=argv.index('--') if '--' in argv else len(argv)
+    a,extra=ap.parse_known_args(argv[:separator])
+    a.frontend_args=extra+argv[separator+1:]
     cfg={} if a.reconfigure else read_json(CONFIG,{})
     if a.status:return show_status(cfg)
-    cfg=configure(cfg,a);model=cfg['model'];ctx=int(cfg['context'])
+    try:
+        cfg=configure(cfg,a);model=cfg['model'];ctx=int(cfg['context'])
+        requested=None;row=None
+        if model in plan.PROFILES:
+            req=worker_plan.parse_model_spec(cfg['model_spec'],cfg.get('models',{}))
+            requested=capacity.resolve_options(req.capacity,ctx);ctx=requested['context']
+            if a.plan_only:
+                proposed,row=capacity_candidate(req,ctx);print(json.dumps(proposed,indent=2));return
+        elif '@' in cfg['model_spec'] or cfg.get('models',{}).get(model):
+            raise ValueError('per-model capacity options require a supported llama.cpp planner profile')
+        elif a.plan_only:
+            print(json.dumps({'model':model,'context':ctx,'rows':selector_views(model,ctx)},indent=2));return
+    except ValueError as exc:raise SystemExit(str(exc))
     # Global cold-start single-flight prevents simultaneous CLIs from racing the
     # same free VRAM before either backend has had time to allocate it. Recheck
     # the registry after acquiring the lock so followers simply reuse the winner.
     with registry_store.named_lock('commission-global',timeout_s=7200):
-        resident=healthy_resident(model,ctx)
+        resident=healthy_resident(model,ctx,requested,requested.get('quant') if requested else None,req if requested else None)
         if resident:say(f"reusing {resident['model']} at {resident['endpoint']}")
         else:
-            rows=selector_views(model,ctx);row=choose_candidate(rows,a.allow_slow)
+            if requested:
+                try:
+                    proposed,row=capacity_candidate(req,ctx)
+                except ValueError as exc:raise SystemExit(str(exc))
+                worker=proposed['workers'][0]
+                say(f"{model}: slots={requested['slots']}, context/slot={ctx:,}, input={requested['input_tokens']:,}, output={requested['output_tokens']:,}, compact={requested['compact_trigger']:,}; estimated {row['req']:,} MiB, headroom {worker['headroom_mib']:,} MiB")
+            if row is None:
+                rows=selector_views(model,ctx);row=choose_candidate(rows,a.allow_slow)
             if not row:raise SystemExit(f'no fitting local configuration found for {model} at {ctx:,} context')
             label,msg=policy.speed_label(row.get('tg'),measured=row.get('evidence')=='LOCAL MEASURED')
             if label in {'SLOW','VERY_SLOW'}:warn(msg or f'{model} is expected to decode below {policy.MIN_DECODE_TOK_S:.0f} tok/s')
@@ -292,7 +369,8 @@ def main():
     frontend=cfg.get('frontend','qwen')
     if frontend=='none':print(f'http://127.0.0.1:{broker_port}/v1');return
     extra=list(a.frontend_args);extra=extra[1:] if extra[:1]==['--'] else extra
-    if frontend=='opencode':launch_opencode(broker_port,ctx,extra)
-    launch_qwen(broker_port,ctx,extra)
+    budget=resident.get('capacity') or capacity.resolve_budget(ctx)
+    if frontend=='opencode':launch_opencode(broker_port,budget['client_context'],extra,model,budget['output_tokens'])
+    launch_qwen(broker_port,budget['client_context'],extra,model,budget['output_tokens'])
 
 if __name__=='__main__':main()

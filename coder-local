@@ -10,6 +10,7 @@ STATE_DIR="${CLAUDE_LOCAL_STATE:-$HOME/.local/share/pushbutton/claude-local}"
 CACHE_DIR="${CLAUDE_LOCAL_CACHE:-$HOME/.cache/pushbutton/llama}"
 LOCK_FILE="${CLAUDE_LOCAL_LOCK_FILE:-$STATE_DIR/startup.lock}"
 CTX="${CLAUDE_LOCAL_CONTEXT:-262144}"
+SLOTS=1
 CLIENT_CTX="${CLAUDE_LOCAL_CLIENT_CONTEXT:-200000}"
 CLIENT_CTX_EXPLICIT=0
 [[ -z "${CLAUDE_LOCAL_CLIENT_CONTEXT+x}" ]] || CLIENT_CTX_EXPLICIT=1
@@ -41,6 +42,7 @@ Usage:
 Per-model placement syntax:
   MODEL@gpu=INDEX,vram=SIZE
   MODEL@gpu=INDEX+INDEX,vram=SIZE
+  MODEL@context=N,slots=N,output=N,client_context=N,compact=N,quant=Q,kv_k=K,kv_v=V,min_tps=N,admission=N
 
 `gpu=` pins that worker to exactly those physical NVIDIA GPU indices.
 `vram=` is a per-selected-GPU hard planning lease; the best quant that fits is
@@ -72,6 +74,7 @@ Options:
   --placement-config FILE       default: ~/.config/pushbutton-local/placement.json
   --plan-only                   print placement/quant and exit before provisioning
   --local-context N
+  --slots N                     fallback parallel slots per model
   --local-client-context N
   --local-cache DIR
   --no-parallel              Force sequential Hugging Face downloads
@@ -171,7 +174,8 @@ sep='\x1f'
 for w in json.load(open(sys.argv[1]))['workers']:
  x=w['profile']; env=';'.join(f'{k}={v}' for k,v in x.get('extra_env',{}).items())
  cap=w.get('vram_limit_mib_per_gpu') or ''
- print(sep.join(map(str,[w['worker'],w['id'],x['hf_spec'],w['cuda_visible_devices'],int(w['multi_gpu']),x['kv_k'],x['kv_v'],x['batch'],x['ubatch'],x['flash_attn'],x['template'],env,x.get('note',''),cap])))
+ c=w['capacity']
+ print(sep.join(map(str,[w['worker'],w['id'],x['hf_spec'],w['cuda_visible_devices'],int(w['multi_gpu']),x['kv_k'],x['kv_v'],x['batch'],x['ubatch'],x['flash_attn'],x['template'],env,x.get('note',''),cap,c['context'],c['slots'],json.dumps(c,separators=(',',':'))])))
 PY
 }
 print_plan(){ python3 - "$PLAN_FILE" <<'PY'
@@ -182,6 +186,8 @@ for w in p['workers']:
  cap=w.get('vram_limit_mib_per_gpu')
  lease=f"  lease={cap/1024:.1f} GiB/GPU" if cap else ""
  print(f"  agent {w['worker']}: {w['model']} / {x['quant']} -> GPU[{gs}] ({len(w['gpus'])} GPU{'s' if len(w['gpus'])!=1 else ''}){lease}")
+ c=w['capacity']
+ print(f"    slots={c['slots']} hard={c['context']} input={c['input_tokens']} output={c['output_tokens']} client={c['client_context']} compact={c['compact_trigger']} estimated-memory={w['required_mib']/1024:.2f} GiB")
 print(f"  spare GPUs: {[g['index'] for g in p['unused_gpus']]}")
 PY
 }
@@ -222,11 +228,11 @@ start_backends(){
  mkdir -p "$STATE_DIR/logs" "$CACHE_DIR"; BACKENDS="$STATE_DIR/coder-backends.$$.tsv"; : >"$BACKENDS"
  export LLAMA_CACHE="$CACHE_DIR" GGML_CUDA_ENABLE_UNIFIED_MEMORY=0 CUDA_SCALE_LAUNCH_QUEUES=4x
  local next=$((PORT_BASE+1))
- while IFS=$'\x1f' read -r worker id hf gpus multi kvk kvv batch ubatch fa template envpairs note vramcap; do
+ while IFS=$'\x1f' read -r worker id hf gpus multi kvk kvv batch ubatch fa template envpairs note vramcap context slots capacity; do
    local port log pid model_path waited=0 failed=0
    download_model_fast "$hf" "$CACHE_DIR" model_path || die "failed to download $hf"
    port="$(free_port "$next")"; next=$((port+1)); log="$STATE_DIR/logs/coder-$id.log"; : >"$log"
-   local -a cmd=("$LLAMA_SERVER" -m "$model_path" --alias "$id" --no-mmproj -ngl 999 -c "$CTX" -np 1 --cache-type-k "$kvk" --cache-type-v "$kvv" -b "$batch" -ub "$ubatch" -fa "$fa" --jinja --no-context-shift --host 127.0.0.1 --port "$port")
+   local -a cmd=("$LLAMA_SERVER" -m "$model_path" --alias "$id" --no-mmproj -ngl 999 -c "$((context * slots))" -np "$slots" --cache-type-k "$kvk" --cache-type-v "$kvv" -b "$batch" -ub "$ubatch" -fa "$fa" --jinja --no-context-shift --host 127.0.0.1 --port "$port")
    [[ "$multi" == 1 ]] && cmd+=(--split-mode layer)
    [[ "$template" == qwen-fixed ]] && cmd+=(--chat-template-file "$QWEN_TEMPLATE")
    local -a envcmd=(env "CUDA_VISIBLE_DEVICES=$gpus" "LLAMA_CACHE=$CACHE_DIR" "GGML_CUDA_ENABLE_UNIFIED_MEMORY=0")
@@ -241,8 +247,9 @@ start_backends(){
      kill "$pid" 2>/dev/null || true
      die "agent $worker exceeded its ${vramcap} MiB/GPU VRAM lease; choose a lower cap/context/model or update the model profile"
    fi
+   verify_capacity "$port" "$capacity" || die "agent $worker effective per-slot capacity is unsafe"
    say "Agent $worker backend ready: http://127.0.0.1:$port/v1"
-   printf '%s\t%s\t%s\t%s\n' "$worker" "$id" "$port" "$hf" >>"$BACKENDS"
+   printf '%s\t%s\t%s\t%s\t%s\n' "$worker" "$id" "$port" "$hf" "$capacity" >>"$BACKENDS"
  done < <(worker_rows)
 }
 ensure_qwen(){
@@ -256,14 +263,14 @@ configure_qwen(){
  local qhome="$STATE_DIR/frontends/qwen" runtime="$STATE_DIR/frontends/qwen-runtime"
  mkdir -p "$qhome/agents" "$runtime"; export QWEN_HOME="$qhome" QWEN_RUNTIME_DIR="$runtime"
  export PUSHBUTTON_LOCAL_API_KEY=pushbutton-local QWEN_CODE_ENABLE_AGENT_TEAM=1 QWEN_USAGE_STATISTICS_ENABLED=0 QWEN_TELEMETRY_ENABLED=0
- python3 - "$BACKENDS" "$qhome/settings.json" "$CLIENT_CTX" <<'PY'
+ python3 - "$BACKENDS" "$qhome/settings.json" "$CAPACITY_PROXY_PORT" <<'PY'
 import json,sys
 rows=[]
 for line in open(sys.argv[1]):
- w,mid,port,hf=line.rstrip('\n').split('\t'); rows.append((int(w),mid,int(port),hf))
+ w,mid,port,hf,capacity=line.rstrip('\n').split('\t'); rows.append((int(w),mid,int(port),hf,json.loads(capacity)))
 models=[]
-for w,mid,port,hf in rows:
- models.append({"id":mid,"name":f"Pushbutton agent {w}: {hf}","envKey":"PUSHBUTTON_LOCAL_API_KEY","baseUrl":f"http://127.0.0.1:{port}/v1","streamIdleTimeoutMs":0,"generationConfig":{"contextWindowSize":int(sys.argv[3]),"maxRetries":1}})
+for w,mid,port,hf,c in rows:
+ models.append({"id":mid,"name":f"Pushbutton agent {w}: {hf}","envKey":"PUSHBUTTON_LOCAL_API_KEY","baseUrl":f"http://127.0.0.1:{sys.argv[3]}/v1","streamIdleTimeoutMs":0,"generationConfig":{"contextWindowSize":c['client_context'],"maxOutputTokens":c['output_tokens'],"maxRetries":1}})
 obj={"modelProviders":{"openai":models},"security":{"auth":{"selectedType":"openai"}},"model":{"name":rows[0][1]},"experimental":{"agentTeam":True},"privacy":{"usageStatisticsEnabled":False},"telemetry":{"enabled":False}}
 open(sys.argv[2],'w').write(json.dumps(obj,indent=2)+'\n')
 PY
@@ -306,6 +313,7 @@ while (($#));do
   --placement-config) [[ $# -ge 2 ]]||die "--placement-config needs a file";PLACEMENT_CONFIG="$2";SELECT_PLACEMENT=1;shift 2;;
   --plan-only) PLAN_ONLY=1;shift;;
   --local-context) CTX="$2";shift 2;; --local-client-context) CLIENT_CTX="$2";CLIENT_CTX_EXPLICIT=1;shift 2;;
+  --slots) [[ $# -ge 2 ]]||die "--slots needs a value";SLOTS="$2";shift 2;;
   --local-cache) CACHE_DIR="$2";SELECT_ARGS+=("$1" "$2");shift 2;; --local-port-base) PORT_BASE="$2";SELECT_ARGS+=("$1" "$2");shift 2;;
   --no-parallel) PUSHBUTTON_NO_PARALLEL=1;SELECT_ARGS+=("$1");shift;;
   --self-test) self_test;exit 0;;
@@ -326,6 +334,7 @@ if ((SELECT)) || ((${#MODELS[@]} == 0)); then
   [[ "$(basename "$0")" == qwen-local ]] && selector_frontend=qwen-local
   [[ -z "${CODER_LOCAL_MENU_FRONTEND:-}" ]] || selector_frontend="$CODER_LOCAL_MENU_FRONTEND"
   selector_args=(--frontend "$selector_frontend" --menu --context "$CTX")
+  [[ "$SLOTS" == 1 ]] || selector_args+=(--slots "$SLOTS")
   ((CLIENT_CTX_EXPLICIT == 0)) || selector_args+=(--client-context "$CLIENT_CTX")
   ((PLAN_ONLY == 0)) || selector_args+=(--plan-only)
   [[ -z "$AGENTS" ]] || selector_args+=(--agents "$AGENTS")
@@ -340,12 +349,13 @@ fi
 [[ "${CODER_LOCAL_STARTUP_ONLY:-0}" != 1 || $PLAN_ONLY -eq 1 ]] || exit 125
 [[ -z "$AGENTS" ]]||[[ "$AGENTS" =~ ^[1-8]$ ]]||die "--agents must be 1..8"
 [[ "$CTX" =~ ^[0-9]+$ && "$CLIENT_CTX" =~ ^[0-9]+$ ]]||die "context values must be integers"
-((CLIENT_CTX<=CTX))||die "client context exceeds physical context"
 for c in git cmake ninja python3 curl tar flock nvidia-smi;do have "$c"||die "$c is required";done
 mkdir -p "$STATE_DIR" "$CACHE_DIR" "$(dirname "$LOCK_FILE")"
 exec {STARTUP_LOCK_FD}>"$LOCK_FILE"; flock "$STARTUP_LOCK_FD"
 PLAN_FILE="$STATE_DIR/coder-plan.$$.json"
-pa=(--context "$CTX" --placement-config "$PLACEMENT_CONFIG"); [[ -n "$AGENTS" ]]&&pa+=(--agents "$AGENTS"); pa+=("${MODELS[@]}")
+pa=(--context "$CTX" --slots "$SLOTS" --placement-config "$PLACEMENT_CONFIG")
+((CLIENT_CTX_EXPLICIT == 0)) || pa+=(--client-context "$CLIENT_CTX")
+[[ -n "$AGENTS" ]]&&pa+=(--agents "$AGENTS"); pa+=("${MODELS[@]}")
 python3 "$PLAN_PY" "${pa[@]}" >"$PLAN_FILE"; print_plan
 if ((PLAN_ONLY)); then
   flock -u "$STARTUP_LOCK_FD"; eval "exec ${STARTUP_LOCK_FD}>&-"; STARTUP_LOCK_FD=""
@@ -353,5 +363,7 @@ if ((PLAN_ONLY)); then
 fi
 source "$ROOT/lib/pushbutton_download.sh"
 source "$HOSTCC_SH"; claude_local_prepare_hostcc; activate_cuda; ensure_llamacpp; grep -q '"template": "qwen-fixed"' "$PLAN_FILE" && fetch_qwen_template || true; start_backends
+start_capacity_proxy
+warn "Qwen uses per-model client/output budgets. Configured compact triggers are exposed in the plan; explicit frontend compaction thresholds are not supported by this integration."
 flock -u "$STARTUP_LOCK_FD"; eval "exec ${STARTUP_LOCK_FD}>&-"; STARTUP_LOCK_FD=""
 launch_qwen

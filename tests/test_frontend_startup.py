@@ -3,7 +3,9 @@ import json
 import os
 import pathlib
 import pty
+import re
 import select
+import shlex
 import shutil
 import subprocess
 import sys
@@ -14,6 +16,110 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 FRONTENDS = ("coder-local", "claude-local", "hermes-local")
 WRAPPERS = ("qwen-local", "opencode-local", "deepseek-local", "mini-swe-local")
+
+
+def shell_function(frontend, name):
+    text = (ROOT / frontend).read_text()
+    match = re.search(r"^" + name + r"\(\)\s*\{.*?^\}", text, re.M | re.S)
+    if not match:
+        raise AssertionError(f"missing {frontend}:{name}")
+    return match.group(0)
+
+
+class CapacityIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        self.scratch = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.scratch.cleanup)
+        self.root = pathlib.Path(self.scratch.name)
+        self.capacity = dict(context=8192, slots=3, output_tokens=1024,
+                             client_context=7000, compact_trigger=4500,
+                             input_tokens=5720, safety_tokens=256,
+                             min_tps=None, admission_limit=2)
+        self.server = dict(id="model-a", worker=1, model="qwen3.8:27b",
+                           cuda_visible_devices="0", multi_gpu=False,
+                           vram_limit_mib_per_gpu=None, capacity=self.capacity,
+                           profile=dict(hf_spec="repo:quant", kv_k="q8_0",
+                                        kv_v="q4_0", batch=512, ubatch=256,
+                                        flash_attn="on", template="", extra_env={}))
+        self.plan = self.root / "plan.json"
+        self.plan.write_text(json.dumps(dict(servers=[self.server],
+                                             workers=[self.server],
+                                             role_ids=dict(haiku="model-a", sonnet="model-a",
+                                                           opus="model-a", fable="model-a"))))
+
+    def run_functions(self, frontend, names, body):
+        prelude = f"""set -euo pipefail
+STATE_DIR={shlex.quote(str(self.root))}
+CACHE_DIR="$STATE_DIR/cache"
+ROOT={shlex.quote(str(ROOT))}
+PLAN_FILE={shlex.quote(str(self.plan))}
+PORT_BASE=18000
+CTX=262144
+CLIENT_CTX=200000
+WEB_SEARCH_BACKEND=exa
+WEB_EXTRACT_BACKEND=firecrawl
+PIDS=()
+ALLOW_OFFLOAD=0
+LLAMA_SERVER=llama-server
+CAPTURE="$STATE_DIR/capture"
+"""
+        command = prelude + "\n".join(shell_function(frontend, name) for name in names) + "\n" + body
+        result = subprocess.run(["bash", "-c", command], text=True, capture_output=True,
+                                timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result
+
+    def test_all_backends_launch_total_context_and_parallel_slots_and_keep_capacity(self):
+        for frontend in FRONTENDS:
+            with self.subTest(frontend=frontend):
+                row_function = "worker_rows" if frontend == "coder-local" else "server_rows"
+                body = """
+say(){ :; }; die(){ echo "$*" >&2; exit 1; }
+download_model_fast(){ printf -v "$3" '%s' model.gguf; }
+free_port(){ echo 18001; }; curl(){ return 0; }
+verify_capacity(){ printf '%s' "$2" >"$STATE_DIR/verified"; }
+start_log_follower(){ echo ''; }; stop_log_follower(){ :; }
+env(){ printf '%s\\n' "$@" >"$CAPTURE"; }
+start_backends
+wait
+"""
+                self.run_functions(frontend, [row_function, "start_backends"], body)
+                args = (self.root / "capture").read_text().splitlines()
+                self.assertEqual(args[args.index("-c") + 1], "24576")
+                self.assertEqual(args[args.index("-np") + 1], "3")
+                self.assertEqual(args[args.index("--cache-type-k") + 1], "q8_0")
+                self.assertIn("--no-context-shift", args)
+                self.assertEqual(json.loads((self.root / "verified").read_text()), self.capacity)
+                registry = next(self.root.glob("coder-backends.*.tsv")) if frontend == "coder-local" else \
+                    next(self.root.glob("backends.*" if frontend == "claude-local" else "hermes-backends.*"))
+                self.assertEqual(json.loads(registry.read_text().strip().split("\t")[-1]), self.capacity)
+
+    def test_gateway_routes_carry_capacity(self):
+        backends = self.root / "backends"
+        backends.write_text("model-a\t18001\trepo:quant\t" + json.dumps(self.capacity) + "\n")
+        self.run_functions("claude-local", ["write_gateway_config"],
+                           f'BACKENDS_TSV={shlex.quote(str(backends))}\nwrite_gateway_config')
+        config = json.loads(next(self.root.glob("gateway.*.json")).read_text())
+        self.assertTrue(all(route["capacity"] == self.capacity for route in config["roles"].values()))
+
+    def test_qwen_model_context_and_output_are_per_model_and_guarded(self):
+        backends = self.root / "backends"
+        second = {**self.capacity, "client_context":12000, "output_tokens":2048}
+        backends.write_text("1\tmodel-a\t18001\trepo:a\t" + json.dumps(self.capacity) + "\n" +
+                            "2\tmodel-b\t18002\trepo:b\t" + json.dumps(second) + "\n")
+        self.run_functions("coder-local", ["configure_qwen"],
+                           f'BACKENDS={shlex.quote(str(backends))}\nCAPACITY_PROXY_PORT=19000\nsay(){{ :; }}\nconfigure_qwen')
+        models = json.loads((self.root / "frontends/qwen/settings.json").read_text())["modelProviders"]["openai"]
+        self.assertEqual([m["generationConfig"]["contextWindowSize"] for m in models], [7000, 12000])
+        self.assertEqual([m["generationConfig"]["maxOutputTokens"] for m in models], [1024, 2048])
+        self.assertTrue(all(m["baseUrl"] == "http://127.0.0.1:19000/v1" for m in models))
+
+    def test_hermes_profile_uses_own_context(self):
+        result = self.run_functions("hermes-local", ["configure_profile"],
+                                    'hermes(){ printf "%s\\n" "$*" >>"$CAPTURE"; }\n'
+                                    'configure_profile fast model-a http://127.0.0.1:19000/v1 low')
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("config set model.context_length 7000", (self.root / "capture").read_text())
 
 
 class StartupTests(unittest.TestCase):
@@ -159,6 +265,15 @@ class StartupTests(unittest.TestCase):
                                  ["--frontend", name, "--menu", "--context", "32768",
                                   "--client-context", "16000", *controlled, "q38",
                                   *["--launch-arg=" + x for x in forwarded]])
+
+    def test_per_model_capacity_suffix_and_global_slots_survive_selection(self):
+        self.selector_recorder()
+        model = "q38@context=8192,slots=3,output=1024,client_context=7000,compact=4000,kv_k=q8_0"
+        for frontend in FRONTENDS:
+            with self.subTest(frontend=frontend):
+                argv = self.recorded(frontend, ["--select", model, "--slots", "2"])["argv"]
+                self.assertIn(model, argv)
+                self.assertEqual(argv[argv.index("--slots") + 1], "2")
 
     def test_qwen_alias_preserves_frontend(self):
         self.selector_recorder()

@@ -79,8 +79,8 @@ def parse_options(options: dict) -> dict:
                 raise ValueError(f"unsupported {name} precision '{value}'")
             result[name] = kind
         else:
-            quant = str(value).strip()
-            if not quant or not re.fullmatch(r"[A-Za-z0-9_.-]+", quant):
+            quant = value.strip() if isinstance(value, str) else ""
+            if not quant or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]*", quant):
                 raise ValueError("quant must be a supported profile quant name")
             result[name] = quant.upper()
     return result

@@ -16,10 +16,14 @@ import argparse
 import http.client
 import json
 import os
+import pathlib
 import signal
 import sys
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import pushbutton_request_budget as request_budget
 
 HOP_HEADERS = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -74,6 +78,10 @@ class Router:
         for role, route in self.roles.items():
             self.alias_map[str(route["model_id"]).lower()] = route
             self.alias_map[role] = route
+        self.gates = {}
+        for route in self.unique_routes():
+            limit = request_budget.integer((route.get("capacity") or {}).get("admission_limit", 1), "admission_limit")
+            self.gates[(route["url"], route["backend_alias"])] = threading.BoundedSemaphore(limit)
 
     def resolve(self, model: str) -> dict:
         key = (model or "").lower()
@@ -377,10 +385,34 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(n) or b"{}")
         except Exception as exc:
             return self._json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": f"bad JSON: {exc}"}})
+        if not isinstance(body, dict):
+            return self._json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": "request body must be an object"}})
 
         route = self.router.resolve(str(body.get("model", "")))
+        gate = self.router.gates[(route["url"], route["backend_alias"])]
+        if not gate.acquire(timeout=60):
+            return self._json(429, {"type": "error", "error": {"type": "rate_limit_error", "message": "route admission limit reached; retry later"}})
+        try:
+            return self._dispatch(route, body, path)
+        finally:
+            gate.release()
+
+    def _dispatch(self, route, body, path):
         body["model"] = route["backend_alias"]
         apply_local_policy(body)
+        capacity = route.get("capacity") or {"context": route.get("context", 65536), "output_tokens": 4096}
+        try:
+            admission = request_budget.enforce(body, capacity, route["url"], "anthropic",
+                                               headers=dict(self.headers),
+                                               count_only=path.endswith("/count_tokens"))
+        except request_budget.BudgetError as exc:
+            return self._json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": str(exc)}})
+        if path.endswith("/count_tokens"):
+            if admission.source != "backend-tokenizer":
+                return self._json(503, {"type": "error", "error": {"type": "api_error", "message": "authoritative token count unavailable; estimate is not a token count"}})
+            return self._json(200, {"input_tokens": admission.input_tokens})
+        if "max_tokens" not in body:
+            body["max_tokens"] = admission.output_tokens
         raw = json.dumps(body, separators=(",", ":")).encode()
         headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP_HEADERS}
         headers["content-type"] = "application/json"; headers["content-length"] = str(len(raw))
@@ -409,7 +441,7 @@ class Handler(BaseHTTPRequestHandler):
                     errors = validate_backend_payload(payload, content_type, body.get("tools"))
                     if errors:
                         last_exc = RuntimeError("invalid backend tool arguments: " + "; ".join(errors[:12]))
-                        self.log_message("%s; retrying=%s", last_exc, attempt < attempts)
+                        self.log_message("invalid backend tool arguments; retrying=%s", attempt < attempts)
                         if attempt < attempts:
                             continue
                         break

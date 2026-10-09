@@ -38,5 +38,13 @@ class PoolTests(unittest.TestCase):
         slow=self.inst(id='slow',tg=12.0);unknown=self.inst(id='unknown',tg=None,tg_measured=False)
         self.assertEqual(pool.auto_candidates([slow,unknown],8192)[0].id,'unknown')
 
+    def test_route_capacity_and_admission_limit_are_authoritative(self):
+        x=self.inst(request_capacity={'context':8192,'admission_limit':2,'min_tps':40},
+                    measured_envelopes=[{'concurrency':4,'max_context':65536,'tg_per_client_p10':45}])
+        self.assertEqual(x.capacity(8192),2)
+        self.assertEqual(x.context_limit(),8192)
+        x.request_capacity['min_tps']=50
+        self.assertEqual(x.capacity(8192),1)
+
 
 if __name__=='__main__':unittest.main()

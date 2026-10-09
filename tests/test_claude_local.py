@@ -3,6 +3,7 @@ import importlib.util
 import pathlib
 import sys
 import unittest
+from unittest.mock import patch
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -64,6 +65,42 @@ class GatewayTests(unittest.TestCase):
 
     def test_unknown_internal_model_stays_local(self):
         self.assertEqual(self.router.resolve("unexpected-internal-id")["model_id"], "local-sonnet")
+
+    def test_count_tokens_cannot_bypass_smaller_route_capacity(self):
+        import json
+        import threading
+        import urllib.request
+        import urllib.error
+        from http.server import ThreadingHTTPServer
+        cfg = {"roles": {
+            "sonnet": {"model_id": "large", "backend_alias": "large", "url": "http://local",
+                       "capacity": {"context": 128, "output_tokens": 32, "input_tokens": 80}},
+            "haiku": {"model_id": "small", "backend_alias": "small", "url": "http://local",
+                      "capacity": {"context": 64, "output_tokens": 16, "input_tokens": 32}},
+        }}
+        server = ThreadingHTTPServer(("127.0.0.1", 0), gwmod.Handler)
+        server.router = gwmod.Router(cfg)
+        server.verbose = False
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        def backend(endpoint, path, body=None, headers=None):
+            return None if path == "/props" else {"input_tokens": 40}
+        try:
+            with patch.object(gwmod.request_budget, "backend_json", side_effect=backend):
+                for model, expected in (("large", 200), ("small", 400)):
+                    request = urllib.request.Request(
+                        f"http://127.0.0.1:{server.server_port}/v1/messages/count_tokens",
+                        json.dumps({"model": model, "messages": [], "tools": [{"name": "run"}]}).encode(),
+                        {"Content-Type": "application/json"})
+                    try:
+                        with urllib.request.urlopen(request, timeout=5) as response:
+                            self.assertEqual(response.status, expected)
+                            self.assertEqual(json.load(response)["input_tokens"], 40)
+                    except urllib.error.HTTPError as exc:
+                        self.assertEqual(exc.code, expected)
+                        self.assertIn("compact/summarize", exc.read().decode())
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 if __name__ == "__main__":
