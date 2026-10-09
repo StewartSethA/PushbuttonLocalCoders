@@ -7,6 +7,7 @@ command -v readlink >/dev/null 2>&1 && SELF="$(readlink -f "$SELF" 2>/dev/null |
 ROOT="$(cd "$(dirname "$SELF")" && pwd)"
 PLAN_PY="$ROOT/lib/claude_local_plan.py"
 HOSTCC_SH="$ROOT/lib/claude_local_hostcc.sh"
+source "$ROOT/lib/pushbutton_download.sh"
 
 STATE_DIR="${CLAUDE_LOCAL_STATE:-$HOME/.local/share/pushbutton/claude-local}"
 CACHE_DIR="${CLAUDE_LOCAL_CACHE:-$HOME/.cache/pushbutton/llama}"
@@ -52,6 +53,7 @@ Hermes frontends:
 
 Harness options:
   --local-cache DIR
+  --no-parallel           Force sequential Hugging Face downloads
   --local-context N
   --local-client-context N
   --local-port-base N
@@ -308,9 +310,10 @@ start_backends() {
     local next=$((PORT_BASE+1))
     BACKENDS_TSV="$STATE_DIR/hermes-backends.$$"; : > "$BACKENDS_TSV"
     while IFS=$'\x1f' read -r id hf gpus multi kvk kvv batch ubatch fa template envpairs note; do
-        local port log pid failed=0 waited=0
+        local port log pid model_path failed=0 waited=0
+        download_model_fast "$hf" "$CACHE_DIR" model_path || die "failed to download $hf"
         port="$(free_port "$next")"; next=$((port+1)); log="$STATE_DIR/logs/hermes-${id}.log"; : > "$log"
-        local -a cmd=("$LLAMA_SERVER" -hf "$hf" --alias "$id" --no-mmproj -ngl 999 -c "$CTX" -np 1 --cache-type-k "$kvk" --cache-type-v "$kvv" -b "$batch" -ub "$ubatch" -fa "$fa" --jinja --no-context-shift --host 127.0.0.1 --port "$port")
+        local -a cmd=("$LLAMA_SERVER" -m "$model_path" --alias "$id" --no-mmproj -ngl 999 -c "$CTX" -np 1 --cache-type-k "$kvk" --cache-type-v "$kvv" -b "$batch" -ub "$ubatch" -fa "$fa" --jinja --no-context-shift --host 127.0.0.1 --port "$port")
         [[ "$multi" == 1 ]] && cmd+=(--split-mode layer)
         [[ "$template" == qwen-fixed ]] && cmd+=(--chat-template-file "$QWEN_TEMPLATE")
         local -a envcmd=(env "CUDA_VISIBLE_DEVICES=$gpus" "LLAMA_CACHE=$CACHE_DIR" "GGML_CUDA_ENABLE_UNIFIED_MEMORY=0" "CUDA_SCALE_LAUNCH_QUEUES=4x")
@@ -451,6 +454,7 @@ while (($#)); do
         --cli) UI=cli; shift ;;
         --resume) RESUME=1; shift ;;
         --local-cache) [[ $# -ge 2 ]] || die "--local-cache needs a directory"; CACHE_DIR="$2"; shift 2 ;;
+        --no-parallel) PUSHBUTTON_NO_PARALLEL=1; shift ;;
         --local-context) [[ $# -ge 2 ]] || die "--local-context needs a value"; CTX="$2"; shift 2 ;;
         --local-client-context) [[ $# -ge 2 ]] || die "--local-client-context needs a value"; CLIENT_CTX="$2"; shift 2 ;;
         --local-port-base) [[ $# -ge 2 ]] || die "--local-port-base needs a value"; PORT_BASE="$2"; shift 2 ;;

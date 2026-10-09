@@ -441,6 +441,29 @@ Frontend-specific CLIs are installed automatically when practical.
 
 ---
 
+## Download Speed
+
+`claude-local`, `coder-local`, and `hermes-local` download model weights before
+starting llama.cpp, with live download progress in the terminal. They use
+**aria2c** automatically: up to four simultaneous files and three connections
+per file, with resumable chunks. On Linux, a missing aria2c triggers a silent,
+non-interactive apt/dnf installation attempt (bounded to 30 seconds plus cleanup).
+No password prompts or manual installation are required. If installation or the
+parallel download fails, the launcher falls back to the Hugging Face CLI,
+automatically installing it in a private runtime virtual environment if needed.
+
+Use `--no-parallel` to skip aria2c and its installation, for example:
+
+```bash
+claude-local qwen3.8:27b --no-parallel --local-cache /mnt/models
+```
+
+Parallel downloads can substantially improve throughput, but **5–10× is not
+guaranteed**: network speed, Hugging Face rate limits, and storage matter.
+Metadata and disk-space validation still apply in sequential mode. Network,
+authentication, or disk errors are reported rather than starting a server with
+incomplete weights. See [STORAGE.md](STORAGE.md) for storage and resume details.
+
 ## License
 
 MIT

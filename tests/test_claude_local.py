@@ -217,6 +217,7 @@ class ContextPolicyTests(unittest.TestCase):
             user_config.write_text('{"autoCompactEnabled":false}')
             script = tmp / "launch.sh"
             functions = (ROOT / "claude-local").read_text().split("\nrequire_files\n", 1)[0]
+            functions = functions.replace('ROOT="$(cd "$(dirname "$SELF")" && pwd)"', f"ROOT={shlex.quote(str(ROOT))}")
             script.write_text(functions + f"\nPLAN_FILE={shlex.quote(str(plan))}\n"
                               f"GATEWAY_CONFIG={shlex.quote(str(config))}\nSTATE_DIR={shlex.quote(str(tmp / 'state'))}\n"
                               "GATEWAY_PORT=18180\nCLAUDE_ARGS=(--resume SESSION)\nrun_claude\n")
@@ -248,6 +249,7 @@ class ContextPolicyTests(unittest.TestCase):
     def test_missing_python_bootstraps_before_policy_without_gpu(self):
         launcher = (ROOT / "claude-local").read_text()
         functions = launcher.split("\nrequire_files\n", 1)[0]
+        functions = functions.replace('ROOT="$(cd "$(dirname "$SELF")" && pwd)"', f"ROOT={shlex.quote(str(ROOT))}")
         startup = launcher[launcher.index("\nif ! have_cmd python3; then"):launcher.index('\nmkdir -p "$STATE_DIR" "$CACHE_DIR"; PLAN_FILE=')]
         with tempfile.TemporaryDirectory() as tmp:
             script = pathlib.Path(tmp) / "bootstrap.sh"
@@ -272,6 +274,7 @@ class GatewayBudgetHTTPTests(unittest.TestCase):
         self.count_fail_once = False
         self.inference_fail_once = False
         self.inference_mode = "json"
+        self.inference_result = None
         test = self
 
         class Backend(BaseHTTPRequestHandler):
@@ -306,6 +309,8 @@ class GatewayBudgetHTTPTests(unittest.TestCase):
                         test.inference_fail_once = False
                     response = {"type": "message", "content": []} if status == 200 else {
                         "type": "error", "error": {"type": "invalid_request_error", "message": "request exceeds the available context size"}}
+                    if test.inference_result is not None:
+                        response = test.inference_result
                     if test.inference_mode == "sse":
                         self.send_response(200)
                         self.send_header("content-type", "text/event-stream")
@@ -352,12 +357,14 @@ class GatewayBudgetHTTPTests(unittest.TestCase):
             self.addCleanup(server.server_close)
             self.addCleanup(server.shutdown)
 
-    def request(self, body=None, path="/v1/messages"):
+    def request(self, body=None, path="/v1/messages", tools=True):
         body = body or {"model": "claude-haiku-4-5", "max_tokens": 8192,
                         "system": [{"type": "text", "text": "system"}],
                         "tools": [{"name": "test", "input_schema": {"type": "object"}}],
                         "messages": [{"role": "assistant", "content": [{"type": "tool_use", "id": "t", "name": "test", "input": {}}]},
                                      {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": "x" * 50000}]}]}
+        if not tools:
+            body.pop("tools", None)
         conn = http.client.HTTPConnection("127.0.0.1", self.gateway.server_port, timeout=5)
         self.addCleanup(conn.close)
         conn.request("POST", path, json.dumps(body), {"content-type": "application/json"})
@@ -444,16 +451,42 @@ class GatewayBudgetHTTPTests(unittest.TestCase):
         for mode in ("sse", "truncated-sse"):
             self.requests.clear()
             self.inference_mode = mode
-            self.assertEqual(self.request()[0], 200)
+            self.assertEqual(self.request(tools=False)[0], 200)
             self.assertEqual(sum(p == "/v1/messages" for p, _ in self.requests), 1)
 
     def test_empty_stream_can_retry_before_commit(self):
         self.inference_mode = "empty-once"
-        status, raw, _ = self.request()
+        status, raw, _ = self.request(tools=False)
         self.assertEqual(status, 200)
         self.assertIn(b"message_start", raw)
         self.assertEqual(sum(p == "/v1/messages" for p, _ in self.requests), 2)
         self.assertEqual(sum(p == "/v1/messages/count_tokens" for p, _ in self.requests), 1)
+
+    def test_preflight_counts_same_policy_payload_as_tool_inference(self):
+        self.assertEqual(self.request()[0], 200)
+        counted, inferred = (body for _, body in self.requests)
+        self.assertEqual(counted, inferred)
+        self.assertEqual(counted["temperature"], 0.0)
+        self.assertFalse(counted["chat_template_kwargs"]["enable_thinking"])
+        self.assertFalse(counted["chat_template_kwargs"]["preserve_thinking"])
+        self.assertFalse(counted["chat_template_kwargs"]["preserve_reasoning"])
+
+    def test_malformed_tool_response_is_rejected_before_commit_without_recount(self):
+        self.inference_result = {"type": "message", "content": [
+            {"type": "tool_use", "id": "t", "name": "test", "input": "not an object"}]}
+        status, raw, _ = self.request()
+        self.assertEqual(status, 502)
+        self.assertIn(b"invalid backend tool arguments", raw)
+        self.assertEqual([p for p, _ in self.requests],
+                         ["/v1/messages/count_tokens", "/v1/messages", "/v1/messages"])
+
+    def test_valid_tool_response_preserved_after_budget_check(self):
+        self.inference_result = {"type": "message", "content": [
+            {"type": "tool_use", "id": "t", "name": "test", "input": {}}]}
+        status, raw, _ = self.request()
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(raw), self.inference_result)
+        self.assertEqual([p for p, _ in self.requests], ["/v1/messages/count_tokens", "/v1/messages"])
 
     def test_startup_cli_reports_effective_capacity_version_and_resume_warning(self):
         with tempfile.TemporaryDirectory() as tmp:

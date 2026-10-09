@@ -8,15 +8,23 @@ SYSTEM=0
 [[ "${1:-}" == --system ]] && { SYSTEM=1; shift; }
 SELECT=0
 [[ "${1:-}" == --select ]] && { SELECT=1; shift; }
+INSTALL_ONLY="${PUSHBUTTON_INSTALL_ONLY:-0}"
+[[ "${1:-}" == --install-only ]] && { INSTALL_ONLY=1; shift; }
 command -v git >/dev/null || { echo "git is required" >&2; exit 1; }
 mkdir -p "$ROOT"
 if [[ -d "$DEST/.git" ]]; then
   git -C "$DEST" fetch --depth=1 origin "$REF"
-  git -C "$DEST" checkout -q --detach FETCH_HEAD
+  # This is an installer-managed immutable checkout, not a user worktree.
+  # Always replace local edits/stale generated changes with the requested ref.
+  git -C "$DEST" checkout -q -f --detach FETCH_HEAD
 else
   git clone --depth=1 --branch "$REF" "$REPO_URL" "$DEST"
 fi
-chmod +x "$DEST/coder-local" "$DEST/opencode-local" "$DEST/deepseek-local" "$DEST/mini-swe-local" "$DEST/pushbutton-backend" "$DEST/pushbutton-bench" "$DEST/pushbutton-select" "$DEST/pushbutton-observe"
+chmod +x \
+  "$DEST/pushbutton" "$DEST/pushbutton-instance" "$DEST/pushbutton-broker" "$DEST/pushbutton-proxy" \
+  "$DEST/claude-local" "$DEST/claude-local-safe" "$DEST/coder-local" "$DEST/qwen-local" \
+  "$DEST/opencode-local" "$DEST/deepseek-local" "$DEST/mini-swe-local" \
+  "$DEST/pushbutton-backend" "$DEST/pushbutton-bench" "$DEST/pushbutton-select" "$DEST/pushbutton-observe"
 
 install_wrapper(){
   local target="$1" body="$2" tmp="$ROOT/.coder-shim.$$"
@@ -27,16 +35,26 @@ install_wrapper(){
 }
 
 qwen_defaults="$(printf '%q' "$DEST/configs/qwen-local-defaults.json")"
-qwen_body="env QWEN_CODE_SYSTEM_DEFAULTS_PATH=$qwen_defaults $(printf '%q' "$DEST/coder-local") --frontend qwen"
+claude_body="$(printf '%q' "$DEST/claude-local-safe")"
+qwen_body="env QWEN_CODE_SYSTEM_DEFAULTS_PATH=$qwen_defaults $(printf '%q' "$DEST/qwen-local")"
 opencode_body="$(printf '%q' "$DEST/opencode-local")"
 deepseek_body="$(printf '%q' "$DEST/deepseek-local")"
 mini_body="$(printf '%q' "$DEST/mini-swe-local")"
+pushbutton_body="$(printf '%q' "$DEST/pushbutton")"
+instance_body="$(printf '%q' "$DEST/pushbutton-instance")"
+broker_body="$(printf '%q' "$DEST/pushbutton-broker")"
+proxy_body="$(printf '%q' "$DEST/pushbutton-proxy")"
 backend_body="$(printf '%q' "$DEST/pushbutton-backend")"
 bench_body="$(printf '%q' "$DEST/pushbutton-bench")"
 select_body="$(printf '%q' "$DEST/pushbutton-select")"
 observe_body="$(printf '%q' "$DEST/pushbutton-observe")"
 
 for spec in \
+ "$HOME/.local/bin/pushbutton|$pushbutton_body" \
+ "$HOME/.local/bin/claude-local|$claude_body" \
+ "$HOME/.local/bin/pushbutton-instance|$instance_body" \
+ "$HOME/.local/bin/pushbutton-broker|$broker_body" \
+ "$HOME/.local/bin/pushbutton-proxy|$proxy_body" \
  "$HOME/.local/bin/qwen-local|$qwen_body" \
  "$HOME/.local/bin/opencode-local|$opencode_body" \
  "$HOME/.local/bin/deepseek-local|$deepseek_body" \
@@ -49,6 +67,11 @@ for spec in \
 done
 
 if ((SYSTEM)); then
+  install_wrapper /usr/local/bin/pushbutton "$pushbutton_body"
+  install_wrapper /usr/local/bin/claude-local "$claude_body"
+  install_wrapper /usr/local/bin/pushbutton-instance "$instance_body"
+  install_wrapper /usr/local/bin/pushbutton-broker "$broker_body"
+  install_wrapper /usr/local/bin/pushbutton-proxy "$proxy_body"
   install_wrapper /usr/local/bin/qwen-local "$qwen_body"
   install_wrapper /usr/local/bin/opencode-local "$opencode_body"
   install_wrapper /usr/local/bin/deepseek-local "$deepseek_body"
@@ -59,12 +82,11 @@ if ((SYSTEM)); then
   install_wrapper /usr/local/bin/pushbutton-observe "$observe_body"
 fi
 
-printf '[pushbutton] Installed coder frontends: qwen-local, opencode-local, deepseek-local, mini-swe-local\n'
-printf '[pushbutton] Installed backend tools: pushbutton-backend, pushbutton-bench, pushbutton-select, pushbutton-observe\n'
-printf '[pushbutton] Qwen Code web MCP: Exa search + fetch enabled by default\n'
+printf '[pushbutton] Installed unified runtime: pushbutton\n'
+printf '[pushbutton] Installed Claude Code local frontend: claude-local (llama.cpp/HF GGUF; Ollama-isolated; JSON tool calls)\n'
+printf '[pushbutton] Expert frontends/tools remain available: qwen-local, opencode-local, deepseek-local, mini-swe-local, pushbutton-select, pushbutton-bench, pushbutton-observe\n'
 
 export QWEN_CODE_SYSTEM_DEFAULTS_PATH="$DEST/configs/qwen-local-defaults.json"
+if ((INSTALL_ONLY)); then exit 0; fi
 if ((SELECT)); then exec "$DEST/pushbutton-select" "$@"; fi
-if (($#)); then exec "$DEST/coder-local" --frontend qwen "$@"; fi
-if [[ -t 0 && -t 1 ]]; then exec "$DEST/pushbutton-select"; fi
-exec "$DEST/coder-local" --frontend qwen --help
+exec "$DEST/pushbutton" "$@"
