@@ -399,7 +399,7 @@ class StartupTests(unittest.TestCase):
         shutil.copy2(ROOT / "lib" / "claude_local_entry.sh", entry)
         (template / "configs").mkdir(exist_ok=True)
         (template / "configs" / "backend-registry.json").write_text("{}")
-        (template / ".git").mkdir()
+        (template / ".git").mkdir(exist_ok=True)
         git = self.bin / "git"
         git.write_text("#!" + sys.executable + "\nimport os, pathlib, shutil, sys\n"
                        "args = sys.argv[1:]\n"
