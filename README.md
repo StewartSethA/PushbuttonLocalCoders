@@ -141,7 +141,13 @@ claude-local nemotron-3.5-lightning qwen3.6:35b qwen3.8:27b --resume
 
 `claude-local` maps one to four positional models onto Haiku/Sonnet/Opus/Fable,
 starts the needed local backends, injects local subagents, and passes normal
-Claude Code flags through unchanged.
+Claude Code flags through, with validation of context-policy overrides.
+
+It verifies live llama.cpp **per-slot capacity**, derives explicit Claude
+auto-compaction/output budgets, and checks the full native-tokenized request
+before inference. Auto-compaction alone cannot prevent every oversized tool
+result or resumed transcript. See [context budgeting and recovery](CLAUDE_LOCAL.md#context-budgeting-and-auto-compaction)
+for version requirements, isolated settings, and safe overrides.
 
 ### Hermes Bot Mode
 
@@ -430,10 +436,22 @@ tradeoff than allocating 262K merely because it fits:
 
 ```bash
 claude-local qwen3.8:27b \
-  --local-context 131072 \
-  --local-client-context 100000 \
-  --resume
+  --local-context 131072
 ```
+
+The client budget is derived automatically from verified backend capacity.
+With a 131,072-token slot, defaults are a 114,688-token custom-model window,
+106,496-token compaction window and 8,192-token output budget, plus reserves.
+Claude Code 2.1.221+ and native llama.cpp Anthropic counting are required.
+Settings/sessions are isolated under `$CLAUDE_LOCAL_STATE/claude-config`;
+ordinary user/project settings (including permission customizations) are not loaded.
+
+`147023 > 131072` is a context-budget error, **not a network error**.
+The old client-budget ≤ requested-context check was insufficient.
+Lowering a threshold does not retroactively fix an oversized saved transcript:
+even `/compact` may fail. Start a **new session** with a saved handoff summary,
+without `--resume`/`--continue`; only use a temporary larger backend when its
+model/hardware fit has been verified. Do not blindly increase context or VRAM.
 
 ---
 

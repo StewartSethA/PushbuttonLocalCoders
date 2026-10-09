@@ -1,8 +1,17 @@
 #!/usr/bin/env python3
 import importlib.util
+import http.client
+import json
+import os
 import pathlib
+import shlex
+import subprocess
 import sys
+import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -16,6 +25,7 @@ def load(name, path):
 
 
 planmod = load("claude_local_plan", ROOT / "lib" / "claude_local_plan.py")
+budgetmod = load("claude_local_budget", ROOT / "lib" / "claude_local_budget.py")
 gwmod = load("claude_local_gateway", ROOT / "lib" / "claude_local_gateway.py")
 
 
@@ -50,7 +60,8 @@ class GatewayTests(unittest.TestCase):
     def setUp(self):
         cfg = {
             "roles": {
-                r: {"model_id": "local-" + r, "backend_alias": "local-" + r, "url": "http://127.0.0.1:1"}
+                r: {"model_id": "local-" + r, "backend_alias": "local-" + r, "url": "http://127.0.0.1:1",
+                    "context_capacity": 131072, "prompt_reserve": 8192}
                 for r in ("haiku", "sonnet", "opus", "fable")
             }
         }
@@ -64,6 +75,449 @@ class GatewayTests(unittest.TestCase):
 
     def test_unknown_internal_model_stays_local(self):
         self.assertEqual(self.router.resolve("unexpected-internal-id")["model_id"], "local-sonnet")
+
+
+class ContextPolicyTests(unittest.TestCase):
+    def test_derived_131072_budget(self):
+        p = budgetmod.context_policy(131072, env={})
+        self.assertEqual(p["client_context"], 114688)
+        self.assertEqual(p["compact_window"], 106496)
+        self.assertEqual(p["max_output_tokens"], 8192)
+        self.assertEqual(sum(p[x] for x in ("compact_window", "max_output_tokens", "prompt_reserve", "compact_reserve")), 131072)
+        self.assertEqual(budgetmod.context_policy(262144, env={})["client_context"], 200000)
+
+    def test_safe_lower_overrides(self):
+        p = budgetmod.context_policy(131072, "110000", {
+            "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "105000",
+            "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "100000",
+            "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "4096"})
+        self.assertEqual((p["client_context"], p["compact_window"], p["max_output_tokens"]), (105000, 100000, 4096))
+
+    def test_unsafe_explicit_overrides(self):
+        for client, env in [
+            ("131072", {}), ("200000", {}), ("99999", {}),
+            ("", {"CLAUDE_CODE_MAX_CONTEXT_TOKENS": "200000"}),
+            ("", {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "131072"}),
+            ("", {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "99999"}),
+            ("", {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "100k"}),
+            ("", {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": "32000"}),
+            ("", {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": "0"}),
+        ]:
+            with self.subTest(client=client, env=env), self.assertRaises(budgetmod.BudgetError):
+                budgetmod.context_policy(131072, client, env)
+
+    def test_disabled_compaction_and_legacy_override(self):
+        for name in ("DISABLE_AUTO_COMPACT", "DISABLE_COMPACT", "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"):
+            with self.subTest(name=name), self.assertRaisesRegex(budgetmod.BudgetError, name):
+                budgetmod.context_policy(131072, env={name: "1"})
+
+    def test_below_documented_minimum_fails_without_clamping(self):
+        for capacity in (32768, 99999, 100000, 120000):
+            with self.subTest(capacity=capacity), self.assertRaisesRegex(budgetmod.BudgetError, "minimum"):
+                budgetmod.context_policy(capacity, env={})
+
+    def test_official_per_slot_metadata_not_native_context(self):
+        self.assertEqual(budgetmod.effective_context({
+            "total_slots": 1, "n_ctx_train": 262144,
+            "default_generation_settings": {"n_ctx": 131072}}), 131072)
+        for props in ({}, {"total_slots": 2, "default_generation_settings": {"n_ctx": 262144}},
+                      {"total_slots": 1, "default_generation_settings": {"n_ctx": 0}}):
+            with self.assertRaises(budgetmod.BudgetError):
+                budgetmod.effective_context(props)
+
+    def test_all_roles_use_smallest_runtime_capacity_and_report_mismatch(self):
+        plan = {"role_ids": dict(zip(("haiku", "sonnet", "opus", "fable"), ("small", "large", "large", "large")))}
+
+        def backend(url, body=None):
+            if url.endswith("/props"):
+                return {"total_slots": 1, "default_generation_settings": {"n_ctx": 131072 if ":1/" in url else 262144}}
+            self.assertIn("system", body)
+            self.assertIn("tools", body)
+            return {"input_tokens": 40}
+
+        with mock.patch.object(budgetmod, "request_json", side_effect=backend), mock.patch("sys.stderr") as stderr:
+            cfg = budgetmod.prepare_config(plan, {"small": 1, "large": 2}, 262144, "", {})
+        self.assertEqual(cfg["budget"]["capacity"], 131072)
+        self.assertEqual(cfg["roles"]["fable"]["context_capacity"], 262144)
+        self.assertTrue(stderr.write.called)
+        with mock.patch.object(budgetmod, "request_json", side_effect=backend), self.assertRaises(budgetmod.BudgetError):
+            budgetmod.prepare_config(plan, {"small": 1, "large": 2}, 262144, "200000", {})
+
+    def test_unavailable_metadata_or_tokenizer_refuses_launch(self):
+        plan = {"role_ids": {"sonnet": "local"}}
+        for replies in ([{}], [{"total_slots": 1, "default_generation_settings": {"n_ctx": 131072}}, {}]):
+            with mock.patch.object(budgetmod, "request_json", side_effect=replies), self.assertRaisesRegex(budgetmod.BudgetError, "Claude was not launched"):
+                budgetmod.prepare_config(plan, {"local": 1}, 131072, "", {})
+
+    def test_unsafe_frontend_and_provider_flags(self):
+        for args, env in [(["--model", "sonnet[1m]"], {}), (["--autocompact=off"], {}),
+                          (["--settings", '{"autoCompactEnabled":false}'], {}),
+                          (["--setting-sources=user"], {}), ([], {"CLAUDE_CODE_USE_VERTEX": "1"})]:
+            with self.subTest(args=args, env=env), self.assertRaises(budgetmod.BudgetError):
+                budgetmod.validate_claude_args(args, env)
+                budgetmod.frontend_policy_env(args, env)
+        budgetmod.validate_claude_args(["--model", "claude-opus-5", "--resume", "SESSION"], {})
+
+    def test_safe_frontend_compaction_window_preserved(self):
+        env = budgetmod.frontend_policy_env(["--autocompact", "100000"], {})
+        self.assertEqual(budgetmod.context_policy(131072, env=env)["compact_window"], 100000)
+        env = budgetmod.frontend_policy_env(["--autocompact=120000"], {})
+        with self.assertRaises(budgetmod.BudgetError):
+            budgetmod.context_policy(131072, env=env)
+
+    def test_managed_settings_conflicts_fail_clearly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "managed-settings.json"
+            for settings in ({"autoCompactEnabled": False}, {"env": {"DISABLE_COMPACT": "1"}},
+                             {"env": {"ANTHROPIC_BASE_URL": "https://example.invalid"}}):
+                path.write_text(json.dumps(settings))
+                with self.assertRaisesRegex(budgetmod.BudgetError, "administrator"):
+                    budgetmod.validate_managed_settings(path)
+            path.write_text('{"autoCompactEnabled":true}')
+            budgetmod.validate_managed_settings(path)
+            directory = path.with_suffix(".d")
+            directory.mkdir()
+            (directory / "10-disable.json").write_text('{"autoCompactEnabled":false}')
+            with self.assertRaises(budgetmod.BudgetError):
+                budgetmod.validate_managed_settings(path)
+            (directory / "20-enable.json").write_text('{"autoCompactEnabled":true}')
+            budgetmod.validate_managed_settings(path)
+            (directory / "30-provider.json").write_text('{"env":{"ANTHROPIC_BASE_URL":"https://example.invalid"}}')
+            with self.assertRaises(budgetmod.BudgetError):
+                budgetmod.validate_managed_settings(path)
+
+    def test_installed_claude_feature_verification(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            claude = pathlib.Path(tmp) / "claude"
+            claude.write_text("#!/bin/sh\n# CLAUDE_CODE_AUTO_COMPACT_WINDOW CLAUDE_CODE_MAX_CONTEXT_TOKENS CLAUDE_CODE_MAX_OUTPUT_TOKENS\n"
+                              "if [ \"$1\" = --help ]; then echo '--autocompact --settings --setting-sources'; else echo '2.1.221 (mock Claude)'; fi\n")
+            claude.chmod(0o755)
+            with mock.patch.object(budgetmod.shutil, "which", return_value=str(claude)):
+                self.assertEqual(budgetmod.claude_capabilities(), "2.1.221 (mock Claude)")
+                claude.write_text("#!/bin/sh\necho '2.1.221 (opaque wrapper)'\n")
+                with self.assertRaisesRegex(budgetmod.BudgetError, "cannot verify"):
+                    budgetmod.claude_capabilities()
+                claude.write_text("#!/bin/sh\necho '2.1.220 (old Claude)'\n")
+                with self.assertRaisesRegex(budgetmod.BudgetError, "2.1.221"):
+                    budgetmod.claude_capabilities()
+
+    def test_mock_claude_launch_exports_policy_and_isolates_settings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            capture = tmp / "capture.json"
+            claude = tmp / "claude"
+            claude.write_text("#!/usr/bin/env python3\nimport json,os,sys\n"
+                              "json.dump({'args':sys.argv[1:],'env':dict(os.environ)},open(os.environ['CAPTURE'],'w'))\n")
+            claude.chmod(0o755)
+            plan = tmp / "plan.json"
+            plan.write_text(json.dumps({"role_ids": {r: "local-" + r for r in ("haiku", "sonnet", "opus", "fable")}}))
+            config = tmp / "gateway.json"
+            config.write_text(json.dumps({"budget": budgetmod.context_policy(131072, env={})}))
+            user_config = tmp / ".claude.json"
+            user_config.write_text('{"autoCompactEnabled":false}')
+            script = tmp / "launch.sh"
+            functions = (ROOT / "claude-local").read_text().split('\ncase "${1:-}" in\n', 1)[0]
+            functions = functions.replace('ROOT="$(cd "$(dirname "$SELF")" && pwd)"', f"ROOT={shlex.quote(str(ROOT))}")
+            script.write_text(functions + f"\nPLAN_FILE={shlex.quote(str(plan))}\n"
+                              f"GATEWAY_CONFIG={shlex.quote(str(config))}\nSTATE_DIR={shlex.quote(str(tmp / 'state'))}\n"
+                              "GATEWAY_PORT=18180\nCLAUDE_ARGS=(--resume SESSION)\nrun_claude\n")
+            env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "DISABLE_"))}
+            env.update(HOME=str(tmp), PATH=str(tmp) + ":" + os.environ["PATH"], CAPTURE=str(capture))
+            result = subprocess.run(["bash", str(script)], env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            captured = json.loads(capture.read_text())
+            self.assertEqual(captured["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "114688")
+            self.assertEqual(captured["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "106496")
+            self.assertEqual(captured["env"]["CLAUDE_CODE_MAX_OUTPUT_TOKENS"], "8192")
+            self.assertEqual(captured["env"]["CLAUDE_CONFIG_DIR"], str(tmp / "state" / "claude-config"))
+            self.assertIn("--resume", captured["args"])
+            i = captured["args"].index("--setting-sources")
+            self.assertEqual(captured["args"][i + 1], "")
+            i = captured["args"].index("--settings")
+            self.assertTrue(json.loads(captured["args"][i + 1])["autoCompactEnabled"])
+            self.assertEqual(user_config.read_text(), '{"autoCompactEnabled":false}')
+
+    def test_launcher_rejects_unsafe_flags_before_dependencies(self):
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "DISABLE_"))}
+        for args in (["--local-context", "131072", "--local-client-context", "200000"],
+                     ["--local-context", "65536"], ["--model", "sonnet[1m]"]):
+            result = subprocess.run(["bash", str(ROOT / "claude-local"), "q38", *args], env=env, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Context policy error", result.stderr)
+            self.assertNotIn("Installing", result.stdout)
+
+    def test_missing_python_bootstraps_before_policy_without_gpu(self):
+        launcher = (ROOT / "claude-local").read_text()
+        functions = launcher.split('\ncase "${1:-}" in\n', 1)[0]
+        functions = functions.replace('ROOT="$(cd "$(dirname "$SELF")" && pwd)"', f"ROOT={shlex.quote(str(ROOT))}")
+        startup = launcher[launcher.index("\nif ! have_cmd python3; then"):launcher.index('\nsource "$LIB/pushbutton_folders.sh"\ninitialize_folders')]
+        startup += launcher[launcher.index("\nif [[ $DRY_RUN -eq 0 ]]; then install_base_deps; ensure_nvidia_driver;"):launcher.index('\nmkdir -p "$STATE_DIR" "$CACHE_DIR"; PLAN_FILE=')]
+        with tempfile.TemporaryDirectory() as tmp:
+            script = pathlib.Path(tmp) / "bootstrap.sh"
+            script.write_text(functions + """
+have_cmd() { [[ "$1" != python3 ]]; }
+install_base_deps() { printf 'deps\\n'; }
+python3() { printf 'policy\\n'; }
+ensure_nvidia_driver() { printf 'driver\\n'; }
+""" + startup)
+            result = subprocess.run(["bash", str(script)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.splitlines(), ["deps", "policy", "deps", "driver"])
+
+
+class GatewayBudgetHTTPTests(unittest.TestCase):
+    def setUp(self):
+        self.requests = []
+        self.prompt_tokens = 100
+        self.inference_status = 200
+        self.count_status = 200
+        self.count_result = None
+        self.count_fail_once = False
+        self.inference_fail_once = False
+        self.inference_mode = "json"
+        self.inference_result = None
+        test = self
+
+        class Backend(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *_):
+                pass
+
+            def do_GET(self):
+                raw = json.dumps({"total_slots": 1, "default_generation_settings": {"n_ctx": 131072}}).encode()
+                self.send_response(200)
+                self.send_header("content-length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["content-length"])))
+                test.requests.append((self.path, body))
+                if self.path.endswith("/count_tokens"):
+                    status = test.count_status
+                    if test.count_fail_once:
+                        status = 503
+                        test.count_fail_once = False
+                    response = {"input_tokens": test.prompt_tokens} if status == 200 else {
+                        "type": "error", "error": {"type": "invalid_request_error", "message": "prompt is too long"}}
+                    if test.count_result is not None:
+                        response = test.count_result
+                else:
+                    status = test.inference_status
+                    if test.inference_fail_once:
+                        status = 503
+                        test.inference_fail_once = False
+                    response = {"type": "message", "content": []} if status == 200 else {
+                        "type": "error", "error": {"type": "invalid_request_error", "message": "request exceeds the available context size"}}
+                    if test.inference_result is not None:
+                        response = test.inference_result
+                    if test.inference_mode == "sse":
+                        self.send_response(200)
+                        self.send_header("content-type", "text/event-stream")
+                        self.send_header("connection", "close")
+                        self.end_headers()
+                        self.wfile.write(b'event: message_start\ndata: {"type":"message_start"}\n\n')
+                        self.wfile.flush()
+                        self.close_connection = True
+                        return
+                    if test.inference_mode == "empty-once":
+                        test.inference_mode = "sse"
+                        self.send_response(200)
+                        self.send_header("content-type", "text/event-stream")
+                        self.send_header("connection", "close")
+                        self.end_headers()
+                        self.close_connection = True
+                        return
+                    if test.inference_mode == "truncated-sse":
+                        self.send_response(200)
+                        self.send_header("content-type", "text/event-stream")
+                        self.send_header("content-length", "10000")
+                        self.end_headers()
+                        self.wfile.write(b"event: message_start\ndata: {}\n\n")
+                        self.wfile.flush()
+                        self.close_connection = True
+                        return
+                raw = json.dumps(response).encode()
+                self.send_response(status)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+        self.backend = ThreadingHTTPServer(("127.0.0.1", 0), Backend)
+        url = f"http://127.0.0.1:{self.backend.server_port}"
+        self.gateway = ThreadingHTTPServer(("127.0.0.1", 0), gwmod.Handler)
+        self.gateway.router = gwmod.Router({"roles": {
+            r: {"model_id": "local-" + r, "backend_alias": "backend-" + r, "url": url,
+                "context_capacity": 131072 if r == "haiku" else 262144, "prompt_reserve": 8192}
+            for r in ("haiku", "sonnet", "opus", "fable")}})
+        self.gateway.verbose = False
+        for server in (self.backend, self.gateway):
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            self.addCleanup(server.server_close)
+            self.addCleanup(server.shutdown)
+
+    def request(self, body=None, path="/v1/messages", tools=True):
+        body = body or {"model": "claude-haiku-4-5", "max_tokens": 8192,
+                        "system": [{"type": "text", "text": "system"}],
+                        "tools": [{"name": "test", "input_schema": {"type": "object"}}],
+                        "messages": [{"role": "assistant", "content": [{"type": "tool_use", "id": "t", "name": "test", "input": {}}]},
+                                     {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": "x" * 50000}]}]}
+        if not tools:
+            body.pop("tools", None)
+        conn = http.client.HTTPConnection("127.0.0.1", self.gateway.server_port, timeout=5)
+        self.addCleanup(conn.close)
+        conn.request("POST", path, json.dumps(body), {"content-type": "application/json"})
+        resp = conn.getresponse()
+        try:
+            raw = resp.read()
+        except http.client.IncompleteRead as exc:
+            raw = exc.partial
+        return resp.status, raw, body
+
+    def test_147023_tokens_rejected_before_inference_and_without_truncation(self):
+        self.prompt_tokens = 147023
+        status, raw, original = self.request()
+        error = json.loads(raw)["error"]
+        self.assertEqual(status, 400)
+        self.assertEqual(error["type"], "invalid_request_error")
+        self.assertIn("147023 input tokens", error["message"])
+        self.assertIn("131072 tokens", error["message"])
+        self.assertIn("resumed transcript", error["message"])
+        self.assertEqual([p for p, _ in self.requests], ["/v1/messages/count_tokens"])
+        counted = self.requests[0][1]
+        self.assertEqual(counted["messages"], original["messages"])
+        self.assertEqual(counted["system"], original["system"])
+        self.assertEqual(counted["tools"], original["tools"])
+        self.assertEqual(counted["max_tokens"], original["max_tokens"])
+
+    def test_output_and_template_reserves_boundary(self):
+        self.prompt_tokens = 131072 - 8192 - 8192
+        self.assertEqual(self.request()[0], 200)
+        self.prompt_tokens += 1
+        self.gateway.router.token_counts.clear()
+        self.assertEqual(self.request()[0], 400)
+        self.assertEqual(sum(p == "/v1/messages" for p, _ in self.requests), 1)
+
+    def test_all_routes_apply_their_own_capacity(self):
+        self.prompt_tokens = 147023
+        for role in ("haiku", "sonnet", "opus", "fable"):
+            status, _, _ = self.request({"model": "claude-" + role + "-5", "max_tokens": 8192, "messages": []})
+            self.assertEqual(status, 400 if role == "haiku" else 200)
+        self.assertEqual(self.requests[-1][1]["model"], "backend-fable")
+
+    def test_inference_400_is_not_retried(self):
+        self.inference_status = 400
+        status, raw, _ = self.request()
+        self.assertEqual(status, 400)
+        self.assertIn(b"exceeds the available context size", raw)
+        self.assertEqual(sum(p == "/v1/messages" for p, _ in self.requests), 1)
+
+    def test_tokenizer_400_is_not_retried_or_inferred(self):
+        self.count_status = 400
+        self.assertEqual(self.request()[0], 400)
+        self.assertEqual(len(self.requests), 1)
+
+    def test_invalid_native_counts_fail_closed(self):
+        for result in ({}, {"input_tokens": -1}, {"input_tokens": "100"}, {"input_tokens": True}):
+            self.count_result = result
+            self.assertEqual(self.request()[0], 503)
+        self.assertFalse(any(p == "/v1/messages" for p, _ in self.requests))
+
+    def test_transient_tokenizer_and_inference_5xx_retry_before_commit(self):
+        self.count_fail_once = True
+        self.inference_fail_once = True
+        self.assertEqual(self.request()[0], 200)
+        self.assertEqual([p for p, _ in self.requests],
+                         ["/v1/messages/count_tokens", "/v1/messages/count_tokens", "/v1/messages", "/v1/messages"])
+
+    def test_count_endpoint_forwards_native_full_payload(self):
+        self.prompt_tokens = 147023
+        status, raw, body = self.request(path="/v1/messages/count_tokens")
+        self.assertEqual((status, json.loads(raw)["input_tokens"]), (200, 147023))
+        self.assertEqual(self.requests[0][1]["messages"], body["messages"])
+
+    def test_identical_count_then_inference_reuses_digest_only_cache(self):
+        _, _, body = self.request(path="/v1/messages/count_tokens")
+        self.assertEqual(self.request(body)[0], 200)
+        self.assertEqual(sum(p.endswith("/count_tokens") for p, _ in self.requests), 1)
+        self.assertEqual(sum(p == "/v1/messages" for p, _ in self.requests), 1)
+        keys = list(self.gateway.router.token_counts)
+        self.assertEqual(len(keys[0][1]), 32)
+        with mock.patch.object(gwmod.time, "monotonic", return_value=10**12):
+            self.assertIsNone(self.gateway.router.cached_count(keys[0]))
+
+    def test_stream_not_replayed_after_first_event_or_truncation(self):
+        for mode in ("sse", "truncated-sse"):
+            self.requests.clear()
+            self.inference_mode = mode
+            self.assertEqual(self.request(tools=False)[0], 200)
+            self.assertEqual(sum(p == "/v1/messages" for p, _ in self.requests), 1)
+
+    def test_empty_stream_can_retry_before_commit(self):
+        self.inference_mode = "empty-once"
+        status, raw, _ = self.request(tools=False)
+        self.assertEqual(status, 200)
+        self.assertIn(b"message_start", raw)
+        self.assertEqual(sum(p == "/v1/messages" for p, _ in self.requests), 2)
+        self.assertEqual(sum(p == "/v1/messages/count_tokens" for p, _ in self.requests), 1)
+
+    def test_preflight_counts_same_policy_payload_as_tool_inference(self):
+        self.assertEqual(self.request()[0], 200)
+        counted, inferred = (body for _, body in self.requests)
+        self.assertEqual(counted, inferred)
+        self.assertEqual(counted["temperature"], 0.0)
+        self.assertFalse(counted["chat_template_kwargs"]["enable_thinking"])
+        self.assertFalse(counted["chat_template_kwargs"]["preserve_thinking"])
+        self.assertFalse(counted["chat_template_kwargs"]["preserve_reasoning"])
+
+    def test_malformed_tool_response_is_rejected_before_commit_without_recount(self):
+        self.inference_result = {"type": "message", "content": [
+            {"type": "tool_use", "id": "t", "name": "test", "input": "not an object"}]}
+        status, raw, _ = self.request()
+        self.assertEqual(status, 502)
+        self.assertIn(b"invalid backend tool arguments", raw)
+        self.assertEqual([p for p, _ in self.requests],
+                         ["/v1/messages/count_tokens", "/v1/messages", "/v1/messages"])
+
+    def test_valid_tool_response_preserved_after_budget_check(self):
+        self.inference_result = {"type": "message", "content": [
+            {"type": "tool_use", "id": "t", "name": "test", "input": {}}]}
+        status, raw, _ = self.request()
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(raw), self.inference_result)
+        self.assertEqual([p for p, _ in self.requests], ["/v1/messages/count_tokens", "/v1/messages"])
+
+    def test_startup_cli_reports_effective_capacity_version_and_resume_warning(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            claude = tmp / "claude"
+            claude.write_text("#!/bin/sh\n# CLAUDE_CODE_AUTO_COMPACT_WINDOW CLAUDE_CODE_MAX_CONTEXT_TOKENS CLAUDE_CODE_MAX_OUTPUT_TOKENS\n"
+                              "if [ \"$1\" = --help ]; then echo '--autocompact --settings --setting-sources'; else echo '2.1.221 (mock Claude)'; fi\n")
+            claude.chmod(0o755)
+            plan = tmp / "plan.json"
+            plan.write_text(json.dumps({"role_ids": {r: "local" for r in ("haiku", "sonnet", "opus", "fable")}}))
+            backends = tmp / "backends.tsv"
+            backends.write_text(f"local\t{self.backend.server_port}\trepo:quant\n")
+            config = tmp / "gateway.json"
+            env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "DISABLE_"))}
+            env["PATH"] = str(tmp) + ":" + os.environ["PATH"]
+            args = [sys.executable, str(ROOT / "lib" / "claude_local_budget.py"), "--requested", "262144",
+                    "--check-claude", "--plan", str(plan), "--backends", str(backends), "--config", str(config),
+                    "--", "--resume", "SESSION", "--model", "claude-opus-5"]
+            result = subprocess.run(args, env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for text in ("2.1.221", "requested context=262144", "effective per-slot=131072",
+                         "window=114688", "auto-compaction window=106496", "max output=8192",
+                         "prompt reserve=8192", "Resume warning", "recognized Claude IDs"):
+                self.assertIn(text, result.stdout)
+            self.assertIn("Context mismatch", result.stderr)
+            cfg = json.loads(config.read_text())
+            self.assertEqual(cfg["budget"]["capacity"], 131072)
+            self.assertEqual(len(cfg["roles"]), 4)
+            self.assertEqual(len(self.requests), 1)
+            self.assertEqual(self.requests[0][0], "/v1/messages/count_tokens")
 
 
 if __name__ == "__main__":

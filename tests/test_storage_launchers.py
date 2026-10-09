@@ -48,6 +48,9 @@ validate_download_space() { echo 'Error: Model requires 89 GiB but only 0 GiB fr
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertIn(str(self.root / "custom cache"), result.stdout)
                     self.assertIn("100 GiB free", result.stdout)
+                    if name == "claude-local":
+                        self.assertIn(str(self.root / "home/state/claude-config"), result.stdout)
+                        self.assertIn("isolated local settings/sessions", result.stdout)
 
     def test_disk_full_stops_before_backend_and_prints_quoted_log_hint(self):
         for name, marker, rows in (

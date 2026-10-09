@@ -280,7 +280,9 @@ def launch_command(frontend,models,result,context,client_context,launch_args):
  if frontend=='coder-local':command+=['--frontend','qwen']
  command+=models
  if frontend in CODER_FRONTENDS:command+=['--agents',str(result['agents'])]
- command+=['--local-context',str(context),'--local-client-context',str(client_context),*launch_args]
+ command+=['--local-context',str(context)]
+ if client_context is not None:command+=['--local-client-context',str(client_context)]
+ command+=launch_args
  return command
 
 def welcome(ap):
@@ -348,8 +350,8 @@ def main():
   if a.frontend in CODER_FRONTENDS:
    a.agents=positive_input('Independent workers',a.agents or len(models),8)
    if not a.ram_limit and not a.vram_limit:ram_cap,cap=ask_caps()
- client_context=min(200000,a.context) if a.client_context is None else a.client_context
- if not 0<client_context<=a.context:raise ValueError('client context must be positive and no larger than physical context')
+ client_context=(None if a.frontend=='claude-local' else min(200000,a.context)) if a.client_context is None else a.client_context
+ if client_context is not None and not 0<client_context<=a.context:raise ValueError('client context must be positive and no larger than physical context')
  if ram_cap is None:_,ram_cap=ram_info()
  tables={selector_model(m):rows_for(selector_model(m),gpu,cap,ram_cap,a.context,[gpu] if gpu else inv) for m in models}
  if not a.json:
@@ -385,7 +387,7 @@ def main():
   if 'roles' in result:print('  Shared roles: '+json.dumps(result['roles']))
   if launch_env:print('  Launch GPU pool: '+launch_env['PUSHBUTTON_SELECTOR_GPU_INDICES']+' (role planner rechecks this pool only)')
   print('  Spare GPUs: '+str([g['index'] for g in result['unused_gpus']]))
-  print(f'  Physical context: {a.context}; client context: {client_context}')
+  print(f'  Physical context: {a.context}; client context: {client_context if client_context is not None else "derived after backend capacity verification"}')
   print('  Host RAM minimum unknown; RAM ceiling is advisory, not enforcement.')
   print('  Resident endpoints are not automatically reused. Launchers choose free ports and recheck placement.')
   printable=['env',*(f'{key}={value}' for key,value in launch_env.items()),*command] if launch_env else command

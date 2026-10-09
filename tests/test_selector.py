@@ -229,6 +229,25 @@ class SelectorTests(unittest.TestCase):
         self.assertEqual(argv[-3:], ['--resume', '--', 'a prompt; $(not-a-command)'])
         self.assertEqual(os.getcwd(), cwd)
 
+    def test_claude_selector_preserves_derived_default_and_explicit_client_budget(self):
+        for budget in (None, '105000'):
+            with self.subTest(client_context=budget):
+                args = ['qwen3.8:27b', '--frontend', 'claude-local', '--context', '131072', '--json']
+                if budget is not None:
+                    args += ['--client-context', budget]
+                code, out, _, launch, _ = self.run_sel(*args, gpus=selector.workers.synthetic_3090(1))
+                self.assertEqual(code, 0)
+                obj = json.loads(out)
+                argv = obj['launch_argv']
+                self.assertEqual(argv[argv.index('--local-context') + 1], '131072')
+                if budget is None:
+                    self.assertIsNone(obj['client_context'])
+                    self.assertNotIn('--local-client-context', argv)
+                else:
+                    self.assertEqual(obj['client_context'], int(budget))
+                    self.assertEqual(argv[argv.index('--local-client-context') + 1], budget)
+                launch.assert_not_called()
+
     def test_reject_opaque_context_override(self):
         code, _, err, launch, inventory = self.run_sel(
             'qwen3.8:27b', '--launch-arg=--local-context', '--launch-arg=1')
