@@ -57,7 +57,8 @@ hermes-local --folders
 Normal startup prints storage paths (`--quiet` suppresses that banner) and each
 backend prints a safely quoted `tail -n 50 -F -- ...` log-follow command.
 Before model downloads, exact Hugging Face file metadata is checked against
-remaining disk space plus a 10 GiB reserve. Unknown sizes or insufficient space
+remaining disk space plus at least a 10 GiB reserve (the downloader also reserves
+5% of the filesystem if larger). Unknown sizes or insufficient space
 stop startup with status 2 rather than retrying a doomed download. VRAM planning
 is separate from this disk-space check.
 
@@ -469,6 +470,29 @@ For the new local coder path:
 Frontend-specific CLIs are installed automatically when practical.
 
 ---
+
+## Download Speed
+
+`claude-local`, `coder-local`, and `hermes-local` download model weights before
+starting llama.cpp, with live download progress in the terminal. They use
+**aria2c** automatically: up to four simultaneous files and three connections
+per file, with resumable chunks. On Linux, a missing aria2c triggers a silent,
+non-interactive apt/dnf installation attempt (bounded to 30 seconds plus cleanup).
+No password prompts or manual installation are required. If installation or the
+parallel download fails, the launcher falls back to the Hugging Face CLI,
+automatically installing it in a private runtime virtual environment if needed.
+
+Use `--no-parallel` to skip aria2c and its installation, for example:
+
+```bash
+claude-local qwen3.8:27b --no-parallel --local-cache /mnt/models
+```
+
+Parallel downloads can substantially improve throughput, but **5–10× is not
+guaranteed**: network speed, Hugging Face rate limits, and storage matter.
+Metadata and disk-space validation still apply in sequential mode. Network,
+authentication, or disk errors are reported rather than starting a server with
+incomplete weights. See [STORAGE.md](STORAGE.md) for storage and resume details.
 
 ## License
 

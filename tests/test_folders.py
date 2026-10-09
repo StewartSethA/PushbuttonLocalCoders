@@ -499,6 +499,22 @@ printf "%s\\n" "$STATE_DIR" "$CACHE_DIR"
                            self.mock_space(10), check=False)
         self.assertEqual(cp.returncode, 2)
 
+    def test_revision_download_cache_excludes_aria2_partial_files(self):
+        _, root = self.metadata()
+        directory = root / ("b" * 40)
+        directory.mkdir()
+        cached = directory / "model-Q4_K_M.gguf"
+        with cached.open("wb") as stream:
+            stream.truncate(3 * GIB)
+        cp = self.run_bash("load_folder_config; validate_download_space owner/repo:Q4_K_M",
+                           self.mock_space(10))
+        self.assertIn("0.00 GiB remaining", cp.stderr)
+        pathlib.Path(str(cached) + ".aria2").touch()
+        cp = self.run_bash("load_folder_config; validate_download_space owner/repo:Q4_K_M",
+                           self.mock_space(10), check=False)
+        self.assertEqual(cp.returncode, 2)
+        self.assertIn("3.00 GiB remaining", cp.stderr)
+
     def test_exact_quant_matching_and_ud_distinction(self):
         self.metadata([
             {"rfilename": "model-Q4_K_M.gguf", "size": GIB},
@@ -619,7 +635,7 @@ printf "%s\\n" "$STATE_DIR" "$CACHE_DIR"
         env.update(PATH=str(bin_dir) + os.pathsep + self.env["PATH"],
                    PROVISIONING_ATTEMPT=str(provisioned))
         cli_cache = self.work / "CLI cache with spaces"
-        for name in ("claude-local", "coder-local", "hermes-local",
+        for name in ("claude-local", "coder-local", "hermes-local", "qwen-local",
                      "lib/claude_local_entry.sh"):
             for flag in ("--folders", "--system-info"):
                 with self.subTest(name=name, flag=flag):
@@ -646,6 +662,9 @@ printf "%s\\n" "$STATE_DIR" "$CACHE_DIR"
         files = (
             "claude-local", "coder-local", "opencode-local", "deepseek-local", "mini-swe-local",
             "pushbutton-backend", "pushbutton-bench", "pushbutton-select", "pushbutton-observe",
+            "pushbutton", "pushbutton-instance", "pushbutton-broker", "pushbutton-proxy",
+            "claude-local-safe", "qwen-local",
+            "lib/pushbutton_download.sh",
             "lib/pushbutton_folders.sh", "lib/claude_local_entry.sh", "lib/claude_local_plan.py",
             "lib/claude_local_gateway.py", "lib/coder_local_plan.py",
             "configs/qwen-local-defaults.json",
@@ -679,7 +698,8 @@ elif args[0] != "-C":
             with self.subTest(installer=installer):
                 env["PUSHBUTTON_DIR"] = str(self.work / (installer + "-install"))
                 for _ in range(2):
-                    cp = subprocess.run(["bash", str(ROOT / installer)], cwd=ROOT, env=env,
+                    args = ["--install-only"] if installer == "install-coder-local.sh" else []
+                    cp = subprocess.run(["bash", str(ROOT / installer), *args], cwd=ROOT, env=env,
                                         text=True, capture_output=True, timeout=20)
                     self.assertEqual(cp.returncode, 0, cp.stderr)
                     self.assertNotIn("Customize state/cache/config", cp.stdout)

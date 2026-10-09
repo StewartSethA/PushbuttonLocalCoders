@@ -28,6 +28,8 @@ validate_download_space() { echo 'Error: Model requires 89 GiB but only 0 GiB fr
 """)
         (self.root / "lib/claude_local_plan.py").touch()
         (self.root / "lib/claude_local_gateway.py").touch()
+        (self.root / "lib/pushbutton_download.sh").write_text(
+            (ROOT / "lib/pushbutton_download.sh").read_text())
 
     def launcher(self, name):
         target = self.root / name
@@ -69,6 +71,7 @@ validate_download_space() { echo 'Error: Model requires 89 GiB but only 0 GiB fr
 STATE_DIR={shlex.quote(str(self.root / "state with spaces"))}
 CACHE_DIR={shlex.quote(str(self.root / "cache"))}
 LLAMA_SERVER={shlex.quote(str(server))}
+download_model_fast() {{ touch {shlex.quote(str(self.root / "download-called"))}; return 1; }}
 free_port() {{ echo 20181; }}
 {rows}() {{ printf '%s\\n' {shlex.quote(chr(31).join(row))}; }}
 start_backends
@@ -77,13 +80,26 @@ start_backends
                                         text=True, capture_output=True)
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertFalse(called.exists())
+                self.assertFalse((self.root / "download-called").exists())
                 self.assertIn("89 GiB", result.stderr)
                 self.assertIn("--local-cache /bigger/disk", result.stderr)
+                # Once validation passes, the backend still prints a quoted log hint.
+                shell.write_text(shell.read_text().replace("start_backends\n", """
+validate_download_space() { return 0; }
+download_model_fast() { printf -v "$3" '%s' '/mock/model.gguf'; }
+curl() { return 0; }
+start_backends
+wait "${PIDS[@]}"
+"""))
+                result = subprocess.run(["bash", str(shell)], env=self.env,
+                                        text=True, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
                 command = next(line.strip() for line in result.stderr.splitlines()
                                if line.strip().startswith("tail -n 50"))
                 args = shlex.split(command)
                 self.assertEqual(args[:5], ["tail", "-n", "50", "-F", "--"])
                 self.assertIn("state with spaces/logs/", args[5])
+                called.unlink()
 
     def test_entry_keeps_frontend_arguments_and_runtime_policy(self):
         entry = self.root / "lib/claude_local_entry.sh"

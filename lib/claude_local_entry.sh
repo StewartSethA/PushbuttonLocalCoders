@@ -29,7 +29,7 @@ while (($#)); do
     --local-context|--local-client-context|--local-port-base)
       [[ $# -ge 2 ]] || { echo "$1 needs a value" >&2; exit 2; }
       ARGS+=("$1" "$2"); shift 2;;
-    --quiet|--local-no-teams|--local-keep-servers|--local-allow-offload|--local-dry-run|--local-verbose)
+    --quiet|--no-parallel|--local-no-teams|--local-keep-servers|--local-allow-offload|--local-dry-run|--local-verbose)
       ARGS+=("$1"); shift;;
     -*)
       ARGS+=("$@"); break;;

@@ -348,6 +348,7 @@ def download_remaining(spec, cache):
             sha = data.get("sha")
             if isinstance(sha, str) and re.fullmatch(r"[a-fA-F0-9]{40,64}", sha):
                 candidates.append(root / "snapshots" / sha / name)
+                candidates.append(root / sha / name)
         # llama.cpp's flat cache uses owner_repo_filename (slashes become _).
         candidates.append(pathlib.Path(cache) / (repo.replace("/", "_") + "_" + name.replace("/", "_")))
         complete = False
@@ -355,6 +356,8 @@ def download_remaining(spec, cache):
             try:
                 resolved = candidate.resolve()
                 if ".downloadInProgress" in str(resolved) or resolved.name.endswith(".incomplete"):
+                    continue
+                if pathlib.Path(str(candidate) + ".aria2").exists():
                     continue
                 if candidate.is_file() and candidate.stat().st_size == size:
                     complete = True
