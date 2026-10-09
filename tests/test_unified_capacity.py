@@ -51,6 +51,12 @@ class UnifiedCapacityTests(unittest.TestCase):
         req = runtime.worker_plan.parse_model_spec(cfg["model_spec"], cfg["models"])
         self.assertEqual(req.capacity["slots"], 2)
 
+    def test_catalog_only_models_keep_context_cli_support(self):
+        with patch.object(runtime, "catalog", return_value={"catalog-model": {"context": 131072}}), patch.object(sys.stdin, "isatty", return_value=False):
+            cfg = runtime.configure({}, self.args(model="catalog-model", context=32768))
+        self.assertEqual(cfg["context"], 32768)
+        self.assertEqual(cfg["models"]["catalog-model"]["context"], 32768)
+
     def test_preview_does_not_write_configuration(self):
         with tempfile.TemporaryDirectory() as td, patch.object(runtime, "CONFIG", pathlib.Path(td) / "runtime.json"):
             with patch.object(sys.stdin, "isatty", return_value=False):

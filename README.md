@@ -76,7 +76,7 @@ slots. Slots share one model's weights; `--agents` creates independent replicas.
 Repeating model specs with different overrides configures individual coder
 replicas. Claude/Hermes roles sharing a server must agree on its settings.
 
-Optional spec keys are `client_context`, `compact`, `quant`, `kv_k`, `kv_v`,
+Optional spec keys are `client_context`, `compact`, `safety`, `quant`, `kv_k`, `kv_v`,
 `min_tps`, and `admission`, in addition to `slots`, `context`, `output`, `gpu`,
 and `vram`. Weight quantization and K/V-cache precision are separate choices.
 Explicit choices that cannot fit are rejected rather than silently reducing
@@ -89,6 +89,10 @@ Coder placement configuration accepts the same per-model capacity defaults:
 
 Use `--placement-config` to select that file. Explicit model-spec fields override
 configuration defaults and global fallback settings.
+Spec token counts accept integer values or binary `K`/`M` suffixes. `compact` accepts
+an absolute token count or a fraction/percentage of the resolved input budget;
+its trigger must remain strictly below that budget. `safety` is a positive
+token reserve.
 
 The plan reports each server's hard context, input limit, output reserve,
 compaction trigger, slots, memory envelope, and headroom. Memory estimates use

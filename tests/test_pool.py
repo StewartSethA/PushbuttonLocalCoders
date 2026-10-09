@@ -6,6 +6,7 @@ ROOT=pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'lib'))
 import pushbutton_pool as pool
 import pushbutton_capacity as capacity
+import pushbutton_request_budget as request_budget
 
 
 class PoolTests(unittest.TestCase):
@@ -59,8 +60,17 @@ class PoolTests(unittest.TestCase):
         x=self.inst(request_capacity=resolved,measured_envelopes=[
             {'concurrency':4,'max_context':8192,'tg_per_client_p10':30}])
         self.assertEqual(x.context_limit(),8192)
-        self.assertEqual(x.capacity(8192),resolved['admission_limit'])
+        self.assertFalse(resolved['admission_explicit'])
+        self.assertEqual(x.capacity(8192),4)
+        self.assertEqual(request_budget.direct_admission_limit(resolved),1)
         self.assertEqual(x.speed()[0],'OK')
+        explicit=capacity.resolve_options({'admission_limit':1},8192,slots=4)
+        self.assertTrue(explicit['admission_explicit'])
+        x.request_capacity=explicit
+        self.assertEqual(x.capacity(8192),1)
+        self.assertEqual(request_budget.direct_admission_limit(explicit),1)
+        with self.assertRaises(ValueError):
+            capacity.parse_options({'admission_explicit':True})
 
 
 if __name__=='__main__':unittest.main()

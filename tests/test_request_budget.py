@@ -119,10 +119,12 @@ class BudgetTests(unittest.TestCase):
                     budget.verify_backend_capacity("http://local", {"context": 128, "slots": 2})
 
     def test_direct_slots_are_not_admission_or_decode_proof(self):
-        capacity = {"slots": 4, "admission_limit": 4, "min_tps": 50}
+        capacity = {"slots": 4, "admission_limit": 1, "min_tps": 50}
         self.assertEqual(budget.direct_admission_limit(capacity), 1)
-        self.assertEqual(budget.direct_admission_limit(dict(capacity, admission_explicit=True)), 4)
-        self.assertEqual(budget.direct_admission_limit(dict(capacity, admission_proven=True)), 4)
+        self.assertEqual(budget.direct_admission_limit({"slots": 4}), 1)
+        self.assertEqual(budget.direct_admission_limit(dict(capacity, admission_limit=3)), 3)
+        self.assertEqual(budget.direct_admission_limit(dict(capacity, admission_limit=4, admission_explicit=True)), 4)
+        self.assertEqual(budget.direct_admission_limit(dict(capacity, admission_limit=4, admission_proven=True)), 4)
         with self.assertRaises(budget.BudgetError):
             budget.direct_admission_limit({"slots": 4, "admission_limit": 0})
 

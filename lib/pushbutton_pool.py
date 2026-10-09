@@ -38,7 +38,10 @@ class Instance:
             measured_envelopes=self.measured_envelopes,
             min_client_tg=float(self.request_capacity.get("min_tps") or policy.MIN_DECODE_TOK_S),
         )
-        return min(proven, int(self.request_capacity.get("admission_limit") or proven))
+        limit = self.request_capacity.get("admission_limit")
+        if limit is None or self.request_capacity.get("admission_explicit") is False:
+            return proven
+        return min(proven, int(limit))
 
     def context_limit(self) -> int:
         limit = policy.backend_limits(self.backend,declared_context=self.max_context).max_context

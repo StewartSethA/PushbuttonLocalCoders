@@ -108,8 +108,11 @@ def configure(cfg,args):
         if req.vram_limit_mib is not None:options['vram_limit']=req.vram_limit_mib
         cfg['models'][model]=options
         cfg['model_spec']=model
-    elif '@' in spec or options:
+    elif '@' in spec or set(options)-{'context'}:
         raise ValueError('per-model capacity options require a supported llama.cpp planner profile')
+    elif 'context' in options:
+        cfg['context']=options['context']
+        if cfg['context']>model_context(model):raise ValueError('per-model context exceeds supported model context')
     if args.frontend:cfg['frontend']=args.frontend
     elif not cfg.get('frontend'):
         cfg['frontend']='qwen'
@@ -396,7 +399,7 @@ def main():
                     if not row:raise ValueError(f'no fitting local configuration found for {model}')
                     print(json.dumps({'model':model,'context':ctx,'selected':automatic_capacity_row(model,req,ctx,row)},indent=2))
                 return
-        elif '@' in cfg['model_spec'] or cfg.get('models',{}).get(model):
+        elif '@' in cfg['model_spec'] or set(cfg.get('models',{}).get(model,{}))-{'context'}:
             raise ValueError('per-model capacity options require a supported llama.cpp planner profile')
         elif a.plan_only:
             print(json.dumps({'model':model,'context':ctx,'rows':selector_views(model,ctx)},indent=2));return

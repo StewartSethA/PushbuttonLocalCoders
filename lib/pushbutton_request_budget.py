@@ -24,7 +24,11 @@ def direct_admission_limit(capacity):
     limit = capacity.get("admission_limit")
     limit = 1 if limit is None else integer(limit, "admission_limit")
     slots = integer(capacity.get("slots", 1), "slots")
-    if capacity.get("admission_explicit") is True or capacity.get("admission_proven") is True:
+    explicit = capacity.get("admission_explicit") is True
+    if "admission_explicit" not in capacity:
+        # Resolved plans default to C1; a larger supplied limit is explicit.
+        explicit = limit > 1
+    if explicit or capacity.get("admission_proven") is True:
         return min(limit, slots)
     return 1
 
