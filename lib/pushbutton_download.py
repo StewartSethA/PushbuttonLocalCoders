@@ -91,9 +91,15 @@ def validate_space(manifest, reuse_partial=False):
 
 
 def reuse_blobs(directory, files):
+    root = os.path.realpath(directory)
     for item in files:
         target = directory / item["name"]
-        if not target.resolve().is_relative_to(directory.resolve()):
+        resolved_target = os.path.realpath(target)
+        try:
+            contained = os.path.commonpath((root, resolved_target)) == root
+        except ValueError:
+            contained = False
+        if not contained:
             raise ValueError("Model filename escapes cache directory")
         if target.exists():
             continue
