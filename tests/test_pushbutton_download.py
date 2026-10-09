@@ -48,6 +48,38 @@ class MetadataTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 download.select_files({"siblings": files}, "UD-Q4_K_XL" if len(files) == 1 else "Q4_K")
 
+    def test_quant_selects_standard_build_unless_mtp_requested(self):
+        for quant in ("IQ3_XXS", "IQ2_S", "IQ2_XS"):
+            standard = f"Qwen3.8-27B-GSQ-RCO-{quant}.gguf"
+            mtp = f"Qwen3.8-27B-GSQ-RCO-{quant}-mtp.gguf"
+            metadata = {"siblings": [
+                {"rfilename": mtp, "size": 48},
+                {"rfilename": standard, "size": 32},
+            ]}
+            for selector, expected in ((quant, standard), (quant.lower(), standard),
+                                       (standard, standard), (quant + "-mtp", mtp),
+                                       (mtp, mtp)):
+                with self.subTest(selector=selector):
+                    self.assertEqual(download.select_files(metadata, selector)[0]["name"], expected)
+            self.assertEqual(len(download.select_files(metadata, quant + "," + mtp)), 2)
+            with self.assertRaisesRegex(ValueError, "No GGUF files"):
+                download.select_files({"siblings": metadata["siblings"][:1]}, quant)
+
+    def test_standard_and_mtp_shards_selected_separately(self):
+        metadata = {"siblings": [
+            {"rfilename": f"Qwen-IQ3_XXS{suffix}-{index:05d}-of-00002.gguf", "size": 32}
+            for suffix in ("", "-mtp") for index in (1, 2)
+        ]}
+        for selector, start in (("IQ3_XXS", 0), ("IQ3_XXS-mtp", 2),
+                                (metadata["siblings"][2]["rfilename"], 2)):
+            with self.subTest(selector=selector):
+                self.assertEqual(
+                    [f["name"] for f in download.select_files(metadata, selector)],
+                    [f["rfilename"] for f in metadata["siblings"][start:start + 2]])
+        metadata["siblings"].pop(1)
+        with self.assertRaisesRegex(ValueError, "incomplete GGUF shard set"):
+            download.select_files(metadata, "IQ3_XXS")
+
     def test_display_name(self):
         self.assertEqual(download.display_name("short"), "short")
         self.assertEqual(download.display_name("x" * 100), "x" * 69 + "...")
@@ -214,6 +246,26 @@ print('huggingface_hub: 100%',file=sys.stderr)
         self.assertIn("Parallel download failed", proc.stderr)
         self.assertEqual(self.calls.read_text().count("hf "), 2)
         self.assertIn("100%", proc.stderr)
+
+    def test_standard_build_download_with_optional_mtp(self):
+        standard = "Qwen3.8-27B-GSQ-RCO-IQ3_XXS.gguf"
+        mtp = "Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf"
+        self.metadata.write_text(json.dumps({"sha": REVISION, "siblings": [
+            {"rfilename": standard, "size": 32},
+            {"rfilename": mtp, "size": 48},
+        ]}))
+        for sequential in (False, True):
+            with self.subTest(sequential=sequential):
+                self.env["PUSHBUTTON_NO_PARALLEL"] = "1" if sequential else "0"
+                proc = self.shell(
+                    'download_model_fast ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF:IQ3_XXS '
+                    '"$2" MODEL_PATH; printf "%s\\n" "$MODEL_PATH"')
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                path = pathlib.Path(proc.stdout.strip())
+                self.assertEqual(path.name, standard)
+                self.assertEqual(path.stat().st_size, 32)
+                self.assertFalse((path.parent / mtp).exists())
+                shutil.rmtree(self.cache)
 
     def test_fallback_skips_completed_shards(self):
         self.env["TEST_ARIA_PARTIAL_FAILURE"] = "1"

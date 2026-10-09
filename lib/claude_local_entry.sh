@@ -6,7 +6,7 @@ command -v readlink >/dev/null 2>&1 && SELF="$(readlink -f "$SELF" 2>/dev/null |
 ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
 
 STATE_DIR="${CLAUDE_LOCAL_STATE:-$HOME/.local/share/pushbutton/claude-local}"
-WEB_MCP=1
+WEB_MCP="${CLAUDE_LOCAL_WEB_MCP:-1}"
 ARGS=()
 INFO_ONLY=0
 case "${1:-}" in
@@ -29,7 +29,7 @@ while (($#)); do
     --local-context|--local-client-context|--local-port-base)
       [[ $# -ge 2 ]] || { echo "$1 needs a value" >&2; exit 2; }
       ARGS+=("$1" "$2"); shift 2;;
-    --quiet|--no-parallel|--local-no-teams|--local-keep-servers|--local-allow-offload|--local-dry-run|--local-verbose)
+    --select|--quiet|--no-parallel|--local-no-teams|--local-keep-servers|--local-allow-offload|--local-dry-run|--local-verbose)
       ARGS+=("$1"); shift;;
     -*)
       ARGS+=("$@"); break;;
@@ -38,6 +38,12 @@ while (($#)); do
 done
 
 ((INFO_ONLY == 0)) || exec "$ROOT/claude-local" "${ARGS[@]}"
+if CLAUDE_LOCAL_STARTUP_ONLY=1 CLAUDE_LOCAL_WEB_MCP="$WEB_MCP" "$ROOT/claude-local" "${ARGS[@]}"; then
+  exit 0
+else
+  startup_rc=$?
+  [[ $startup_rc -eq 125 ]] || exit "$startup_rc"
+fi
 source "$ROOT/lib/pushbutton_folders.sh"
 initialize_folders 1
 
@@ -84,4 +90,7 @@ JSON
   ARGS+=(--mcp-config "$MCP_CONFIG")
 fi
 
+if [[ -x "$ROOT/claude-local-safe" ]]; then
+  exec "$ROOT/claude-local-safe" "${ARGS[@]}"
+fi
 exec "$ROOT/claude-local" "${ARGS[@]}"

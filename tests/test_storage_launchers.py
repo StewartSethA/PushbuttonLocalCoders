@@ -51,9 +51,9 @@ validate_download_space() { echo 'Error: Model requires 89 GiB but only 0 GiB fr
 
     def test_disk_full_stops_before_backend_and_prints_quoted_log_hint(self):
         for name, marker, rows in (
-            ("claude-local", "\nrequire_files\n", "server_rows"),
+            ("claude-local", '\ncase "${1:-}" in', "server_rows"),
             ("coder-local", "\nwhile (($#));do", "worker_rows"),
-            ("hermes-local", '\n[[ -f "$PLAN_PY" ]]', "server_rows"),
+            ("hermes-local", "\nwhile (($#)); do", "server_rows"),
         ):
             with self.subTest(name=name):
                 launcher = self.launcher(name)
@@ -68,6 +68,7 @@ validate_download_space() { echo 'Error: Model requires 89 GiB but only 0 GiB fr
                     row = ["1"] + row + [""]
                 shell = self.root / f"test-{name}"
                 shell.write_text(definitions + f"""
+source "$ROOT/lib/pushbutton_folders.sh"
 STATE_DIR={shlex.quote(str(self.root / "state with spaces"))}
 CACHE_DIR={shlex.quote(str(self.root / "cache"))}
 LLAMA_SERVER={shlex.quote(str(server))}
@@ -106,7 +107,8 @@ wait "${PIDS[@]}"
         entry.write_text((ROOT / "lib/claude_local_entry.sh").read_text())
         launcher = self.root / "claude-local"
         launcher.write_text(
-            '#!/bin/bash\nprintf "TIMEOUT=%s\\n" "${API_TIMEOUT_MS:-}"\n'
+            '#!/bin/bash\n[[ "${CLAUDE_LOCAL_STARTUP_ONLY:-0}" != 1 ]] || exit 125\n'
+            'printf "TIMEOUT=%s\\n" "${API_TIMEOUT_MS:-}"\n'
             'printf "ARG=%s\\n" "$@"\n')
         launcher.chmod(0o755)
         for args in (

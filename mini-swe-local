@@ -12,6 +12,13 @@ while (($#)); do
     *) PASS+=("$1"); shift ;;
   esac
 done
+if [[ -n "$SWARM_TASK" ]]; then export MINI_SWE_SWARM_TASK="$SWARM_TASK"; fi
+if CODER_LOCAL_MENU_FRONTEND=mini-swe-local CODER_LOCAL_STARTUP_ONLY=1 "$ROOT/coder-local" --frontend qwen "${PASS[@]}"; then
+  exit 0
+else
+  startup_rc=$?
+  [[ $startup_rc -eq 125 ]] || exit "$startup_rc"
+fi
 if ! command -v mini >/dev/null 2>&1; then
   if command -v uv >/dev/null 2>&1; then
     echo "[mini-swe-local] Installing mini-SWE-agent with uv..."
@@ -69,5 +76,4 @@ exec mini -c "$cfg" "$@"
 INNER
 chmod +x "$shim/qwen"
 export PATH="$shim:$PATH"
-if [[ -n "$SWARM_TASK" ]]; then export MINI_SWE_SWARM_TASK="$SWARM_TASK"; fi
 exec "$ROOT/coder-local" --frontend qwen "${PASS[@]}"

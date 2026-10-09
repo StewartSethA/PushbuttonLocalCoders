@@ -1,9 +1,18 @@
 import json, os, pathlib, sys, tempfile, unittest
+from unittest import mock
 ROOT=pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'lib'))
 import pushbutton_metrics as m
 
 class MetricsTests(unittest.TestCase):
+    def test_remote_source_local_is_still_reference_evidence(self):
+        row = {'source':'local', 'model':'qwen3.8:27b', 'backend':'vllm-qwen38-3090', 'tg':42}
+        with mock.patch.object(m, 'local_rows', return_value=[row]), \
+             mock.patch.object(m, '_remote_rows', return_value=[row]):
+            rows = m.observations('qwen3.8:27b', 'vllm-qwen38-3090')
+        self.assertEqual([r['evidence_origin'] for r in rows], ['local', 'reference'])
+        self.assertNotIn('evidence_origin', row)
+
     def test_bundled_3090_measurements_exist(self):
         rows=m.observations('qwen3.8:27b','vllm-qwen38-3090',None,'NVIDIA GeForce RTX 3090',262144)
         self.assertTrue(any(r.get('tg')==127.0 for r in rows))

@@ -80,6 +80,54 @@ verify with `--folders` before removing the old copy. See [STORAGE.md](STORAGE.m
 for the schema, migration steps, and troubleshooting. Third-party frontend
 installations may retain their own data: Claude Code in `~/.claude` and Hermes
 profiles/sessions in `~/.hermes`.
+## Start here: help and model selection
+
+Run an installed frontend with no model in a terminal (`qwen-local`,
+`opencode-local`, `deepseek-local`, `mini-swe-local`, `claude-local`, or
+`hermes-local`) to see a welcome menu: **choose models, inspect hardware/models,
+preview a plan, help, or quit**. `--select` explicitly opens that menu.
+Nothing is downloaded, built, or launched until you confirm the placement preview.
+Piped/non-TTY no-model launches print help and exit without prompting; `--help`
+does not require GPUs or the frontend toolchain. Explicit model commands keep
+their existing unattended behavior.
+
+```bash
+qwen-local --select
+pushbutton-select qwen3.8-flash-next qwen3.8:27b --agents 2 --plan-only
+pushbutton-select 'qwen3.8:27b@gpu=0,vram=16G' \
+  'qwen3.6:35b@gpu=1,vram=16G' --agents 2 --context 65536 --json
+pushbutton-select --frontend claude-local qwen3.8:27b qwen3.6:35b --plan-only
+```
+
+Coder selections use independent workers and the existing joint disjoint-GPU
+planner. Claude/Hermes keep their shared model-to-role semantics, not replicas.
+The preview shows free/occupied/total VRAM, per-GPU leases, quant envelopes,
+context, and spare GPUs. A smaller selected physical context also lowers the
+default client budget; an explicitly larger client budget is rejected.
+See [selector and Flash-Next validation details](docs/BACKEND_SELECTOR.md).
+
+### Qwen3.8 Flash-Next: existing support, not locally measured speed
+
+Flash-Next is already in the llama.cpp planner with six profiles. At 262,144
+context their **conservative planning envelopes** are 136/116/112/104/99/94 GiB;
+these are not measured allocations. The existing four-32-GiB-card recommendation
+is `UD-IQ4_XS` (116 GiB). Multiple independent copies need disjoint GPU groups.
+
+`sglang-v100` (4× V100 32 GiB, NVLink recipe) and `vllm-flashnext-3090`
+(4× RTX 3090 24 GiB) are existing **experimental benchmark adapters**, not
+drop-in coder/Claude/Hermes launch backends. Architecture eligibility does not
+prove memory fit or runtime correctness. The 3090 adapter's default `mtp` profile
+is limited to 65,536 context; deeper upstream profiles need separate validation
+and, for FP8 KV, calibration. There are **no repository-local Flash-Next
+measurements** in this change, so selector PP/TG remains unknown without matching
+evidence. Published ~118–120 tok/s V100 MTP and ~115–117 tok/s 3090 MTP results
+are upstream claims under specific prompt/profile conditions, not local promises.
+
+No CPU/expert offloading or unified-memory spill is silently enabled. Supporting
+a new offload recipe would require a separate adapter, loader/RAM/topology checks,
+and measured correctness/performance validation.
+
+---
 
 ## Frontends: change the command, keep the model idea
 

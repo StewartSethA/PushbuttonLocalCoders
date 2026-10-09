@@ -6,6 +6,12 @@ ROOT="$(cd "$(dirname "$SELF")" && pwd)"
 STATE_DIR="${CLAUDE_LOCAL_STATE:-$HOME/.local/share/pushbutton/claude-local}"
 export DSH_HOME="${DSH_HOME:-$STATE_DIR/frontends/deepseek/dsh}"
 have(){ command -v "$1" >/dev/null 2>&1; }
+if CODER_LOCAL_MENU_FRONTEND=deepseek-local CODER_LOCAL_STARTUP_ONLY=1 "$ROOT/coder-local" --frontend qwen "$@"; then
+  exit 0
+else
+  startup_rc=$?
+  [[ $startup_rc -eq 125 ]] || exit "$startup_rc"
+fi
 if ! have npm; then echo "deepseek-local requires Node.js/npm" >&2; exit 1; fi
 if ! have dsh; then
   echo "[deepseek-local] Installing official DeepSeek Harness CLI..."

@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -580,6 +581,15 @@ def main() -> int:
             print(json.dumps(data, indent=2))
             return 0
         gpus = inventory()
+        selected = os.environ.get("PUSHBUTTON_SELECTOR_GPU_INDICES")
+        if selected is not None:
+            try:
+                indices = {int(x) for x in selected.split(",") if x}
+            except ValueError as exc:
+                raise ValueError("invalid selector GPU pool") from exc
+            if not indices or not indices <= {g.index for g in gpus}:
+                raise ValueError("selector GPU pool is empty or no longer visible")
+            gpus = [g for g in gpus if g.index in indices]
         models = args.models
         if args.smart or not models:
             models = smart_defaults(gpus)
