@@ -17,6 +17,10 @@ loader = importlib.machinery.SourceFileLoader('selector', str(SEL))
 spec = importlib.util.spec_from_loader(loader.name, loader)
 selector = importlib.util.module_from_spec(spec)
 loader.exec_module(selector)
+runtime_loader = importlib.machinery.SourceFileLoader('runtime', str(ROOT / 'pushbutton'))
+runtime_spec = importlib.util.spec_from_loader(runtime_loader.name, runtime_loader)
+runtime = importlib.util.module_from_spec(runtime_spec)
+runtime_loader.exec_module(runtime)
 
 class SelectorTests(unittest.TestCase):
     def run_sel(self, *args, gpus=None, tty=False, inputs=()):
@@ -42,8 +46,8 @@ class SelectorTests(unittest.TestCase):
             '--no-interactive', gpus=selector.workers.synthetic_3090(1))
         self.assertEqual(code, 0)
         self.assertIn('IQ3_XXS', out)
-        self.assertRegex(out, r'BLOCK\s+ninfer-3090')
-        self.assertRegex(out, r'UNVERIFIED\s+llamampere')
+        self.assertRegex(out, r'BLOCK\s+\S+\s+ninfer-3090')
+        self.assertRegex(out, r'UNVERIFIED\s+\S+\s+llamampere')
         self.assertIn('Recommended launch:', out)
         launch.assert_not_called()
 
@@ -58,6 +62,7 @@ class SelectorTests(unittest.TestCase):
         self.assertRegex(out, r'llamampere.*UNKNOWN')
         self.assertRegex(out, r'127\s+UPSTREAM REFERENCE')
         self.assertNotIn('ESTIMATED', out)
+        self.assertIn('25 TG/s', out)
 
     def test_noninteractive_no_model_does_not_inventory_or_read(self):
         code, out, _, launch, inventory = self.run_sel()
@@ -308,6 +313,46 @@ class SelectorTests(unittest.TestCase):
         self.assertIsNone(obj['launch_argv'])
         launch.assert_not_called()
         inventory.assert_not_called()
+
+    def test_catalog_aliases_capabilities_and_speed_policy_are_preserved(self):
+        code, out, _, launch, _ = self.run_sel(
+            'ornith-9b', '--json', gpus=selector.workers.synthetic_3090(1))
+        obj = json.loads(out)
+        self.assertEqual(code, 2)  # Catalog inspection is not a joint frontend profile.
+        self.assertEqual(obj['speed_floor_tg'], 25.0)
+        self.assertIn('SWE-bench Verified', obj['capability_benchmarks']['ornith-1.5:9b'])
+        rows = obj['rows']['ornith-1.5:9b']
+        self.assertTrue(any(r['status'] == 'FIT' for r in rows))
+        self.assertTrue(all(r['tg'] is None and r['evidence'] == 'UNKNOWN' for r in rows))
+        self.assertTrue(all('speed_status' in r for r in rows))
+        self.assertTrue(all(not r['frontend_integrated'] for r in rows))
+        launch.assert_not_called()
+
+    def test_unified_runtime_consumes_joint_json_and_catalog_only_rows(self):
+        row = {'model': 'ornith-1.5:9b', 'backend': 'llama.cpp',
+               'artifact': 'Q4_K_M', 'status': 'FIT', 'tg': None, 'req': 9000}
+        response = subprocess.CompletedProcess(
+            [], 2, json.dumps({'rows': {'ornith-1.5:9b': [row]},
+                              'error': 'no joint frontend profile'}))
+        with mock.patch.object(runtime.plan, 'inventory', return_value=selector.workers.synthetic_3090(1)), \
+             mock.patch.object(runtime.subprocess, 'run', return_value=response):
+            rows = runtime.selector_views('ornith-9b', 65536)
+        self.assertEqual(rows, [{**row, 'gpu': 0}])
+        self.assertEqual(runtime.choose_candidate(rows), rows[0])
+
+    def test_unified_runtime_does_not_treat_reference_rates_as_local(self):
+        reference = {'status': 'FIT', 'tg': 100, 'evidence': 'UPSTREAM REFERENCE',
+                     'quality': 95, 'req': 10000}
+        local = {**reference, 'tg': 90, 'evidence': 'LOCAL MEASURED'}
+        self.assertEqual(runtime.choose_candidate([reference, local]), local)
+
+    def test_catalog_large_models_remain_guidance_not_automatic_adapter_fit(self):
+        rows = selector.rows_for('deepseek-v4.1-flash', None, None, None, 65536,
+                                 selector.workers.synthetic_v100(24))
+        self.assertEqual(rows[0]['status'], 'UNVERIFIED')
+        self.assertEqual(rows[0]['evidence'], 'UNKNOWN')
+        self.assertFalse(rows[0]['frontend_integrated'])
+        self.assertNotIn('validation_argv', rows[0])
 
 if __name__ == '__main__':
     unittest.main()

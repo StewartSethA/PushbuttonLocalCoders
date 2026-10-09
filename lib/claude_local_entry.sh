@@ -69,4 +69,7 @@ JSON
   ARGS+=(--mcp-config "$MCP_CONFIG")
 fi
 
+if [[ -x "$ROOT/claude-local-safe" ]]; then
+  exec "$ROOT/claude-local-safe" "${ARGS[@]}"
+fi
 exec "$ROOT/claude-local" "${ARGS[@]}"

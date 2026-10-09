@@ -13,7 +13,7 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 FRONTENDS = ("coder-local", "claude-local", "hermes-local")
-WRAPPERS = ("opencode-local", "deepseek-local", "mini-swe-local")
+WRAPPERS = ("qwen-local", "opencode-local", "deepseek-local", "mini-swe-local")
 
 
 class StartupTests(unittest.TestCase):
@@ -26,7 +26,7 @@ class StartupTests(unittest.TestCase):
         for name in ("bash", "cat", "dirname", "basename", "readlink", "mkdir", "chmod", "ln", "mv", "rm"):
             (self.bin / name).symlink_to(shutil.which(name))
         (self.bin / "python3").symlink_to(sys.executable)
-        for name in FRONTENDS + WRAPPERS:
+        for name in FRONTENDS + WRAPPERS + ("claude-local-safe",):
             shutil.copy2(ROOT / name, self.root / name)
         self.env = dict(os.environ, PATH=str(self.bin), HOME=str(self.root / "home"),
                         CLAUDE_LOCAL_STATE=str(self.root / "state"),
@@ -162,7 +162,6 @@ class StartupTests(unittest.TestCase):
 
     def test_qwen_alias_preserves_frontend(self):
         self.selector_recorder()
-        (self.root / "qwen-local").symlink_to(self.root / "coder-local")
         self.assertEqual(self.recorded("qwen-local")["argv"][:2],
                          ["--frontend", "qwen-local"])
         self.assertEqual(self.recorded("coder-local", ["--frontend", "qwen"])["argv"][:2],
@@ -191,6 +190,31 @@ class StartupTests(unittest.TestCase):
         self.assertEqual(record["swarm"], "task with spaces")
         self.assertEqual(record["argv"][:2], ["--frontend", "mini-swe-local"])
 
+    def test_no_parallel_survives_selection_on_all_frontends(self):
+        self.selector_recorder()
+        for name in FRONTENDS + WRAPPERS:
+            with self.subTest(frontend=name):
+                record = self.recorded(name, ["--no-parallel"])
+                self.assertIn("--launch-arg=--no-parallel", record["argv"])
+                self.assertFalse((self.root / "state").exists())
+
+    def test_safe_claude_wrapper_has_menu_and_help_before_gpu_probe(self):
+        self.selector_recorder()
+        nvidia = self.bin / "nvidia-smi"
+        nvidia.write_text("#!/bin/bash\necho UNEXPECTED_GPU_PROBE >&2\nexit 91\n")
+        nvidia.chmod(0o755)
+        for args in ([], ["--resume"], ["--select", "q38"]):
+            with self.subTest(args=args):
+                record = self.recorded("claude-local-safe", args)
+                self.assertEqual(record["argv"][:3], ["--frontend", "claude-local", "--menu"])
+                result = self.run_script("claude-local-safe", args)
+                self.assertIn("interactive terminal", result.stderr)
+                self.assertNotIn("UNEXPECTED_GPU_PROBE", result.stderr)
+        result = self.run_script("claude-local-safe", ["--help"])
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("--select", result.stdout)
+        self.assertNotIn("UNEXPECTED_GPU_PROBE", result.stderr)
+
     def test_explicit_wrapper_model_argv_is_unchanged(self):
         coder = self.root / "coder-local"
         coder.write_text(
@@ -199,7 +223,10 @@ class StartupTests(unittest.TestCase):
             "print('RECORDER:' + json.dumps({'argv':sys.argv[1:], 'cwd':os.getcwd(), "
             "'swarm':os.environ.get('MINI_SWE_SWARM_TASK')}))\n")
         coder.chmod(0o755)
-        for tool in ("opencode", "npm", "dsh", "pnpm", "mini", "grep"):
+        (self.root / "lib").mkdir()
+        (self.root / "lib" / "claude_local_hostcc.sh").write_text(
+            "claude_local_prepare_hostcc() { :; }\n")
+        for tool in ("cmake", "opencode", "npm", "dsh", "pnpm", "mini", "grep"):
             executable = self.bin / tool
             executable.write_text("#!/bin/bash\nexit 0\n")
             executable.chmod(0o755)
@@ -359,7 +386,10 @@ class StartupTests(unittest.TestCase):
         template.mkdir(exist_ok=True)
         for frontend in FRONTENDS:
             shutil.copy2(ROOT / frontend, template / frontend)
+        shutil.copy2(ROOT / "qwen-local", template / "qwen-local")
+        shutil.copy2(ROOT / "claude-local-safe", template / "claude-local-safe")
         for extra in ("opencode-local", "deepseek-local", "mini-swe-local",
+                      "pushbutton", "pushbutton-instance", "pushbutton-broker", "pushbutton-proxy",
                       "pushbutton-backend", "pushbutton-bench", "pushbutton-observe", "pushbutton-select"):
             (template / extra).write_text("#!/bin/bash\necho UNEXPECTED_TOOL\nexit 91\n")
         (template / "lib").mkdir(exist_ok=True)
@@ -386,6 +416,14 @@ class StartupTests(unittest.TestCase):
                 self.assertNotIn("UNEXPECTED_TOOL", result.stdout)
                 self.assertFalse((self.root / "state").exists())
                 shutil.rmtree(self.root / "installed")
+
+    def test_coder_installer_install_only_retains_runtime_installation(self):
+        installer = self.prepare_installer("coder-local")
+        result = self.run_script(installer, ["--install-only"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Installed unified runtime", result.stdout)
+        self.assertNotIn("UNEXPECTED_TOOL", result.stdout)
+        self.assertTrue((self.root / "home/.local/bin/pushbutton").exists())
 
     def test_installed_claude_shim_options_preflight_before_mcp_state(self):
         installer = self.prepare_installer("claude-local")

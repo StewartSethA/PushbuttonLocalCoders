@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Interactive model/backend selector with live hardware and benchmark guidance."""
+"""Interactive model/backend selector with live hardware, SLA and capability hints."""
 from __future__ import annotations
 import argparse, json, os, pathlib, re, shlex, subprocess, sys
 from dataclasses import asdict, replace
@@ -9,45 +9,78 @@ sys.path.insert(0,str(ROOT/'lib'))
 import claude_local_plan as plan
 import coder_local_plan as workers
 import pushbutton_metrics as metrics
+import pushbutton_policy as policy
+
+CATALOG_PATH=ROOT/'configs/model-catalog.json'
+def catalog():
+ try:return json.loads(CATALOG_PATH.read_text()).get('models',{})
+ except Exception:return {}
+
+def aliases():
+ a={'qwen38':'qwen3.8:27b','qwen3.8-27b':'qwen3.8:27b','q38':'qwen3.8:27b'}
+ for mid,m in catalog().items():
+  a[mid.lower()]=mid
+  for x in m.get('aliases',[]):a[str(x).lower()]=mid
+ return a
 
 UPSTREAM={
  ('qwen3.8:27b','llamampere'):{'artifact':'ATX-IQ4_XS-M (4.56 bpw)','tested_card_mib':24576,'hard_min_mib':None,'host_ram_mib':8192,'quality':'~97*','note':'3090/3090 Ti specialized path; reduced-memory behavior is recipe-dependent.'},
  ('qwen3.8:27b','vllm-qwen38-3090'):{'artifact':'patched vLLM W4A16/int8-requantized','tested_card_mib':24576,'hard_min_mib':None,'host_ram_mib':12288,'quality':'n/a','note':'single-3090 specialized stack; use measured rows for exact speed/context claims.'},
  ('qwen3.8:27b','ninfer-3090'):{'artifact':'NInfer groupwise 16.96 GiB','tested_card_mib':24576,'hard_min_mib':17368,'host_ram_mib':8192,'quality':'n/a','note':'artifact alone exceeds 16 GiB; published C1 peak is about 19.2 GiB.'},
 }
-ALIASES={'qwen38':'qwen3.8:27b','qwen3.8-27b':'qwen3.8:27b','q38':'qwen3.8:27b'}
+RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; BOLD='\033[1m'; CYAN='\033[36m'; RESET='\033[0m'
+def color(s,c):return f'{c}{s}{RESET}' if sys.stdout.isatty() else s
+def canon(x:str)->str:
+ k=x.lower().strip()
+ if k in aliases():return aliases()[k]
+ try:return plan.canonical_model(k)
+ except Exception:return k
 
-RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; BOLD='\033[1m'; RESET='\033[0m'
-def color(s,c): return f'{c}{s}{RESET}' if sys.stdout.isatty() else s
-
-def canon(x:str)->str:return plan.canonical_model(ALIASES.get(x.lower(),x.lower()))
 def parse_mem(s:str|None)->int|None:
  if not s:return None
  m=re.fullmatch(r'\s*(\d+(?:\.\d+)?)\s*([GM]?)I?B?\s*',s,re.I)
  if not m:raise ValueError(f'invalid memory size {s!r}')
- v=float(m.group(1));u=m.group(2).upper(); return int(v*1024) if u=='G' else int(v)
+ v=float(m.group(1));u=m.group(2).upper();return int(v*1024) if u=='G' else int(v)
 
 def ram_info():
  try:
-  text=pathlib.Path('/proc/meminfo').read_text(); vals={k:int(v) for k,v in re.findall(r'^(MemTotal|MemAvailable):\s+(\d+)',text,re.M)}
+  text=pathlib.Path('/proc/meminfo').read_text();vals={k:int(v) for k,v in re.findall(r'^(MemTotal|MemAvailable):\s+(\d+)',text,re.M)}
   return vals.get('MemTotal',0)//1024,vals.get('MemAvailable',0)//1024
  except Exception:return None,None
 
 def gpu_inventory():
  try:return plan.inventory()
  except Exception:return []
+def benchmark_hint(model,short=False):
+ m=catalog().get(model,{})
+ b=m.get('benchmarks') or {}
+ order=['Terminal-Bench 2.1 (Claude Code)','Terminal-Bench 2.1','SWE-bench Verified','SWE-bench Pro','DeepSWE v1.1','DeepSWE','NL2Repo-Bench','NL2Repo','GPQA Diamond']
+ parts=[]
+ for name in order:
+  if name not in b:continue
+  label=name.replace('Terminal-Bench 2.1 (Claude Code)','TB2.1-CC').replace('Terminal-Bench 2.1','TB2.1').replace('SWE-bench Verified','SWE-V').replace('SWE-bench Pro','SWE-Pro').replace('DeepSWE v1.1','DeepSWE').replace('NL2Repo-Bench','NL2Repo').replace('GPQA Diamond','GPQA')
+  parts.append(f"{label} {b[name].get('score')}")
+  if short and len(parts)>=2:break
+ return ' | '.join(parts)
 
 def model_menu():
- names=list(plan.PROFILES)
+ names=[]
+ for m in list(plan.PROFILES)+list(catalog()):
+  if m not in names:names.append(m)
+ pref=['qwen3.8:27b','ornith-1.5:35b-a3b','ornith-1.5:9b','deepseek-v4.1-flash','ornith-1.5:397b']
+ names=sorted(names,key=lambda x:(pref.index(x) if x in pref else 100+names.index(x)))
  print('\nAvailable model families:')
  for i,m in enumerate(names,1):
-  profiles=plan.PROFILES[m]; q=profiles[0].quality if profiles else '-'
-  print(f' {i:>2}. {m:<26} best planner quality {q}')
+  c=catalog().get(m,{});h=benchmark_hint(m,True);desc=c.get('display') or m
+  if m in plan.PROFILES:desc=f'{desc}  [GGUF planner]'
+  print(f' {i:>2}. {desc:<43}'+(f'  {h}' if h else ''))
+ print('Benchmark hints are upstream/vendor harness results, not local speed measurements.')
  while True:
   s=input('Choose model(s), space-separated numbers/names [1]: ').strip() or '1'
   try:
    selected=[names[int(x)-1] if x.isdigit() and 1<=int(x)<=len(names) else x for x in s.split()]
-   for x in selected:workers.parse_model_spec(x)
+   for x in selected:
+    if canon(x) not in catalog():workers.parse_model_spec(x)
    return selected
   except (ValueError, IndexError):
    print('Please enter valid numbers or model names (optional @gpu=0+1,vram=30G).')
@@ -77,6 +110,30 @@ def evidence_label(obs,sm):
  if not sm.get('pp') and not sm.get('tg'):return 'UNKNOWN'
  return 'LOCAL MEASURED' if obs and all(r.get('evidence_origin')=='local' for r in obs) else 'UPSTREAM REFERENCE'
 
+def selector_model(text):
+ name=canon(text)
+ if name in catalog():return name
+ return workers.parse_model_spec(text).model
+
+def catalog_rows(model,gpu,capacity,ram_cap,context):
+ m=catalog().get(model,{})
+ rows=[];gpu_name=gpu.name if gpu else None
+ for q in m.get('quants') or []:
+  weight=float(q['weight_gib'])*1024
+  scale=max(.125,min(1.0,context/max(1,int(m.get('context') or 262144))))
+  ctx_overhead=(5120 if '9b' in model else 9216)*scale
+  req=int(weight+ctx_overhead+1536);ram_req=max(2048,int(weight*.15))
+  status='UNKNOWN' if capacity is None else ('FIT' if req<=capacity else 'BLOCK')
+  if ram_cap is not None and ram_req>ram_cap:status='BLOCK'
+  obs,sm=measured_summary(model,'llama.cpp',gpu_name,context,q['name'])
+  rows.append({'model':model,'backend':'llama.cpp','artifact':q['name'],'req':req,'ram_req':ram_req,'quality':str(q.get('quality','n/a')),'pp':(sm.get('pp') or {}).get('median'),'tg':(sm.get('tg') or {}).get('median'),'status':status,'note':f"{m.get('gguf_repo')} — estimated memory envelope, not a joint frontend planner profile",'evidence':evidence_label(obs,sm),'spread':sm})
+ if model=='deepseek-v4.1-flash':
+  req=int(float(m.get('minimum_vram_gib',614))*1024)
+  rows.append({'model':model,'backend':'vllm','artifact':'native mixed MXFP4/MXFP8','req':req,'ram_req':32768,'quality':'native','pp':None,'tg':None,'status':'BLOCK' if capacity is not None and capacity<req else 'UNVERIFIED','note':'vLLM 0.30+ dedicated DeepSeek V4.1 image; 614 GB aggregate VRAM reference, no automatic local launcher','evidence':'UNKNOWN','spread':{}})
+ elif model=='ornith-1.5:397b' and not m.get('quants'):
+  rows.append({'model':model,'backend':'vllm/llama.cpp','artifact':'397B checkpoint / GGUF','req':None,'ram_req':None,'quality':'native','pp':None,'tg':None,'status':'UNVERIFIED','note':'large-node model; exact local quant/memory profile must be measured before automatic launch','evidence':'UNKNOWN','spread':{}})
+ return rows
+
 def rows_for(model,gpu,cap,ram_cap,context,gpus=None):
  rows=[]; gpu_name=gpu.name if gpu else None
  gpus=gpus if gpus is not None else ([gpu] if gpu else [])
@@ -91,6 +148,7 @@ def rows_for(model,gpu,cap,ram_cap,context,gpus=None):
    obs,sm=measured_summary(model,'llama.cpp',gpu_name,context,p.quant)
    pp=(sm.get('pp') or {}).get('median'); tg=(sm.get('tg') or {}).get('median')
    rows.append({'model':model,'backend':'llama.cpp','artifact':p.quant,'req':req,'ram_req':None,'quality':str(p.quality),'pp':pp,'tg':tg,'status':status,'note':'baseline; conservative VRAM planning envelope, not measured allocation; host RAM minimum unknown; '+p.note,'evidence':evidence_label(obs,sm),'spread':sm})
+ if model not in plan.PROFILES:rows+=catalog_rows(model,gpu,capacity if baseline_gpus else None,ram_cap,context)
  for (m,b),d in UPSTREAM.items():
   if m!=model:continue
   hard=d.get('hard_min_mib'); tested=d.get('tested_card_mib'); ram_req=d.get('host_ram_mib')
@@ -112,16 +170,19 @@ def rows_for(model,gpu,cap,ram_cap,context,gpus=None):
   rows.append({'model':model,'backend':backend,'artifact':d.get('artifact','recipe-specific'),'req':None,'ram_req':None,'quality':'n/a','pp':(sm.get('pp') or {}).get('median'),'tg':(sm.get('tg') or {}).get('median'),'status':status,'note':f"experimental; {note}; {d['notes']} Source: {d['source']}",'evidence':evidence_label(obs,sm),'spread':sm})
  for r in rows:
   metadata=registry.get(r['backend'],{})
-  r['support']=metadata.get('status','baseline')
-  r['frontend_integrated']=r['backend']=='llama.cpp'
+  r['support']=metadata.get('status','catalogued')
+  r['frontend_integrated']=r['backend']=='llama.cpp' and model in plan.PROFILES
   r['constraints']=metadata.get('constraints',{})
-  if r['backend']!='llama.cpp':
+  if r['backend']!='llama.cpp' and metadata:
    eligible=[g for g in gpus if 'sm'+g.compute_cap.replace('.','') in metadata['gpu_arch']]
    command=[str(ROOT/'pushbutton-bench'),model,'--backend',r['backend'],'--context',str(min(context,r['constraints'].get('max_context',context))),'--suite','standard']
    if eligible:command+=['--gpus',','.join(str(g.index) for g in eligible[:r['constraints'].get('gpu_count',1)])]
    r['validation_argv']=command
+  s,w=policy.speed_label(r.get('tg'),measured=r['evidence']=='LOCAL MEASURED')
+  r['speed_status']=s;r['speed_warning']=w
  rank={'FIT':0,'UNKNOWN':1,'UNVERIFIED':1,'UNAVAILABLE':2,'BLOCK':2}
- rows.sort(key=lambda r:(rank[r['status']],-(int(r['quality']) if str(r['quality']).isdigit() else -1)))
+ sr={'OK':0,'UNKNOWN':1,'SLOW':2,'VERY_SLOW':3}
+ rows.sort(key=lambda r:(rank[r['status']],sr.get(r['speed_status'],4),-(int(r['quality']) if str(r['quality']).isdigit() else -1)))
  return rows
 
 def fmt_mib(v):return '-' if v is None else f'{v/1024:.1f}G'
@@ -130,23 +191,36 @@ def ev_label(r):
  s=r['evidence']
  return color(s,GREEN) if s=='LOCAL MEASURED' else s
 
+def speed_label(r):
+ s=r.get('speed_status','UNKNOWN')
+ if s=='OK':return color(s,GREEN)
+ if s in {'SLOW','VERY_SLOW'}:return color(s,RED)
+ return color(s,YELLOW)
 def print_hw(gpu,ram_cap,vram_cap):
- total,avail=ram_info(); print('')
+ total,avail=ram_info();print('')
  if gpu:
   used=max(0,gpu.total_mib-gpu.free_mib)
   print(f"GPU {gpu.index}: {gpu.name}  {gpu.free_mib/1024:.1f}G free / {gpu.total_mib/1024:.1f}G total  ({used/1024:.1f}G occupied)")
   if vram_cap and vram_cap>gpu.free_mib: print(color(f'WARNING: requested VRAM ceiling {fmt_mib(vram_cap)} exceeds currently free VRAM {fmt_mib(gpu.free_mib)}.',YELLOW),file=sys.stderr)
  if total: print(f'Host RAM: {avail/1024:.1f}G available / {total/1024:.1f}G total  planning ceiling={fmt_mib(ram_cap)}')
 
-def print_table(rows,gpu,cap,ram_cap):
+def print_benchmark_hints(model):
+ h=benchmark_hint(model)
+ if not h:return
+ print('\n'+color('Capability hints:',CYAN)+' '+h)
+ print('  upstream/vendor benchmark results; harness, context and sampling matter. They are hints, not local performance SLAs.')
+
+def print_table(rows,gpu,cap,ram_cap,model):
  print_hw(gpu,ram_cap,cap)
- print(f"{'#':>2} {'status':<10} {'backend':<19} {'quant/artifact':<28} {'VRAM*':>7} {'RAM*':>7} {'qual':>6} {'PP':>7} {'TG':>7} {'evidence':<10}")
+ print(f"{'#':>2} {'status':<10} {'speed':<10} {'backend':<19} {'quant/artifact':<28} {'VRAM*':>7} {'RAM*':>7} {'qual':>6} {'PP':>7} {'TG':>7} {'evidence':<10}")
  print('-'*116)
  for i,r in enumerate(rows,1):
-  print(f"{i:>2} {r['status']:<10} {r['backend']:<19} {r['artifact'][:28]:<28} {fmt_mib(r['req']):>7} {fmt_mib(r['ram_req']):>7} {r['quality']:>6} {fmt_rate(r['pp']):>7} {fmt_rate(r['tg']):>7} {ev_label(r):<10}")
+  print(f"{i:>2} {r['status']:<10} {speed_label(r):<10} {r['backend']:<19} {r['artifact'][:28]:<28} {fmt_mib(r['req']):>7} {fmt_mib(r['ram_req']):>7} {r['quality']:>6} {fmt_rate(r['pp']):>7} {fmt_rate(r['tg']):>7} {ev_label(r):<10}")
  print('\nPP/TG are tok/s: LOCAL MEASURED and UPSTREAM REFERENCE are separate evidence.')
  print('UNKNOWN means no matching evidence; benchmark before making speed claims. FIT is a memory plan, not GPU validation.')
  print('* llama.cpp VRAM is a conservative planning envelope, not measured allocation; host RAM minimum unknown.')
+ print(f'{policy.MIN_DECODE_TOK_S:.0f} TG/s is the Pushbutton normal-speed floor; sub-floor evidence is explicitly SLOW.')
+ print_benchmark_hints(model)
  for r in rows:
   if r['backend']!='llama.cpp':print(f"  {r['backend']}: {r['note']}")
 
@@ -201,9 +275,9 @@ def launch_command(frontend,models,result,context,client_context,launch_args):
  # The wrapper supplies an argv list; only recognized launchers are executable.
  target=ROOT/frontend
  if frontend=='claude-local':target=ROOT/'lib/claude_local_entry.sh'
- if frontend in ('qwen-local','coder-local'):target=ROOT/'coder-local'
+ if frontend=='coder-local':target=ROOT/'coder-local'
  command=['bash',str(target)] if frontend=='claude-local' else [str(target)]
- if frontend in ('qwen-local','coder-local'):command+=['--frontend','qwen']
+ if frontend=='coder-local':command+=['--frontend','qwen']
  command+=models
  if frontend in CODER_FRONTENDS:command+=['--agents',str(result['agents'])]
  command+=['--local-context',str(context),'--local-client-context',str(client_context),*launch_args]
@@ -277,13 +351,13 @@ def main():
  client_context=min(200000,a.context) if a.client_context is None else a.client_context
  if not 0<client_context<=a.context:raise ValueError('client context must be positive and no larger than physical context')
  if ram_cap is None:_,ram_cap=ram_info()
- tables={workers.parse_model_spec(m).model:rows_for(workers.parse_model_spec(m).model,gpu,cap,ram_cap,a.context,[gpu] if gpu else inv) for m in models}
+ tables={selector_model(m):rows_for(selector_model(m),gpu,cap,ram_cap,a.context,[gpu] if gpu else inv) for m in models}
  if not a.json:
   for model,rs in tables.items():
    print(f'\n{model} — available profiles (single-model guidance; joint plan below is authoritative)')
-   print_table(rs,gpu,cap,ram_cap)
+   print_table(rs,gpu,cap,ram_cap,model)
    for r in rs:
-    if r['backend']!='llama.cpp':
+    if 'validation_argv' in r:
      print('  Optional benchmark/validation ONLY (not integrated with frontend; review prerequisites): '+shlex.join(r['validation_argv']))
  if action=='2':return 0
  error=None; result=None; command=None; launch_env={}
@@ -298,13 +372,16 @@ def main():
    launch_env['PUSHBUTTON_SELECTOR_GPU_INDICES']=','.join(
     str(g['index']) for server in result['servers'] for g in server['gpus'])
  except ValueError as exc:error=str(exc)
- obj={'models':models,'frontend':a.frontend,'context':a.context,'client_context':client_context,'ram_limit_mib':ram_cap,'host_ram_fit':'unknown; no proven minimum','vram_limit_mib_per_gpu':cap,'inventory':[asdict(g) for g in inv],'rows':tables,'plan':result,'launch_argv':command,'launch_env':launch_env,'error':error}
+ obj={'models':models,'frontend':a.frontend,'context':a.context,'client_context':client_context,'ram_limit_mib':ram_cap,'host_ram_fit':'unknown; no proven minimum','vram_limit_mib_per_gpu':cap,'inventory':[asdict(g) for g in inv],'rows':tables,'plan':result,'launch_argv':command,'launch_env':launch_env,'error':error,'speed_floor_tg':policy.MIN_DECODE_TOK_S,'capability_benchmarks':{m:catalog().get(m,{}).get('benchmarks',{}) for m in tables}}
  if a.json:print(json.dumps(obj,indent=2))
  elif error:print(f'\nCannot launch: {error}',file=sys.stderr)
  else:
   print('\nJoint placement preview — baseline llama.cpp; planned memory, NOT measured allocation:')
   for w in result.get('workers',result.get('servers',[])):
    print(f"  {w['model']} {w['profile']['quant']}: GPUs {w['cuda_visible_devices']}, envelope {fmt_mib(w['required_mib'])}, free lease capacity {fmt_mib(w['allocated_mib'])}, per-GPU lease {fmt_mib(w.get('vram_limit_mib_per_gpu'))}")
+   row=next((r for r in tables[w['model']] if r['artifact']==w['profile']['quant']),None)
+   if row and row['speed_status'] in {'SLOW','VERY_SLOW'}:
+    print('\n*** SERIOUS SLOWNESS WARNING ***\n'+row['speed_warning'],file=sys.stderr)
   if 'roles' in result:print('  Shared roles: '+json.dumps(result['roles']))
   if launch_env:print('  Launch GPU pool: '+launch_env['PUSHBUTTON_SELECTOR_GPU_INDICES']+' (role planner rechecks this pool only)')
   print('  Spare GPUs: '+str([g['index'] for g in result['unused_gpus']]))

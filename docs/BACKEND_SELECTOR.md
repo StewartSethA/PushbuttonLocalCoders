@@ -187,22 +187,20 @@ The repository includes the client and queueing protocol; deploying a public col
 
 ## Direct curl use
 
-The existing direct constrained launch still works:
+Install without launching, then run the replica-aware frontend for GPU leases
+and multiple workers:
 
 ```bash
 curl -fL https://raw.githubusercontent.com/StewartSethA/PushbuttonLocalCoders/main/install-coder-local.sh \
-  | bash -s -- --system \
-    'qwen3.8:27b@gpu=0,vram=16G' \
-    'qwen3.6:35b@gpu=1,vram=16G' \
-    --agents 2
+  | bash -s -- --system --install-only
+qwen-local 'qwen3.8:27b@gpu=0,vram=16G' \
+  'qwen3.6:35b@gpu=1,vram=16G' --agents 2
 ```
 
-To install and enter the selector directly with flags:
+Enter the selector from a terminal after installing:
 
 ```bash
-curl -fL https://raw.githubusercontent.com/StewartSethA/PushbuttonLocalCoders/main/install-coder-local.sh \
-  | bash -s -- --system --select \
-    qwen3.8:27b --gpu 0 --vram-limit 16G --ram-limit 32G
+qwen-local --select qwen3.8:27b --local-context 65536
 ```
 
 If the installer is run with no model or other arguments in an interactive
@@ -211,3 +209,14 @@ implicitly opens `/dev/tty`; `--select` without a TTY prints guidance rather tha
 blocking. To select interactively after installing, run `qwen-local --select`
 from a terminal. Automated scripts should pass explicit model(s) or request
 structured selector output.
+
+Explicit model arguments to `install-coder-local.sh` are forwarded to the newer
+unified `pushbutton` runtime. Use `qwen-local` or `pushbutton-select` explicitly
+for the joint replica planner and confirmation flow described above.
+
+The selector also preserves the unified runtime's expanded model catalog,
+vendor capability hints, and 25 tok/s speed-policy labels. Catalog entries that
+lack a coder/Claude/Hermes planner profile are inspection-only in this flow:
+their JSON rows remain available, but the joint frontend plan is unavailable.
+Vendor capability hints and upstream speed references are not local validation;
+missing measured throughput stays unknown.

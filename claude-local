@@ -54,6 +54,7 @@ Built-ins: nemotron-3.5-lightning qwen3.6:35b qwen3.8:27b glm-5.3-flash
 Harness options (put before ordinary Claude Code flags):
   --select                   choose models interactively before provisioning
   --local-cache DIR          llama.cpp/Hugging Face model cache
+  --no-parallel              Force sequential Hugging Face downloads
   --local-context N          physical backend context (default 262144)
   --local-client-context N   Claude Code budget (default 200000)
   --local-port-base N        starting port for gateway/backends
@@ -348,9 +349,10 @@ start_backends() {
     mkdir -p "$STATE_DIR/logs" "$CACHE_DIR"; export LLAMA_CACHE="$CACHE_DIR" GGML_CUDA_ENABLE_UNIFIED_MEMORY="$ALLOW_OFFLOAD" CUDA_SCALE_LAUNCH_QUEUES=4x
     local next=$((PORT_BASE+1)); BACKENDS_TSV="$STATE_DIR/backends.$$"; : > "$BACKENDS_TSV"
     while IFS=$'\x1f' read -r id hf gpus multi kvk kvv batch ubatch fa template envpairs note; do
-        local port log pid follower failed=0 waited=0
+        local port log pid follower model_path failed=0 waited=0
+        download_model_fast "$hf" "$CACHE_DIR" model_path || die "failed to download $hf"
         port="$(free_port "$next")"; next=$((port+1)); log="$STATE_DIR/logs/${id}.log"; : > "$log"
-        local -a cmd=("$LLAMA_SERVER" -hf "$hf" --alias "$id" --no-mmproj -ngl 999 -c "$CTX" -np 1 --cache-type-k "$kvk" --cache-type-v "$kvv" -b "$batch" -ub "$ubatch" -fa "$fa" --jinja --no-context-shift --host 127.0.0.1 --port "$port")
+        local -a cmd=("$LLAMA_SERVER" -m "$model_path" --alias "$id" --no-mmproj -ngl 999 -c "$CTX" -np 1 --cache-type-k "$kvk" --cache-type-v "$kvv" -b "$batch" -ub "$ubatch" -fa "$fa" --jinja --no-context-shift --host 127.0.0.1 --port "$port")
         [[ "$multi" == 1 ]] && cmd+=(--split-mode layer)
         [[ "$template" == qwen-fixed ]] && cmd+=(--chat-template-file "$QWEN_TEMPLATE")
         local -a envcmd=(env "CUDA_VISIBLE_DEVICES=$gpus" "LLAMA_CACHE=$CACHE_DIR" "GGML_CUDA_ENABLE_UNIFIED_MEMORY=$ALLOW_OFFLOAD" "CUDA_SCALE_LAUNCH_QUEUES=4x")
@@ -505,6 +507,7 @@ while (($#)); do
       --select) SELECT=1; shift;;
       --) shift; CLAUDE_ARGS+=("$@"); break;;
       --local-cache) [[ $# -ge 2 ]] || die "--local-cache needs a directory"; CACHE_DIR="$2"; SELECT_ARGS+=("$1" "$2"); shift 2;;
+      --no-parallel) PUSHBUTTON_NO_PARALLEL=1; SELECT_ARGS+=("$1"); shift;;
       --local-context) CTX="$2"; shift 2;;
       --local-client-context) CLIENT_CTX="$2"; CLIENT_CTX_EXPLICIT=1; shift 2;;
       --local-port-base) PORT_BASE="$2"; SELECT_ARGS+=("$1" "$2"); shift 2;;
@@ -534,6 +537,7 @@ if ((SELECT)) || ((${#MODELS[@]} == 0)); then
     exec python3 "$ROOT/pushbutton-select" "${selector_args[@]}"
 fi
 [[ "${CLAUDE_LOCAL_STARTUP_ONLY:-0}" != 1 ]] || exit 125
+source "$LIB/pushbutton_download.sh"
 require_files
 [[ "$CTX" =~ ^[0-9]+$ && "$CLIENT_CTX" =~ ^[0-9]+$ ]] || die "context values must be integers"
 (( CLIENT_CTX <= CTX )) || die "client context ($CLIENT_CTX) exceeds physical context ($CTX)"
