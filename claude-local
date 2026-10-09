@@ -23,6 +23,8 @@ KEEP_SERVERS=0
 ENABLE_TEAMS=1
 DRY_RUN=0
 VERBOSE=0
+QUIET=0
+FOLDERS_ONLY=0
 SELECT=0
 SELECT_ARGS=()
 MODELS=()
@@ -54,6 +56,8 @@ Built-ins: nemotron-3.5-lightning qwen3.6:35b qwen3.8:27b glm-5.3-flash
 Harness options (put before ordinary Claude Code flags):
   --select                   choose models interactively before provisioning
   --local-cache DIR          llama.cpp/Hugging Face model cache
+  --folders, --system-info   show storage paths and disk usage, then exit
+  --quiet                    suppress the startup folder banner
   --no-parallel              Force sequential Hugging Face downloads
   --local-context N          physical backend context (default 262144)
   --local-client-context N   Claude Code budget (default 200000)
@@ -350,7 +354,8 @@ start_backends() {
     local next=$((PORT_BASE+1)); BACKENDS_TSV="$STATE_DIR/backends.$$"; : > "$BACKENDS_TSV"
     while IFS=$'\x1f' read -r id hf gpus multi kvk kvv batch ubatch fa template envpairs note; do
         local port log pid follower model_path failed=0 waited=0
-        download_model_fast "$hf" "$CACHE_DIR" model_path || die "failed to download $hf"
+        validate_download_space "$CACHE_DIR" "$hf" "${hf##*:}" || exit 2
+        download_model_fast "$hf" "$CACHE_DIR" model_path || { rc=$?; [[ $rc != 2 ]] || exit 2; die "failed to download $hf"; }
         port="$(free_port "$next")"; next=$((port+1)); log="$STATE_DIR/logs/${id}.log"; : > "$log"
         local -a cmd=("$LLAMA_SERVER" -m "$model_path" --alias "$id" --no-mmproj -ngl 999 -c "$CTX" -np 1 --cache-type-k "$kvk" --cache-type-v "$kvv" -b "$batch" -ub "$ubatch" -fa "$fa" --jinja --no-context-shift --host 127.0.0.1 --port "$port")
         [[ "$multi" == 1 ]] && cmd+=(--split-mode layer)
@@ -358,6 +363,7 @@ start_backends() {
         local -a envcmd=(env "CUDA_VISIBLE_DEVICES=$gpus" "LLAMA_CACHE=$CACHE_DIR" "GGML_CUDA_ENABLE_UNIFIED_MEMORY=$ALLOW_OFFLOAD" "CUDA_SCALE_LAUNCH_QUEUES=4x")
         if [[ -n "$envpairs" ]]; then local -a pairs; IFS=';' read -ra pairs <<< "$envpairs"; local pair; for pair in "${pairs[@]}"; do envcmd+=("$pair"); done; fi
         say "Starting $id on GPU(s) [$gpus], $hf, ctx=$CTX${note:+ — $note}"
+        printf '[claude-local] Follow %s logs in another terminal:\n  tail -n 50 -F -- %q\n' "$id" "$log" >&2
         "${envcmd[@]}" "${cmd[@]}" >"$log" 2>&1 & pid=$!; PIDS+=("$pid")
         follower="$(start_log_follower "$log")"
         while ! curl -fsS "http://127.0.0.1:$port/health" >/dev/null 2>&1; do
@@ -497,7 +503,7 @@ doctor() {
 case "${1:-}" in
   help|-h|--help) usage; exit 0;;
   install) shift; install_base_deps; install_claude_code; install_command "${1:-}"; exit 0;;
-  doctor) doctor; exit 0;;
+  doctor) source "$LIB/pushbutton_folders.sh"; load_folder_config; check_folders_exist; print_folder_summary 0; doctor; exit 0;;
   models) python3 "$PLAN_PY" catalogue; exit 0;;
 esac
 
@@ -506,7 +512,9 @@ while (($#)); do
       -h|--help) usage; exit 0;;
       --select) SELECT=1; shift;;
       --) shift; CLAUDE_ARGS+=("$@"); break;;
-      --local-cache) [[ $# -ge 2 ]] || die "--local-cache needs a directory"; CACHE_DIR="$2"; SELECT_ARGS+=("$1" "$2"); shift 2;;
+      --local-cache) [[ $# -ge 2 ]] || die "--local-cache needs a directory"; export CLAUDE_LOCAL_CACHE="$2"; SELECT_ARGS+=("$1" "$2"); shift 2;;
+      --folders|--system-info) FOLDERS_ONLY=1; shift;;
+      --quiet) QUIET=1; SELECT_ARGS+=("$1"); shift;;
       --no-parallel) PUSHBUTTON_NO_PARALLEL=1; SELECT_ARGS+=("$1"); shift;;
       --local-context) CTX="$2"; shift 2;;
       --local-client-context) CLIENT_CTX="$2"; CLIENT_CTX_EXPLICIT=1; shift 2;;
@@ -521,6 +529,14 @@ while (($#)); do
     esac
 done
 
+if ((FOLDERS_ONLY)); then
+    source "$LIB/pushbutton_folders.sh"
+    load_folder_config
+    check_folders_exist
+    print_folder_summary 1
+    printf '  Claude Code user data: %s\n' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+    exit 0
+fi
 if ((SELECT)) || ((${#MODELS[@]} == 0)); then
     if [[ ! -t 0 || ! -t 1 ]]; then
         usage >&2
@@ -539,6 +555,10 @@ fi
 [[ "${CLAUDE_LOCAL_STARTUP_ONLY:-0}" != 1 ]] || exit 125
 source "$LIB/pushbutton_download.sh"
 require_files
+source "$LIB/pushbutton_folders.sh"
+initialize_folders "$QUIET"
+((QUIET)) || say "Claude Code user data: ${CLAUDE_CONFIG_DIR:-$HOME/.claude} (managed by Claude Code)"
+LOCK_FILE="${CLAUDE_LOCAL_LOCK_FILE:-$STATE_DIR/startup.lock}"
 [[ "$CTX" =~ ^[0-9]+$ && "$CLIENT_CTX" =~ ^[0-9]+$ ]] || die "context values must be integers"
 (( CLIENT_CTX <= CTX )) || die "client context ($CLIENT_CTX) exceeds physical context ($CTX)"
 if [[ $DRY_RUN -eq 0 ]]; then install_base_deps; ensure_nvidia_driver; else have_cmd nvidia-smi || die "nvidia-smi required for dry run"; fi
@@ -550,6 +570,7 @@ mkdir -p "$STATE_DIR" "$CACHE_DIR"; PLAN_FILE="$STATE_DIR/plan.$$.json"
 plan_args=(plan --context "$CTX"); if ((${#MODELS[@]})); then plan_args+=("${MODELS[@]}"); else plan_args+=(--smart); fi
 python3 "$PLAN_PY" "${plan_args[@]}" > "$PLAN_FILE" || exit $?
 print_plan; [[ $DRY_RUN -eq 1 ]] && exit 0
+validate_plan_download_space "$PLAN_FILE" "$CACHE_DIR" || exit 2
 install_claude_code; prepare_host_compiler; activate_cuda; ensure_llamacpp
 grep -q '"template": "qwen-fixed"' "$PLAN_FILE" && fetch_qwen_template || true
 start_backends; write_gateway_config; start_gateway

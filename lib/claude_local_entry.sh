@@ -8,23 +8,44 @@ ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
 STATE_DIR="${CLAUDE_LOCAL_STATE:-$HOME/.local/share/pushbutton/claude-local}"
 WEB_MCP="${CLAUDE_LOCAL_WEB_MCP:-1}"
 ARGS=()
+INFO_ONLY=0
+case "${1:-}" in
+  help|-h|--help|models|doctor) exec "$ROOT/claude-local" "$@";;
+esac
 while (($#)); do
   case "$1" in
+    --)
+      ARGS+=("$@"); break;;
     --local-state)
       [[ $# -ge 2 ]] || { echo "--local-state needs a directory" >&2; exit 2; }
       STATE_DIR="$2"; export CLAUDE_LOCAL_STATE="$2"; shift 2;;
+    --local-cache)
+      [[ $# -ge 2 ]] || { echo "--local-cache needs a directory" >&2; exit 2; }
+      export CLAUDE_LOCAL_CACHE="$2"; ARGS+=("$1" "$2"); shift 2;;
     --local-no-web)
       WEB_MCP=0; shift;;
+    --folders|--system-info)
+      INFO_ONLY=1; ARGS+=("$1"); shift;;
+    --local-context|--local-client-context|--local-port-base)
+      [[ $# -ge 2 ]] || { echo "$1 needs a value" >&2; exit 2; }
+      ARGS+=("$1" "$2"); shift 2;;
+    --select|--quiet|--no-parallel|--local-no-teams|--local-keep-servers|--local-allow-offload|--local-dry-run|--local-verbose)
+      ARGS+=("$1"); shift;;
+    -*)
+      ARGS+=("$@"); break;;
     *) ARGS+=("$1"); shift;;
   esac
 done
 
+((INFO_ONLY == 0)) || exec "$ROOT/claude-local" "${ARGS[@]}"
 if CLAUDE_LOCAL_STARTUP_ONLY=1 CLAUDE_LOCAL_WEB_MCP="$WEB_MCP" "$ROOT/claude-local" "${ARGS[@]}"; then
   exit 0
 else
   startup_rc=$?
   [[ $startup_rc -eq 125 ]] || exit "$startup_rc"
 fi
+source "$ROOT/lib/pushbutton_folders.sh"
+initialize_folders 1
 
 # Local inference can have long first-token and tool/subagent queues. Claude's
 # hosted defaults are too aggressive for a single 3090/V100 under a large
