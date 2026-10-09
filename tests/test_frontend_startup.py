@@ -18,12 +18,12 @@ WRAPPERS = ("qwen-local", "opencode-local", "deepseek-local", "mini-swe-local")
 
 class StartupTests(unittest.TestCase):
     def setUp(self):
-        self.scratch = tempfile.TemporaryDirectory(dir=ROOT)
+        self.scratch = tempfile.TemporaryDirectory(dir="/tmp")
         self.addCleanup(self.scratch.cleanup)
         self.root = pathlib.Path(self.scratch.name)
         self.bin = self.root / "bin"
         self.bin.mkdir()
-        for name in ("bash", "cat", "dirname", "basename", "readlink", "mkdir", "chmod", "ln", "mv", "rm"):
+        for name in ("bash", "cat", "dirname", "basename", "readlink", "mkdir", "chmod", "ln", "mv", "rm", "stat", "df"):
             (self.bin / name).symlink_to(shutil.which(name))
         (self.bin / "python3").symlink_to(sys.executable)
         for name in FRONTENDS + WRAPPERS + ("claude-local-safe",):
@@ -198,6 +198,48 @@ class StartupTests(unittest.TestCase):
                 self.assertIn("--launch-arg=--no-parallel", record["argv"])
                 self.assertFalse((self.root / "state").exists())
 
+    def test_storage_options_survive_selection_without_creating_folders(self):
+        self.selector_recorder()
+        cache = self.root / "chosen model cache"
+        for name in FRONTENDS + WRAPPERS:
+            with self.subTest(frontend=name):
+                record = self.recorded(name, ["--select", "q38", "--quiet",
+                                             "--local-cache", str(cache)])
+                for arg in ("--quiet", "--local-cache", str(cache)):
+                    self.assertIn("--launch-arg=" + arg, record["argv"])
+                self.assertFalse(cache.exists())
+                self.assertFalse((self.root / "state").exists())
+
+    def test_selector_uses_relocated_placement_without_writing_state(self):
+        self.selector_recorder()
+        (self.root / "lib").mkdir()
+        shutil.copy2(ROOT / "lib/pushbutton_folders.sh",
+                     self.root / "lib/pushbutton_folders.sh")
+        config = self.root / "custom config"
+        config.mkdir()
+        folders = config / "folders.json"
+        original = json.dumps({
+            "schema_version": 1,
+            "folders": {"state_dir": str(self.root / "state"),
+                        "cache_dir": str(self.root / "cache"),
+                        "config_dir": str(config)},
+            "created_at": "2026-10-09T00:00:00+00:00",
+        })
+        folders.write_text(original)
+        self.env["PUSHBUTTON_CONFIG_DIR"] = str(config)
+        for name in ("coder-local", "qwen-local"):
+            with self.subTest(frontend=name):
+                argv = self.recorded(name, ["--select", "q38"])["argv"]
+                self.assertEqual(argv[argv.index("--placement-config") + 1],
+                                 str(config / "placement.json"))
+                argv = self.recorded(name, ["--select", "q38", "--placement-config",
+                                           "explicit-placement.json"])["argv"]
+                self.assertEqual(argv[argv.index("--placement-config") + 1],
+                                 "explicit-placement.json")
+                self.assertEqual(folders.read_text(), original)
+                self.assertFalse((self.root / "state").exists())
+                self.assertFalse((self.root / "cache").exists())
+
     def test_safe_claude_wrapper_has_menu_and_help_before_gpu_probe(self):
         self.selector_recorder()
         nvidia = self.bin / "nvidia-smi"
@@ -224,6 +266,8 @@ class StartupTests(unittest.TestCase):
             "'swarm':os.environ.get('MINI_SWE_SWARM_TASK')}))\n")
         coder.chmod(0o755)
         (self.root / "lib").mkdir()
+        shutil.copy2(ROOT / "lib/pushbutton_folders.sh",
+                     self.root / "lib/pushbutton_folders.sh")
         (self.root / "lib" / "claude_local_hostcc.sh").write_text(
             "claude_local_prepare_hostcc() { :; }\n")
         for tool in ("cmake", "opencode", "npm", "dsh", "pnpm", "mini", "grep"):
@@ -317,6 +361,8 @@ class StartupTests(unittest.TestCase):
 
     def test_claude_entry_confirmed_models_keep_hardened_policy(self):
         entry = self.prepare_claude_entry()
+        shutil.copy2(ROOT / "lib/pushbutton_folders.sh",
+                     self.root / "lib/pushbutton_folders.sh")
         frontend = self.root / "claude-local"
         frontend.write_text(
             "#!" + sys.executable + "\nimport json, os, sys\n"
@@ -393,18 +439,40 @@ class StartupTests(unittest.TestCase):
                       "pushbutton-backend", "pushbutton-bench", "pushbutton-observe", "pushbutton-select"):
             (template / extra).write_text("#!/bin/bash\necho UNEXPECTED_TOOL\nexit 91\n")
         (template / "lib").mkdir(exist_ok=True)
+        shutil.copy2(ROOT / "lib/pushbutton_folders.sh",
+                     template / "lib/pushbutton_folders.sh")
         for asset in ("pushbutton_metrics.py", "coder_local_plan.py", "claude_local_plan.py"):
             (template / "lib" / asset).touch()
         entry = template / "lib" / "claude_local_entry.sh"
         shutil.copy2(ROOT / "lib" / "claude_local_entry.sh", entry)
         (template / "configs").mkdir(exist_ok=True)
         (template / "configs" / "backend-registry.json").write_text("{}")
+        (template / ".git").mkdir(exist_ok=True)
         git = self.bin / "git"
-        git.write_text("#!" + sys.executable + "\nimport os, shutil, sys\n"
-                       "if sys.argv[1] == 'clone': shutil.copytree(os.environ['TEMPLATE'], sys.argv[-1])\n")
+        git.write_text("#!" + sys.executable + "\nimport os, pathlib, shutil, sys\n"
+                       "args = sys.argv[1:]\n"
+                       "if 'clone' in args: shutil.copytree(os.environ['TEMPLATE'], args[-1])\n"
+                       "elif 'checkout' in args:\n"
+                       "  if '-f' not in args: sys.exit(1)\n"
+                       "  dest = pathlib.Path(args[args.index('-C') + 1])\n"
+                       "  shutil.copy2(pathlib.Path(os.environ['TEMPLATE']) / 'lib/claude_local_entry.sh', "
+                       "dest / 'lib/claude_local_entry.sh')\n")
         git.chmod(0o755)
         self.env.update(PUSHBUTTON_DIR=str(self.root / "installed"), TEMPLATE=str(template))
         return installer
+
+    def test_claude_installer_update_replaces_local_edits(self):
+        installer = self.prepare_installer("claude-local")
+        result = self.run_script(installer)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        installed_entry = self.root / "installed/PushbuttonLocalCoders/lib/claude_local_entry.sh"
+        installed_entry.write_text("local edit\n")
+        result = self.run_script(installer)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(installed_entry.read_text(),
+                         (self.root / "template/lib/claude_local_entry.sh").read_text())
 
     def test_piped_installer_noargs_installs_and_prints_help(self):
         for name in FRONTENDS:
@@ -414,7 +482,10 @@ class StartupTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("Usage:", result.stdout)
                 self.assertNotIn("UNEXPECTED_TOOL", result.stdout)
-                self.assertFalse((self.root / "state").exists())
+                self.assertFalse((self.root / "state/web-mcp.json").exists())
+                self.assertFalse((self.root / "state/frontends").exists())
+                if name != "hermes-local":
+                    self.assertTrue((self.root / "home/.config/pushbutton-local/folders.json").exists())
                 shutil.rmtree(self.root / "installed")
 
     def test_coder_installer_install_only_retains_runtime_installation(self):
@@ -435,7 +506,7 @@ class StartupTests(unittest.TestCase):
                 result = self.run_script(shim, args)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("interactive terminal", result.stderr)
-                self.assertFalse((self.root / "state").exists())
+                self.assertFalse((self.root / "state/web-mcp.json").exists())
 
     def test_piped_installer_select_and_help_exit_before_git(self):
         for name in FRONTENDS:

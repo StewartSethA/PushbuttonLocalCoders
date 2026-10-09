@@ -324,8 +324,11 @@ print('huggingface_hub: 100%',file=sys.stderr)
         self.assertFalse((self.cache / ".download-log").exists())
 
     def test_folder_validation_hook(self):
-        proc = self.fast('validate_download_space() { echo "folder policy rejected" >&2; return 1; }; ')
-        self.assertNotEqual(proc.returncode, 0)
+        self.env["TEST_CACHE"] = str(self.cache)
+        proc = self.fast('validate_download_space() { '
+                         '[[ "$1" == "$TEST_CACHE" && "$2" == owner/repo:UD-Q4_K_XL ]] || return 99; '
+                         'echo "folder policy rejected" >&2; return 2; }; ')
+        self.assertEqual(proc.returncode, 2)
         self.assertIn("folder policy rejected", proc.stderr)
         self.assertFalse(self.calls.exists())
 

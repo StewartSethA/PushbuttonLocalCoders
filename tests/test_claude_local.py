@@ -250,7 +250,8 @@ class ContextPolicyTests(unittest.TestCase):
         launcher = (ROOT / "claude-local").read_text()
         functions = launcher.split('\ncase "${1:-}" in\n', 1)[0]
         functions = functions.replace('ROOT="$(cd "$(dirname "$SELF")" && pwd)"', f"ROOT={shlex.quote(str(ROOT))}")
-        startup = launcher[launcher.index("\nif ! have_cmd python3; then"):launcher.index('\nmkdir -p "$STATE_DIR" "$CACHE_DIR"; PLAN_FILE=')]
+        startup = launcher[launcher.index("\nif ! have_cmd python3; then"):launcher.index('\nsource "$LIB/pushbutton_folders.sh"\ninitialize_folders')]
+        startup += launcher[launcher.index("\nif [[ $DRY_RUN -eq 0 ]]; then install_base_deps; ensure_nvidia_driver;"):launcher.index('\nmkdir -p "$STATE_DIR" "$CACHE_DIR"; PLAN_FILE=')]
         with tempfile.TemporaryDirectory() as tmp:
             script = pathlib.Path(tmp) / "bootstrap.sh"
             script.write_text(functions + """
