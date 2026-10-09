@@ -100,6 +100,11 @@ class Profile:
 
 
 ALIASES = {
+    "ornith-1.5:9b": "ornith-1.5:9b", "ornith": "ornith-1.5:9b",
+    "ornith-1.5": "ornith-1.5:9b", "ornith-9b": "ornith-1.5:9b",
+    "ornith-1.5-9b": "ornith-1.5:9b",
+    "ornith-1.5:35b-a3b": "ornith-1.5:35b-a3b", "ornith-35b": "ornith-1.5:35b-a3b",
+    "ornith-1.5-35b": "ornith-1.5:35b-a3b", "ornith-1.5-35b-a3b": "ornith-1.5:35b-a3b",
     "qwen3.8:27b": "qwen3.8:27b", "qwen3.8-27b": "qwen3.8:27b", "q38": "qwen3.8:27b",
     "qwen3.8": "qwen3.8:27b", "qwen38": "qwen3.8:27b",
     "qwen3.8-flash-next": "qwen3.8-flash-next", "qwen3.8:flash-next": "qwen3.8-flash-next",
@@ -118,6 +123,20 @@ ALIASES = {
 # quant, compute buffers, and a modest CUDA safety margin. Profiles are ordered
 # best quality first. Values are conservative planning envelopes, not promises.
 PROFILES: dict[str, tuple[Profile, ...]] = {
+    # Catalog weights plus context/buffer overhead, rounded up to whole GiB.
+    # These envelopes are planning estimates, not local allocation/speed evidence.
+    "ornith-1.5:9b": (
+        Profile("ornith-1.5:9b", "Ornith 1.5 9B", "ornith-ai/Ornith-1.5-9B-GGUF", "Q8_0", 17*1024, 100),
+        Profile("ornith-1.5:9b", "Ornith 1.5 9B", "ornith-ai/Ornith-1.5-9B-GGUF", "Q6_K", 15*1024, 98),
+        Profile("ornith-1.5:9b", "Ornith 1.5 9B", "ornith-ai/Ornith-1.5-9B-GGUF", "Q5_K_M", 14*1024, 97),
+        Profile("ornith-1.5:9b", "Ornith 1.5 9B", "ornith-ai/Ornith-1.5-9B-GGUF", "Q4_K_M", 13*1024, 95),
+    ),
+    "ornith-1.5:35b-a3b": (
+        Profile("ornith-1.5:35b-a3b", "Ornith 1.5 35B-A3B", "ornith-ai/Ornith-1.5-35B-A3B-GGUF", "Q8_0", 49*1024, 100),
+        Profile("ornith-1.5:35b-a3b", "Ornith 1.5 35B-A3B", "ornith-ai/Ornith-1.5-35B-A3B-GGUF", "Q6_K", 40*1024, 98),
+        Profile("ornith-1.5:35b-a3b", "Ornith 1.5 35B-A3B", "ornith-ai/Ornith-1.5-35B-A3B-GGUF", "Q5_K_M", 36*1024, 97),
+        Profile("ornith-1.5:35b-a3b", "Ornith 1.5 35B-A3B", "ornith-ai/Ornith-1.5-35B-A3B-GGUF", "Q4_K_M", 33*1024, 95),
+    ),
     "qwen3.8:27b": (
         Profile("qwen3.8:27b", "Qwen3.8 27B", "unsloth/Qwen3.8-27B-GGUF", "Q8_0", 35*1024, 100, template="qwen-fixed"),
         Profile("qwen3.8:27b", "Qwen3.8 27B", "unsloth/Qwen3.8-27B-GGUF", "UD-Q6_K", 28*1024, 98, template="qwen-fixed"),
