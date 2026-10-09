@@ -97,6 +97,17 @@ class SelectorTests(unittest.TestCase):
                 self.run_sel('--help')
         self.assertEqual(cm.exception.code, 0)
 
+    def test_claude_replica_preview_and_launch_match(self):
+        gpus = selector.workers.synthetic_3090(2)
+        result, models = selector.joint_preview(
+            ["q38@context=32K,slots=2"], "claude-local", 2, gpus, 262144)
+        self.assertEqual(len(result["servers"]), 2)
+        self.assertEqual(models, ["qwen3.8:27b@context=32K,slots=2"] * 2)
+        command = selector.launch_command(
+            "claude-local", models, result, 262144, None, [])
+        self.assertEqual(command.count(models[0]), 2)
+        self.assertNotEqual(result["role_ids"]["haiku"], result["role_ids"]["sonnet"])
+
     def test_welcome_invalid_help_and_quit_before_inventory(self):
         code, out, _, launch, inventory = self.run_sel(tty=True, inputs=['invalid', '4', '5'])
         self.assertEqual(code, 0)
@@ -238,7 +249,7 @@ class SelectorTests(unittest.TestCase):
         self.assertEqual([r["req"] for r in selected],
                          [w["required_mib"] for w in obj["plan"]["workers"]])
 
-    def test_claude_and_hermes_share_roles_not_replicas(self):
+    def test_role_frontends_keep_repeated_selectors_independent(self):
         for frontend in ('claude-local', 'hermes-local'):
             with self.subTest(frontend=frontend):
                 code, out, _, _, _ = self.run_sel(
@@ -246,10 +257,10 @@ class SelectorTests(unittest.TestCase):
                     '--json', gpus=selector.workers.synthetic_v100(2))
                 obj = json.loads(out)
                 self.assertEqual(code, 0, obj)
-                self.assertEqual(len(obj['plan']['servers']), 1)
+                self.assertEqual(len(obj['plan']['servers']), 2)
                 self.assertIn('roles', obj['plan'])
                 self.assertNotIn('--agents', obj['launch_argv'])
-                self.assertEqual(obj['launch_env']['PUSHBUTTON_SELECTOR_GPU_INDICES'], '0')
+                self.assertEqual(obj['launch_env']['PUSHBUTTON_SELECTOR_GPU_INDICES'], '0,1')
                 if frontend == 'claude-local':
                     self.assertEqual(obj['launch_argv'][:2], ['bash', str(ROOT / 'lib/claude_local_entry.sh')])
 

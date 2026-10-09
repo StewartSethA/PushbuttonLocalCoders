@@ -16,6 +16,7 @@ CACHE_DIR="${CLAUDE_LOCAL_CACHE:-$HOME/.cache/pushbutton/llama}"
 LOCK_FILE="${CLAUDE_LOCAL_LOCK_FILE:-$HOME/.local/share/pushbutton/claude-local/startup.lock}"
 CTX="${CLAUDE_LOCAL_CONTEXT:-262144}"
 SLOTS=1
+AGENTS=""
 CLIENT_CTX="${CLAUDE_LOCAL_CLIENT_CONTEXT:-}"
 CLIENT_CTX_EXPLICIT=0
 [[ -z "${CLAUDE_LOCAL_CLIENT_CONTEXT+x}" ]] || CLIENT_CTX_EXPLICIT=1
@@ -52,6 +53,8 @@ Model order:
   2 models: Haiku = #1, Sonnet/Opus/Fable = #2
   3 models: Haiku = #1, Sonnet = #2, Opus/Fable = #3
   4 models: Haiku, Sonnet, Opus, Fable respectively
+  Each supplied model is an independent instance, even for repeated models.
+  Unspecified roles reuse the last instance.
 
 Built-ins: nemotron-3.5-lightning qwen3.6:35b qwen3.8:27b glm-5.3-flash
 
@@ -63,6 +66,8 @@ Harness options (put before ordinary Claude Code flags):
   --no-parallel              Force sequential Hugging Face downloads
   --local-context N          fallback hard context per slot (default 262144)
   --slots N                  fallback parallel slots per model
+  --agents N                 replicate model configs into N instances (1-4)
+                             JSON agent definitions still pass to Claude Code
   MODEL@context=N,slots=N,output=N,client_context=N,compact=N,quant=Q,kv_k=K,kv_v=V,min_tps=N,admission=N
   --local-client-context N   assumed client window (default derived, <=200000)
   --local-port-base N        starting port for gateway/backends
@@ -550,6 +555,14 @@ while (($#)); do
       --no-parallel) PUSHBUTTON_NO_PARALLEL=1; SELECT_ARGS+=("$1"); shift;;
       --local-context) [[ $# -ge 2 ]] || die "--local-context needs an integer"; CTX="$2"; shift 2;;
       --slots) [[ $# -ge 2 ]] || die "--slots needs a value"; SLOTS="$2"; shift 2;;
+      --agents)
+        [[ $# -ge 2 ]] || die "--agents needs a value"
+        if [[ "$2" =~ ^[0-9]+$ ]]; then
+            [[ "$2" =~ ^[1-4]$ ]] || die "--agents must be between 1 and 4"
+            AGENTS="$2"; shift 2
+        else
+            CLAUDE_ARGS+=("$@"); break
+        fi;;
       --local-client-context) [[ $# -ge 2 ]] || die "--local-client-context needs an integer"; CLIENT_CTX="$2"; CLIENT_CTX_EXPLICIT=1; shift 2;;
       --local-port-base) PORT_BASE="$2"; SELECT_ARGS+=("$1" "$2"); shift 2;;
       --local-no-teams) ENABLE_TEAMS=0; SELECT_ARGS+=("$1"); shift;;
@@ -578,6 +591,7 @@ if ((SELECT)) || ((${#MODELS[@]} == 0)); then
     have_cmd python3 || die "python3 is required for the interactive selector"
     [[ -f "$ROOT/pushbutton-select" ]] || die "missing $ROOT/pushbutton-select; reinstall claude-local"
     selector_args=(--frontend claude-local --menu --context "$CTX")
+    [[ -z "$AGENTS" ]] || selector_args+=(--agents "$AGENTS")
     [[ "$SLOTS" == 1 ]] || selector_args+=(--slots "$SLOTS")
     ((CLIENT_CTX_EXPLICIT == 0)) || selector_args+=(--client-context "$CLIENT_CTX")
     selector_args+=("${MODELS[@]}")
@@ -607,6 +621,7 @@ mkdir -p "$STATE_DIR" "$CACHE_DIR"; PLAN_FILE="$STATE_DIR/plan.$$.json"
 # second launch cannot observe the same free VRAM/port state and race the first.
 [[ $DRY_RUN -eq 0 ]] && acquire_startup_lock
 plan_args=(plan --context "$CTX" --slots "$SLOTS")
+[[ -z "$AGENTS" ]] || plan_args+=(--agents "$AGENTS")
 ((CLIENT_CTX_EXPLICIT == 0)) || plan_args+=(--client-context "$CLIENT_CTX")
 if ((${#MODELS[@]})); then plan_args+=("${MODELS[@]}"); else plan_args+=(--smart); fi
 python3 "$PLAN_PY" "${plan_args[@]}" > "$PLAN_FILE" || exit $?

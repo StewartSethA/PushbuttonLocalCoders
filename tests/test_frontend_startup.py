@@ -436,6 +436,13 @@ class StartupTests(unittest.TestCase):
                 self.assertIn(model, argv)
                 self.assertEqual(argv[argv.index("--slots") + 1], "2")
 
+    def test_claude_numeric_agents_survives_selection(self):
+        self.selector_recorder()
+        for frontend in ("claude-local", "claude-local-safe"):
+            argv = self.recorded(frontend, ["--select", "q38", "--agents", "2"])["argv"]
+            self.assertEqual(argv[argv.index("--agents") + 1], "2")
+            self.assertNotIn("--launch-arg=--agents", argv)
+
     def test_qwen_alias_preserves_frontend(self):
         self.selector_recorder()
         self.assertEqual(self.recorded("qwen-local")["argv"][:2],

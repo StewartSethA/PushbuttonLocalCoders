@@ -2,7 +2,7 @@
 """Hardware-aware model and GPU planner for claude-local.
 
 No third-party Python dependencies. The planner treats VRAM as a hard resource:
-concurrently served unique models receive disjoint GPU sets. A single model is
+concurrently served model instances receive disjoint GPU sets. A single model is
 placed on the freest viable GPU set, with system-aware maximum PCIe link
 capability as the next placement tie-breaker. Multiple requested models are
 planned jointly before any server is started so an early assignment cannot
@@ -421,7 +421,7 @@ def _score_add(a: tuple[int, ...], b: tuple[int, ...]) -> tuple[int, ...]:
 
 
 def joint_model_choices(
-    models: list[str], gpus: list[GPU], context: int, sonnet_model: str,
+    models: list[str] | list[int], gpus: list[GPU], context: int, sonnet_model: str,
     candidate_map: dict | None = None,
 ) -> list[Candidate] | None:
     """Find the best complete disjoint model/GPU plan before launching."""
@@ -438,11 +438,12 @@ def joint_model_choices(
         # hardest models first, with the same freest/link-aware local policy.
         remaining = list(gpus)
         result: list[Candidate] = []
-        for model in sorted(
+        order = sorted(
             models,
             key=lambda m: min(c.required_mib for c in candidates[m]),
             reverse=True,
-        ):
+        )
+        for model in order:
             available = {gpus.index(g) for g in remaining}
             viable = [c for c in candidates[model] if set(c.gpu_positions) <= available]
             local = min(viable, key=lambda c: (c.card_count, -c.free_mib, -c.link_score,
@@ -464,7 +465,7 @@ def joint_model_choices(
                 )
             )
             remaining = [g for g in remaining if g not in chosen]
-        by_model = {c.model: c for c in result}
+        by_model = dict(zip(order, result))
         return [by_model[m] for m in models]
 
     # Hardest-first ordering reduces branching only; the global score chooses
@@ -511,7 +512,7 @@ def joint_model_choices(
     if found is None:
         return None
     _, choices = found
-    by_model = {c.model: c for c in choices}
+    by_model = dict(zip(order, choices))
     return [by_model[m] for m in models]
 
 
@@ -530,51 +531,27 @@ def ordered_group_for_layer_split(candidate: Candidate, gpus: list[GPU]) -> list
 
 
 def plan(models: list[str], gpus: list[GPU], context: int, slots: int = 1,
-         defaults: dict | None = None, client_context: int | None = None) -> dict:
+         defaults: dict | None = None, client_context: int | None = None,
+         agents: int | None = None) -> dict:
     # Lazy import keeps the existing coder -> base API import cycle harmless.
     from coder_local_plan import (parse_model_spec, candidates_for_request,
-                                  request_capacity, apply_client_context)
+                                  request_capacity, apply_client_context, expand_workers)
     capacity.resolve_options({}, context, slots)
-    requests = apply_client_context([parse_model_spec(m, defaults) for m in models],
-                                    context, client_context)
+    requests = expand_workers([parse_model_spec(m, defaults) for m in models], agents)
+    requests = apply_client_context(requests, context, client_context)
     rm = role_map([r.model for r in requests])
-    by_model = {}
-    def shared_settings(request):
-        resolved = capacity.resolve_options(request.capacity, context, slots)
-        for key in ("output", "compact", "safety"):
-            resolved.pop(key, None)
-        profile = PROFILES[request.model][0]
-        resolved.setdefault("kv_k", profile.kv_k)
-        resolved.setdefault("kv_v", profile.kv_v)
-        return resolved
-
-    for request in requests:
-        previous = by_model.get(request.model)
-        if previous is not None and (
-            (tuple(sorted(previous.gpu_indices)) if previous.gpu_indices is not None else None)
-            != (tuple(sorted(request.gpu_indices)) if request.gpu_indices is not None else None)
-            or previous.vram_limit_mib != request.vram_limit_mib
-            or shared_settings(previous) != shared_settings(request)
-        ):
-            raise ValueError(f"conflicting shared-role settings for {request.model}")
-        by_model[request.model] = request
-    unique: list[str] = []
-    for role in ROLES:
-        model = rm[role]
-        if model not in unique:
-            unique.append(model)
-
-    candidate_map = {m: candidates_for_request(by_model[m], gpus, context, slots,
-                                              quality_filter=False) for m in unique}
-    if len(unique) == 1:
-        candidates = candidate_map[unique[0]]
+    instances = list(range(len(requests)))
+    candidate_map = {i: candidates_for_request(requests[i], gpus, context, slots,
+                                              quality_filter=False) for i in instances}
+    if len(instances) == 1:
+        candidates = candidate_map[0]
         picked = min(candidates, key=lambda c: (c.card_count, -c.free_mib, -c.link_score,
                      -c.profile.quality, -c.speed_score,
                      tuple(gpus[p].index for p in c.gpu_positions))) if candidates else None
         choices = [picked] if picked else None
         policy = "freest-then-link"
     else:
-        choices = joint_model_choices(unique, gpus, context, rm["sonnet"], candidate_map)
+        choices = joint_model_choices(instances, gpus, context, rm["sonnet"], candidate_map)
         policy = "joint-global-plan"
 
     if not choices or any(c is None for c in choices):
@@ -586,15 +563,17 @@ def plan(models: list[str], gpus: list[GPU], context: int, slots: int = 1,
 
     servers = []
     used_mask = 0
-    for c in choices:
+    for i, (request, c) in enumerate(zip(requests, choices)):
         assert c is not None
         used_mask |= c.mask
         group = ordered_group_for_layer_split(c, gpus)
-        request = by_model[c.model]
         settings = request_capacity(request, c.profile, context, slots)
+        server_id = f"local-{c.model.replace(':', '-').replace('.', '').replace('_', '-')}"
+        if sum(r.model == request.model for r in requests) > 1:
+            server_id += f"-{i + 1}"
         servers.append(
             {
-                "id": f"local-{c.model.replace(':', '-').replace('.', '').replace('_', '-')}",
+                "id": server_id,
                 "model": c.model,
                 "profile": {
                     **asdict(c.profile),
@@ -616,8 +595,8 @@ def plan(models: list[str], gpus: list[GPU], context: int, slots: int = 1,
         )
 
     role_ids = {
-        role: next(s["id"] for s in servers if s["model"] == model)
-        for role, model in rm.items()
+        role: servers[min(i, len(servers) - 1)]["id"]
+        for i, role in enumerate(ROLES)
     }
     return {
         "context": context,
@@ -641,6 +620,7 @@ def main() -> int:
     lp.add_argument("models", nargs="*")
     lp.add_argument("--context", type=int, default=262144)
     lp.add_argument("--slots", type=int, default=1)
+    lp.add_argument("--agents", type=int)
     lp.add_argument("--client-context", type=int)
     lp.add_argument("--placement-config", default=os.path.expanduser(
         os.environ.get("PUSHBUTTON_PLACEMENT_CONFIG", "~/.config/pushbutton-local/placement.json")))
@@ -677,7 +657,7 @@ def main() -> int:
         from coder_local_plan import load_placement_config
         defaults = load_placement_config(args.placement_config)
         print(json.dumps(plan(models, gpus, args.context, args.slots, defaults,
-                              args.client_context), indent=2))
+                              args.client_context, args.agents), indent=2))
         return 0
     except ValueError as exc:
         print(f"claude-local planner: {exc}", file=sys.stderr)
