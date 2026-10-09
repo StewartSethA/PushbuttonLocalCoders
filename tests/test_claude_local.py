@@ -216,7 +216,7 @@ class ContextPolicyTests(unittest.TestCase):
             user_config = tmp / ".claude.json"
             user_config.write_text('{"autoCompactEnabled":false}')
             script = tmp / "launch.sh"
-            functions = (ROOT / "claude-local").read_text().split("\nrequire_files\n", 1)[0]
+            functions = (ROOT / "claude-local").read_text().split('\ncase "${1:-}" in\n', 1)[0]
             functions = functions.replace('ROOT="$(cd "$(dirname "$SELF")" && pwd)"', f"ROOT={shlex.quote(str(ROOT))}")
             script.write_text(functions + f"\nPLAN_FILE={shlex.quote(str(plan))}\n"
                               f"GATEWAY_CONFIG={shlex.quote(str(config))}\nSTATE_DIR={shlex.quote(str(tmp / 'state'))}\n"
@@ -241,14 +241,14 @@ class ContextPolicyTests(unittest.TestCase):
         env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "DISABLE_"))}
         for args in (["--local-context", "131072", "--local-client-context", "200000"],
                      ["--local-context", "65536"], ["--model", "sonnet[1m]"]):
-            result = subprocess.run(["bash", str(ROOT / "claude-local"), *args], env=env, capture_output=True, text=True)
+            result = subprocess.run(["bash", str(ROOT / "claude-local"), "q38", *args], env=env, capture_output=True, text=True)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("Context policy error", result.stderr)
             self.assertNotIn("Installing", result.stdout)
 
     def test_missing_python_bootstraps_before_policy_without_gpu(self):
         launcher = (ROOT / "claude-local").read_text()
-        functions = launcher.split("\nrequire_files\n", 1)[0]
+        functions = launcher.split('\ncase "${1:-}" in\n', 1)[0]
         functions = functions.replace('ROOT="$(cd "$(dirname "$SELF")" && pwd)"', f"ROOT={shlex.quote(str(ROOT))}")
         startup = launcher[launcher.index("\nif ! have_cmd python3; then"):launcher.index('\nmkdir -p "$STATE_DIR" "$CACHE_DIR"; PLAN_FILE=')]
         with tempfile.TemporaryDirectory() as tmp:

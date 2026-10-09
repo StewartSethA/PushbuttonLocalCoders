@@ -12,6 +12,13 @@ ROOT="$(cd "$(dirname "$SELF")" && pwd)"
 CORE="$ROOT/claude-local"
 [[ -x "$CORE" ]] || { echo "claude-local-safe: missing executable $CORE" >&2; exit 1; }
 
+if CLAUDE_LOCAL_STARTUP_ONLY=1 "$CORE" "$@"; then
+  exit 0
+else
+  startup_rc=$?
+  [[ $startup_rc -eq 125 ]] || exit "$startup_rc"
+fi
+
 # Do not allow a previous Ollama/local-provider setup to bleed into Claude Code.
 # claude-local sets a fresh ANTHROPIC_BASE_URL and credentials pointing only at
 # its own loopback gateway immediately before it invokes Claude Code.

@@ -107,8 +107,12 @@ def selector_views(model,context):
         cmd=[sys.executable,str(ROOT/'pushbutton-select'),model,'--context',str(context),'--no-interactive','--json']
         if idx is not None:cmd += ['--gpu',str(idx)]
         try:
-            obj=json.loads(subprocess.check_output(cmd,text=True,stderr=subprocess.DEVNULL));
-            for r in obj.get('rows',[]):
+            cp=subprocess.run(cmd,text=True,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
+            if cp.returncode not in (0,2):continue
+            obj=json.loads(cp.stdout)
+            rows=obj.get('rows',[])
+            if isinstance(rows,dict):rows=rows.get(canon(model),[])
+            for r in rows:
                 if r.get('status')=='FIT':out.append({**r,'gpu':idx})
         except Exception:pass
     return out
@@ -118,13 +122,13 @@ def quality_number(x):
     except Exception:return 0.0
 def choose_candidate(rows,allow_slow=False):
     if not rows:return None
-    def speed(r):return policy.speed_label(r.get('tg'),measured=r.get('evidence')=='MEASURED')[0]
+    def speed(r):return policy.speed_label(r.get('tg'),measured=r.get('evidence')=='LOCAL MEASURED')[0]
     okay=[r for r in rows if speed(r)=='OK']
     unknown=[r for r in rows if speed(r)=='UNKNOWN']
     pool=okay or (unknown if unknown else rows)
     if not allow_slow and not okay and not unknown:
-        best=max(rows,key=lambda r:r.get('tg') or 0);label,msg=policy.speed_label(best.get('tg'),measured=best.get('evidence')=='MEASURED');warn((msg or 'selected model is slow')+'\nNo >=25 tok/s fitting alternative was found.')
-    return max(pool,key=lambda r:(1 if r.get('evidence')=='MEASURED' else 0,r.get('tg') or 0,quality_number(r.get('quality')), -(r.get('req') or 0)))
+        best=max(rows,key=lambda r:r.get('tg') or 0);label,msg=policy.speed_label(best.get('tg'),measured=best.get('evidence')=='LOCAL MEASURED');warn((msg or 'selected model is slow')+'\nNo >=25 tok/s fitting alternative was found.')
+    return max(pool,key=lambda r:(1 if r.get('evidence')=='LOCAL MEASURED' else 0,r.get('tg') or 0,quality_number(r.get('quality')), -(r.get('req') or 0)))
 def hf_spec(model,artifact):
     if model in plan.PROFILES:
         for p in plan.PROFILES[model]:
@@ -227,7 +231,7 @@ def commission(model,context,row):
             proc=start_detached(cmd,logs/f'{model.replace(":","-")}-{backend}-{port}-c1.log',f'{model} / {backend} C1 fallback')
             if not wait_endpoint(proc,endpoint):raise SystemExit(f'backend failed to become ready even at C1; inspect {logs}')
         else:raise SystemExit(f'backend failed to become ready; inspect {logs}')
-    inst={'id':f'{model}-{backend}-{port}','model':model,'served_model':served_model(endpoint,model),'aliases':[model],'backend':backend,'artifact':artifact,'endpoint':endpoint,'pid':proc.pid,'max_context':context,'framework_max_concurrency':slots,'measured_envelopes':[{'concurrency':1,'max_context':context,'safe':True,'evidence':'PROVEN'}],'tg':row.get('tg'),'tg_measured':row.get('evidence')=='MEASURED','healthy':True,'gpu':gpu,'required_mib':row.get('req'),'provisioned_slots':slots,'calibration_safe':bool(backend=='llama.cpp' and slots>1)}
+    inst={'id':f'{model}-{backend}-{port}','model':model,'served_model':served_model(endpoint,model),'aliases':[model],'backend':backend,'artifact':artifact,'endpoint':endpoint,'pid':proc.pid,'max_context':context,'framework_max_concurrency':slots,'measured_envelopes':[{'concurrency':1,'max_context':context,'safe':True,'evidence':'PROVEN'}],'tg':row.get('tg'),'tg_measured':row.get('evidence')=='LOCAL MEASURED','healthy':True,'gpu':gpu,'required_mib':row.get('req'),'provisioned_slots':slots,'calibration_safe':bool(backend=='llama.cpp' and slots>1)}
     registry_store.append_instance(inst,REGISTRY);return inst
 
 def ensure_qwen():
@@ -280,7 +284,7 @@ def main():
         else:
             rows=selector_views(model,ctx);row=choose_candidate(rows,a.allow_slow)
             if not row:raise SystemExit(f'no fitting local configuration found for {model} at {ctx:,} context')
-            label,msg=policy.speed_label(row.get('tg'),measured=row.get('evidence')=='MEASURED')
+            label,msg=policy.speed_label(row.get('tg'),measured=row.get('evidence')=='LOCAL MEASURED')
             if label in {'SLOW','VERY_SLOW'}:warn(msg or f'{model} is expected to decode below {policy.MIN_DECODE_TOK_S:.0f} tok/s')
             say(f"selected {model} / {row['backend']} / {row['artifact']} on GPU {row.get('gpu')} — TG {row.get('tg') or '?'} tok/s ({row.get('evidence')})")
             resident=commission(model,ctx,row)

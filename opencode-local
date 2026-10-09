@@ -5,6 +5,12 @@ SELF="${BASH_SOURCE[0]}"; command -v readlink >/dev/null 2>&1 && SELF="$(readlin
 ROOT="$(cd "$(dirname "$SELF")" && pwd)"
 STATE_DIR="${CLAUDE_LOCAL_STATE:-$HOME/.local/share/pushbutton/claude-local}"
 have(){ command -v "$1" >/dev/null 2>&1; }
+if CODER_LOCAL_MENU_FRONTEND=opencode-local CODER_LOCAL_STARTUP_ONLY=1 "$ROOT/coder-local" --frontend qwen "$@"; then
+  exit 0
+else
+  startup_rc=$?
+  [[ $startup_rc -eq 125 ]] || exit "$startup_rc"
+fi
 if ! have opencode; then
   printf '[opencode-local] Installing OpenCode...\n'
   curl -fsSL https://opencode.ai/install | bash

@@ -5,11 +5,21 @@ REF="${PUSHBUTTON_REF:-main}"
 ROOT="${PUSHBUTTON_DIR:-$HOME/.local/share/pushbutton}"
 DEST="$ROOT/PushbuttonLocalCoders"
 SYSTEM=0
-[[ "${1:-}" == --system ]] && { SYSTEM=1; shift; }
 SELECT=0
-[[ "${1:-}" == --select ]] && { SELECT=1; shift; }
 INSTALL_ONLY="${PUSHBUTTON_INSTALL_ONLY:-0}"
-[[ "${1:-}" == --install-only ]] && { INSTALL_ONLY=1; shift; }
+while (($#)); do
+  case "$1" in
+    --system) SYSTEM=1; shift;;
+    --select) SELECT=1; shift;;
+    --install-only) INSTALL_ONLY=1; shift;;
+    -h|--help) echo "Usage: install-coder-local.sh [--system] [--install-only] [--select] [MODEL ...] [options]"; exit 0;;
+    *) break;;
+  esac
+done
+if ((SELECT)) && [[ ! -t 0 || ! -t 1 ]]; then
+  echo "Run --select in an interactive terminal, or supply a MODEL without --select. Piped installs without arguments only install and print help." >&2
+  exit 1
+fi
 command -v git >/dev/null || { echo "git is required" >&2; exit 1; }
 mkdir -p "$ROOT"
 if [[ -d "$DEST/.git" ]]; then
@@ -88,5 +98,7 @@ printf '[pushbutton] Expert frontends/tools remain available: qwen-local, openco
 
 export QWEN_CODE_SYSTEM_DEFAULTS_PATH="$DEST/configs/qwen-local-defaults.json"
 if ((INSTALL_ONLY)); then exit 0; fi
-if ((SELECT)); then exec "$DEST/pushbutton-select" "$@"; fi
-exec "$DEST/pushbutton" "$@"
+if ((SELECT)); then exec "$DEST/qwen-local" --select "$@"; fi
+if (($#)); then exec "$DEST/pushbutton" "$@"; fi
+if [[ -t 0 && -t 1 ]]; then exec "$DEST/qwen-local"; fi
+exec "$DEST/qwen-local" --help

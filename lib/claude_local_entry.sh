@@ -6,7 +6,7 @@ command -v readlink >/dev/null 2>&1 && SELF="$(readlink -f "$SELF" 2>/dev/null |
 ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
 
 STATE_DIR="${CLAUDE_LOCAL_STATE:-$HOME/.local/share/pushbutton/claude-local}"
-WEB_MCP=1
+WEB_MCP="${CLAUDE_LOCAL_WEB_MCP:-1}"
 ARGS=()
 while (($#)); do
   case "$1" in
@@ -18,6 +18,13 @@ while (($#)); do
     *) ARGS+=("$1"); shift;;
   esac
 done
+
+if CLAUDE_LOCAL_STARTUP_ONLY=1 CLAUDE_LOCAL_WEB_MCP="$WEB_MCP" "$ROOT/claude-local" "${ARGS[@]}"; then
+  exit 0
+else
+  startup_rc=$?
+  [[ $startup_rc -eq 125 ]] || exit "$startup_rc"
+fi
 
 # Local inference can have long first-token and tool/subagent queues. Claude's
 # hosted defaults are too aggressive for a single 3090/V100 under a large
@@ -62,4 +69,7 @@ JSON
   ARGS+=(--mcp-config "$MCP_CONFIG")
 fi
 
+if [[ -x "$ROOT/claude-local-safe" ]]; then
+  exec "$ROOT/claude-local-safe" "${ARGS[@]}"
+fi
 exec "$ROOT/claude-local" "${ARGS[@]}"
