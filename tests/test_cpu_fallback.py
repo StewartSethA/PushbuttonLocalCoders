@@ -205,6 +205,60 @@ class StartupPlannerTests(unittest.TestCase):
                                    [base.GPU(i, "fixture 24G", 24576, 24576) for i in range(2)],
                                    262144, host=self.host)
 
+    def dedicated_plan(self, placement=None, entries=None, **kwargs):
+        placement = placement or json.loads((ROOT / "configs/flash-next-role-placement.json").read_text())
+        host = resources.Host(256000, None, 256000, tuple(range(16)), 16, ())
+        gpus = [base.GPU(i, "fixture 32G", 32768, 32400) for i in range(6)]
+        return resources.startup_plan(
+            base, ["q3-4b", "q38", "q38", "q38next"], gpus, 131072,
+            host=kwargs.pop("host", host),
+            metadata={"version": 1, "placements": entries or
+                      [calibration("q3-4b", "cpu"), calibration("q38")]},
+            classifier_model="q38", classifier_gpu=5, role_placement=placement, **kwargs)
+
+    def test_dedicated_fable_four_gpus_cpu_haiku_and_classifier(self):
+        p = self.dedicated_plan()
+        by_id = {s["id"]: s for s in p["servers"]}
+        haiku = by_id[p["role_ids"]["haiku"]]
+        fable = by_id[p["role_ids"]["fable"]]
+        self.assertEqual(haiku["mode"], "cpu")
+        self.assertEqual(haiku["gpus"], [])
+        self.assertEqual({g["index"] for g in fable["gpus"]}, {0, 1, 2, 3})
+        self.assertEqual(by_id[p["role_ids"]["sonnet"]]["cuda_visible_devices"], "4")
+        self.assertEqual(by_id[p["classifier_id"]]["cuda_visible_devices"], "5")
+        self.assertEqual(p["role_ids"]["sonnet"], p["role_ids"]["opus"])
+        self.assertTrue(all(s["slots"] == 2 and s["backend"] == "llama.cpp" for s in p["servers"]))
+        self.assertLessEqual(sum(s["threads"] for s in p["servers"]), 16)
+        validate.admit_layout(p, host=resources.Host(256000, None, 256000, tuple(range(16)), 16, ()),
+                              gpus=[base.GPU(i, "fixture", 32768, 32400) for i in range(6)])
+
+    def test_dedicated_reservations_fail_closed(self):
+        for change, error in (
+                (lambda p: p["roles"]["fable"].update(gpus=[0, 1]), "four GPUs"),
+                (lambda p: p["roles"]["fable"].update(backend="sglang-v100"), "OpenAI-only"),
+                (lambda p: p["roles"]["haiku"].update(gpus=[5]), "disjoint"),
+                (lambda p: p["roles"]["opus"].update(gpus=[3]), "sharing a model"),
+                (lambda p: p["classifier"].update(gpus=[]), "dedicated physical"),
+                (lambda p: p["roles"]["fable"].update(gpus=[0, 1, 2, 9]), "unavailable")):
+            placement = json.loads((ROOT / "configs/flash-next-role-placement.json").read_text())
+            change(placement)
+            with self.subTest(error=error), self.assertRaisesRegex(ValueError, error):
+                self.dedicated_plan(placement)
+
+    def test_dedicated_cpu_haiku_still_requires_calibration(self):
+        with self.assertRaisesRegex(ValueError, "no safe"):
+            self.dedicated_plan(entries=[calibration("q38")])
+
+    def test_dedicated_does_not_drop_gpu_group_or_add_unrequested_overflow(self):
+        p = self.dedicated_plan(
+            entries=[calibration("q3-4b", "cpu"), calibration("q38"), calibration("q38", "cpu")],
+            startup_policy="allow-cpu-only")
+        self.assertEqual(len(p["servers"]), 4)
+        self.assertFalse(any(s.get("fallback") for s in p["servers"]))
+        host = resources.Host(32000, None, 32000, tuple(range(16)), 16, ())
+        with self.assertRaisesRegex(ValueError, "joint RAM"):
+            self.dedicated_plan(host=host)
+
     def test_joint_ram_budget_rejects_individually_fitting_models(self):
         host = resources.Host(7000, 7000, 7000, tuple(range(8)), 8, (), 1000)
         with self.assertRaisesRegex(ValueError, "joint RAM"):
@@ -593,6 +647,42 @@ class LauncherFallbackTests(unittest.TestCase):
     def source(self, start, end):
         source = (ROOT / "claude-local").read_text()
         return source[source.index(start):source.index(end)]
+
+    def test_actual_dedicated_role_dry_run_with_mocked_hardware(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            state = pathlib.Path(directory)
+            tools = state / "bin"; tools.mkdir()
+            wrapper = tools / "python3"
+            wrapper.write_text(f"""#!{sys.executable}
+import os,sys
+if len(sys.argv)>1 and sys.argv[1]=={str(ROOT / 'lib/claude_local_plan.py')!r}:
+ sys.path.insert(0,{str(ROOT / 'lib')!r})
+ import claude_local_plan as base
+ import claude_local_resources as resources
+ base.inventory=lambda: [base.GPU(i,'MOCK 32G GPU',32768,32400) for i in range(6)]
+ resources.host_inventory=lambda: resources.Host(256000,None,256000,tuple(range(16)),16,())
+ sys.argv=sys.argv[1:]
+ raise SystemExit(base.main())
+os.execv(sys.executable,[sys.executable,*sys.argv[1:]])
+""")
+            wrapper.chmod(0o755)
+            metadata = state / "memory.json"
+            metadata.write_text(json.dumps({"version": 1, "placements": [
+                calibration("q3-4b", "cpu"), calibration("q38")]}))
+            env = {**os.environ, "PATH": str(tools) + os.pathsep + os.environ["PATH"],
+                   "CLAUDE_LOCAL_STATE": str(state / "state"), "CLAUDE_LOCAL_CACHE": str(state / "cache"),
+                   "CLAUDE_LOCAL_STARTUP_POLICY": "gpu-only"}
+            result = subprocess.run([
+                str(ROOT / "claude-local"), "q3-4b", "q38", "q38", "q38next",
+                "--local-role-placement", str(ROOT / "configs/flash-next-role-placement.json"),
+                "--local-memory-metadata", str(metadata), "--local-context", "131072",
+                "--local-client-context", "120000", "--local-classifier-model", "q38",
+                "--local-classifier-gpu", "5", "--local-classifier-request-model", "observed-safety-id",
+                "--local-dry-run"], env=env, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for detail in ("MOCK 32G GPU", "CPU only", "slots=2", "local-classifier [llama.cpp]",
+                           "local-qwen38-flash-next [llama.cpp]", "placement=cpu ngl=0"):
+                self.assertIn(detail, result.stdout)
 
     def test_four_role_gateway_config_keeps_classifier_explicit(self):
         models = ["q3-4b", "q38", "q36", "q38next"]

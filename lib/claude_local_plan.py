@@ -611,6 +611,7 @@ def main() -> int:
     lp.add_argument("--startup-policy", default="gpu-only",
                     choices=("gpu-only", "allow-cpu-only"))
     lp.add_argument("--memory-metadata", help="versioned calibrated placement JSON")
+    lp.add_argument("--role-placement", help="explicit llama.cpp role/GPU reservations JSON")
     lp.add_argument("--min-quality", type=int, default=0)
     lp.add_argument("--max-layouts", type=int, default=3)
     sub.add_parser("catalogue")
@@ -644,10 +645,15 @@ def main() -> int:
         if args.memory_metadata:
             with open(args.memory_metadata) as stream:
                 metadata = json.load(stream)
+        role_placement = None
+        if args.role_placement:
+            with open(args.role_placement) as stream:
+                role_placement = json.load(stream)
         result = resources.startup_plan(
             sys.modules[__name__], models, gpus, args.context, **kwargs,
             startup_policy=args.startup_policy, metadata=metadata,
             min_quality=args.min_quality, max_layouts=args.max_layouts,
+            role_placement=role_placement,
         )
         print(json.dumps(result, indent=2))
         return 0

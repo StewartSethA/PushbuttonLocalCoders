@@ -24,6 +24,7 @@ PORT_BASE="${CLAUDE_LOCAL_PORT_BASE:-18180}"
 ALLOW_OFFLOAD=0
 STARTUP_POLICY="${CLAUDE_LOCAL_STARTUP_POLICY:-gpu-only}"
 MEMORY_METADATA="${CLAUDE_LOCAL_MEMORY_METADATA:-}"
+ROLE_PLACEMENT="${CLAUDE_LOCAL_ROLE_PLACEMENT:-}"
 MIN_QUALITY="${CLAUDE_LOCAL_MIN_QUALITY:-0}"
 MAX_LAYOUTS="${CLAUDE_LOCAL_MAX_LAYOUTS:-3}"
 STARTUP_TIMEOUT="${CLAUDE_LOCAL_STARTUP_TIMEOUT:-1800}"
@@ -75,6 +76,7 @@ Harness options (put before ordinary Claude Code flags):
   --local-allow-offload      obsolete: rejected; use explicit startup policy
   --local-startup-policy P   gpu-only (default), allow-cpu-only (bounded overflow)
   --local-memory-metadata F calibrated placements JSON (required for CPU and Qwen3 4B)
+  --local-role-placement F  explicit llama.cpp role/GPU groups (empty GPUs = calibrated CPU)
   --local-min-quality N     minimum catalogue quality tier, 0..100
   --local-max-layouts N     bounded complete startup alternatives (default 3)
   --local-dry-run            show hardware/model plan only
@@ -578,7 +580,7 @@ for r in ('haiku','sonnet','opus','fable'): print(f"  {r:6} -> {p['roles'][r]} (
 print('Servers:')
 for s in p['servers']:
  x=s['profile']; gs=', '.join(f"GPU{g['index']} {g['name']} ({g['free_mib']/1024:.1f} GiB free, PCIe Gen{g['pcie_gen']} x{g['pcie_width']})" for g in s['gpus'])
- print(f"  {s['id']}: {x['hf_spec']}\n    {gs}\n    context/slot={s['context']} slots={s['slots']} KV={x['kv_k']}/{x['kv_v']} batch={x['batch']}/{x['ubatch']} FA={x['flash_attn']} quality-tier={x['quality']}")
+ print(f"  {s['id']} [{s.get('backend','llama.cpp')}]: {x['hf_spec']}\n    {gs or 'CPU only'}\n    context/slot={s['context']} slots={s['slots']} KV={x['kv_k']}/{x['kv_v']} batch={x['batch']}/{x['ubatch']} FA={x['flash_attn']} quality-tier={x['quality']}")
  if 'mode' in s:
   print(f"    placement={s['mode']} ngl={s['ngl']} threads={s['threads']}/{s['threads_batch']} RAM={s['ram_required_mib']} MiB VRAM={s['required_mib']} MiB")
   print(f"    estimates={s['memory_estimate']}; source={s['estimate_source']}")
@@ -681,6 +683,7 @@ while (($#)); do
       --local-allow-offload) ALLOW_OFFLOAD=1; shift;;
       --local-startup-policy) [[ $# -ge 2 ]] || die "--local-startup-policy needs a policy"; STARTUP_POLICY="$2"; shift 2;;
       --local-memory-metadata) [[ $# -ge 2 ]] || die "--local-memory-metadata needs a file"; MEMORY_METADATA="$2"; shift 2;;
+      --local-role-placement) [[ $# -ge 2 ]] || die "--local-role-placement needs a file"; ROLE_PLACEMENT="$2"; shift 2;;
       --local-min-quality) [[ $# -ge 2 ]] || die "--local-min-quality needs a tier"; MIN_QUALITY="$2"; shift 2;;
       --local-max-layouts) [[ $# -ge 2 ]] || die "--local-max-layouts needs a count"; MAX_LAYOUTS="$2"; shift 2;;
       --local-dry-run) DRY_RUN=1; shift;;
@@ -718,6 +721,7 @@ mkdir -p "$STATE_DIR" "$CACHE_DIR"; PLAN_FILE="$STATE_DIR/plan.$$.json"
 [[ $DRY_RUN -eq 0 ]] && acquire_startup_lock
 plan_args=(plan --context "$CTX" --slots "$SLOTS" --startup-policy "$STARTUP_POLICY" --min-quality "$MIN_QUALITY" --max-layouts "$MAX_LAYOUTS")
 [[ -z "$MEMORY_METADATA" ]] || plan_args+=(--memory-metadata "$MEMORY_METADATA")
+[[ -z "$ROLE_PLACEMENT" ]] || plan_args+=(--role-placement "$ROLE_PLACEMENT")
 if [[ -n "$CLASSIFIER_MODEL" ]]; then
     plan_args+=(--classifier-model "$CLASSIFIER_MODEL" --classifier-context "$CLASSIFIER_CTX")
     [[ -z "$CLASSIFIER_GPU" ]] || plan_args+=(--classifier-gpu "$CLASSIFIER_GPU")

@@ -151,9 +151,51 @@ def validate_metadata(data):
     return entries
 
 
+def placement_targets(config, roles, gpus, classifier_model, classifier_gpu):
+    if not isinstance(config, dict) or config.get("version") != 1:
+        raise ValueError("role placement must have version 1")
+    routes = config.get("roles")
+    if not isinstance(routes, dict) or set(routes) != set(roles):
+        raise ValueError("role placement must specify haiku, sonnet, opus and fable")
+    targets, occupied = {}, {}
+    requests = [(roles[role], False, routes[role]) for role in roles]
+    if classifier_model:
+        if "classifier" not in config:
+            raise ValueError("role placement requires a dedicated classifier entry")
+        requests.append((classifier_model, True, config["classifier"]))
+    elif "classifier" in config:
+        raise ValueError("classifier placement requires a classifier model")
+    visible = {g.index for g in gpus}
+    for model, classifier, route in requests:
+        if not isinstance(route, dict) or route.get("backend") != "llama.cpp":
+            raise ValueError("claude-local role placement supports only llama.cpp Anthropic serving; "
+                             "OpenAI-only specialized engines must use pushbutton-bench")
+        indices = route.get("gpus")
+        if (not isinstance(indices, list) or
+                any(type(i) is not int or i < 0 for i in indices) or len(set(indices)) != len(indices)):
+            raise ValueError("placement gpus must be a list of distinct physical indices (empty for CPU)")
+        target = frozenset(indices)
+        if not target <= visible:
+            raise ValueError("role placement GPU is unavailable")
+        if classifier and (classifier_gpu is None or target != {classifier_gpu}):
+            raise ValueError("classifier placement must match its dedicated physical GPU")
+        key = (model, classifier)
+        if key in targets and targets[key] != target:
+            raise ValueError("roles sharing a model must use the same placement")
+        if model == "qwen3.8-flash-next" and not classifier and len(target) != 4:
+            raise ValueError("dedicated Flash-Next placement requires exactly four GPUs; two-card recipes are unverified")
+        for index in target:
+            if index in occupied and occupied[index] != key:
+                raise ValueError("role/classifier GPU reservations must be disjoint")
+            occupied[index] = key
+        targets[key] = target
+    return targets
+
+
 def startup_plan(base, models, gpus, context, *, slots=2, startup_policy="gpu-only",
                  metadata=None, host=None, min_quality=0, classifier_model=None,
-                 classifier_gpu=None, classifier_context=32768, max_layouts=3):
+                 classifier_gpu=None, classifier_context=32768, max_layouts=3,
+                 role_placement=None):
     if startup_policy not in ("gpu-only", "allow-cpu-only"):
         raise ValueError("unknown startup policy")
     if slots < 1 or min(context, classifier_context) < 1 or not 0 <= min_quality <= 100:
@@ -169,6 +211,9 @@ def startup_plan(base, models, gpus, context, *, slots=2, startup_policy="gpu-on
     host = host or host_inventory()
     entries = validate_metadata(metadata) if metadata is not None else []
     roles = base.role_map(models)
+    classifier_model = base.canonical_model(classifier_model) if classifier_model else None
+    targets = (placement_targets(role_placement, roles, gpus, classifier_model, classifier_gpu)
+               if role_placement is not None else None)
     unique = list(dict.fromkeys(roles.values()))
     requests = [(m, context, False) for m in unique]
     if classifier_model:
@@ -181,8 +226,11 @@ def startup_plan(base, models, gpus, context, *, slots=2, startup_policy="gpu-on
     candidate_work = 0
     for model, ctx, classifier in requests:
         candidates = []
+        target = targets[(model, classifier)] if targets is not None else None
         cards = [g for g in gpus if (g.index == classifier_gpu if classifier and classifier_gpu is not None
                                      else classifier or g.index != classifier_gpu)]
+        if target is not None:
+            cards = [g for g in cards if g.index in target]
         for profile in base.PROFILES[model]:
             if profile.quality < min_quality or ctx > profile.native_context:
                 continue
@@ -192,7 +240,9 @@ def startup_plan(base, models, gpus, context, *, slots=2, startup_policy="gpu-on
                 if candidate_work > 200000:
                     raise ValueError("startup candidate enumeration exceeds bounded complexity")
                 mode = e["mode"]
-                if mode == "cpu" and startup_policy == "gpu-only":
+                if mode == "cpu" and startup_policy == "gpu-only" and target != frozenset():
+                    continue
+                if target is not None and (mode == "cpu") != (not target):
                     continue
                 if ctx > e["max_context"] or slots > e["max_slots"]:
                     continue
@@ -203,6 +253,8 @@ def startup_plan(base, models, gpus, context, *, slots=2, startup_policy="gpu-on
                 # Calibrated fallback placements currently target one GPU.
                 groups = [[]] if mode == "cpu" else [[g] for g in cards if g.free_mib >= vram + 512]
                 for group in groups:
+                    if target is not None and {g.index for g in group} != target:
+                        continue
                     candidates.append(_server(base, profile, group, ctx, slots, classifier,
                                               mode, ram, vram, e))
                     if len(candidates) > 4096:
@@ -216,6 +268,8 @@ def startup_plan(base, models, gpus, context, *, slots=2, startup_policy="gpu-on
                     if candidate_work > 200000:
                         raise ValueError("startup candidate enumeration exceeds bounded complexity")
                     group = [cards[p] for p in positions]
+                    if target is not None and {g.index for g in group} != target:
+                        continue
                     if sum(g.free_mib - 512 for g in group) >= envelope:
                         candidates.append(_server(base, profile, group, ctx, slots, classifier,
                                                   "gpu", envelope, envelope, None))
@@ -226,7 +280,7 @@ def startup_plan(base, models, gpus, context, *, slots=2, startup_policy="gpu-on
                              "memory metadata or sufficient GPU capacity; context/slots/quality are never reduced")
         options = []
         for candidate in candidates:
-            if startup_policy == "allow-cpu-only" and candidate["mode"] == "gpu":
+            if startup_policy == "allow-cpu-only" and candidate["mode"] == "gpu" and targets is None:
                 # Overflow must already be resident and budgeted, using exactly
                 # the requested weights, context and classifier identity.
                 replicas = [s for s in candidates if s["mode"] == "cpu" and
@@ -298,6 +352,7 @@ def startup_plan(base, models, gpus, context, *, slots=2, startup_policy="gpu-on
                         "classifier_id": "local-classifier" if classifier_model else None,
                         "servers": servers, "unused_gpus": [asdict(g) for g in gpus if g.index not in used],
                         "placement_policy": "joint-host-vram", "startup_policy": startup_policy,
+                        "role_placement": role_placement,
                         "host": asdict(host), "ram_required_mib": sum(s["ram_required_mib"] for s in servers),
                         "min_quality": min_quality})
     return {**layouts[0], "alternatives": layouts[1:]}
@@ -315,6 +370,7 @@ def _server(base, profile, group, context, slots, classifier, mode, ram, vram, e
     return {
         "id": "local-classifier" if classifier else f"local-{profile.model.replace(':', '-').replace('.', '')}",
         "model": profile.model, "classifier": classifier, "context": context, "slots": slots,
+        "backend": "llama.cpp",
         "profile": p, "gpus": [asdict(g) for g in group],
         "cuda_visible_devices": ",".join(str(g.index) for g in group), "multi_gpu": len(group) > 1,
         "mode": mode, "ngl": entry["ngl"] if entry else 999, "cache_on_cpu": mode == "cpu",

@@ -10,6 +10,7 @@ import argparse
 import json
 import os
 import pathlib
+import math
 import shlex
 import shutil
 import subprocess
@@ -17,10 +18,16 @@ import sys
 from typing import Iterable
 
 ROOT = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT / "lib"))
 REGISTRY_PATH = ROOT / "configs" / "backend-registry.json"
 STATE = pathlib.Path(os.environ.get("PUSHBUTTON_BACKEND_STATE", os.environ.get("CLAUDE_LOCAL_STATE", str(pathlib.Path.home() / ".local/share/pushbutton/claude-local")))) / "optional-backends"
 CACHE = pathlib.Path(os.environ.get("PUSHBUTTON_MODEL_CACHE", os.environ.get("CLAUDE_LOCAL_CACHE", str(pathlib.Path.home() / ".cache/pushbutton/llama"))))
 DRY = False
+FLASH_BACKENDS = ("sglang-v100", "vllm-flashnext-3090")
+FLASH_ARTIFACTS = {
+    "sglang-v100": "geesegeesegeese/sglang-v100:v100-qwen38-flash-next-v4",
+    "vllm-flashnext-3090": "VnimanieAI/Qwen3.8-Flash-Next-W4A16@9236d703b25f25eb5c17e9640204f84fa1ce0c6e",
+}
 
 
 def say(msg: str) -> None:
@@ -40,6 +47,12 @@ def run(cmd: list[str], *, cwd: pathlib.Path | None = None, env: dict[str, str] 
 
 
 def exec_cmd(cmd: list[str], *, cwd: pathlib.Path | None = None, env: dict[str, str] | None = None) -> None:
+    # Docker parses --gpus as CSV even with subprocess argv: a device list must
+    # be one quoted CSV field, not separate count/device fields.
+    if "--gpus" in cmd:
+        pos = cmd.index("--gpus") + 1
+        if cmd[pos].startswith("device=") and "," in cmd[pos]:
+            cmd = cmd[:pos] + ['"' + cmd[pos] + '"'] + cmd[pos + 1:]
     say(("DRY-RUN exec " if DRY else "exec ") + shell(cmd))
     if DRY:
         return
@@ -96,6 +109,10 @@ def validate(backend: str, model: str, gpus: list[int], force: bool) -> None:
         raise SystemExit(f"unknown backend {backend!r}; run: pushbutton-backend list")
     if model not in info["models"]:
         raise SystemExit(f"backend {backend} does not currently have a tested adapter for {model}; supported: {', '.join(info['models'])}")
+    if not gpus or len(set(gpus)) != len(gpus) or any(g < 0 for g in gpus):
+        raise SystemExit("select distinct nonnegative physical GPU indices")
+    if backend in FLASH_BACKENDS and len(gpus) != 4:
+        raise SystemExit(f"{backend} requires exactly four dedicated GPUs; two-card recipes are unverified")
     if DRY or force:
         return
     rows = {r["index"]: r for r in gpu_rows()}
@@ -109,6 +126,81 @@ def validate(backend: str, model: str, gpus: list[int], force: bool) -> None:
     minimum = {"sglang-v100": 4, "vllm-flashnext-3090": 4}.get(backend, 1)
     if len(gpus) < minimum:
         raise SystemExit(f"{backend} needs at least {minimum} GPU(s); selected {gpus}")
+
+
+def validate_capacity(backend, model, gpus, context, concurrency, profile, path):
+    """Specialized Flash-Next capacity is measured, never inferred from GGUF size."""
+    if context < 1 or not 1 <= concurrency <= 64:
+        raise SystemExit("context must be positive and concurrency must be 1..64")
+    if backend == "vllm-qwen38-3090" and concurrency != 1:
+        raise SystemExit("vllm-qwen38-3090 image has no verified concurrency control; use C1")
+    if backend not in FLASH_BACKENDS:
+        return None
+    lane = profile or "mtp"
+    if backend == "vllm-flashnext-3090":
+        if lane not in ("mtp", "bf16"):
+            raise SystemExit("supported recipe profiles: mtp, bf16; FP8 requires unintegrated patches/scales")
+        limit = 65536 if lane == "mtp" else 131072
+        if context > limit:
+            raise SystemExit(f"{lane} recipe context limit is {limit}; requested {context}")
+    elif lane != "mtp":
+        raise SystemExit("sglang-v100 currently supports only the MTP recipe")
+    if not path:
+        if DRY:
+            say("UNVERIFIED capacity: dry-run only; live Flash-Next serving requires --capacity")
+            return None
+        raise SystemExit("live specialized Flash-Next requires calibrated --capacity JSON (RAM, per-GPU VRAM, context/concurrency)")
+    data = json.loads(pathlib.Path(path).read_text())
+    if not isinstance(data, dict) or data.get("version") != 1 or not isinstance(data.get("placements"), list):
+        raise SystemExit("capacity JSON requires version 1 and placements array")
+    matches = [e for e in data["placements"] if isinstance(e, dict) and
+               (e.get("backend"), e.get("model"), e.get("profile"), e.get("artifact")) ==
+               (backend, model, lane, FLASH_ARTIFACTS[backend])]
+    for entry in matches:
+        for key in ("host_mib", "max_context", "max_concurrency", "cpu_threads"):
+            if type(entry.get(key)) is not int or entry[key] < 1:
+                raise SystemExit(f"capacity requires positive integer {key}")
+        vram = entry.get("gpu_mib")
+        if not isinstance(vram, list) or len(vram) != 4 or any(type(v) is not int or v <= 0 for v in vram):
+            raise SystemExit("capacity gpu_mib must contain four measured positive per-device envelopes")
+        if not isinstance(entry.get("source"), str) or not entry["source"].strip():
+            raise SystemExit("capacity requires measurement provenance in source")
+        if not isinstance(entry.get("runtime_revision"), str) or not entry["runtime_revision"].strip():
+            raise SystemExit("capacity requires the measured runtime_revision (recipe commit or Docker image ID)")
+        # The upstream W4A16 recipe CPU-offloads a ~97 GiB BF16 PLE table.
+        if backend == "vllm-flashnext-3090" and entry["host_mib"] < 97 * 1024:
+            raise SystemExit("W4A16 recipe requires at least 97 GiB host PLE weights plus measured staging/buffers")
+        if context > entry["max_context"] or concurrency > entry["max_concurrency"]:
+            continue
+        if not DRY:
+            sys.path.insert(0, str(ROOT / "lib"))
+            from claude_local_resources import host_inventory
+            host = host_inventory()
+            if entry["host_mib"] + host.reserve_mib > host.usable_mib or entry["cpu_threads"] > host.cpu_capacity:
+                continue
+            rows = {r["index"]: r for r in gpu_rows()}
+            arch = set(registry()["backends"][backend]["gpu_arch"])
+            fraction = .80 if backend == "sglang-v100" else .97 if lane == "mtp" else .96
+            if any(g not in rows or f"sm{rows[g]['compute_cap'].replace('.', '')}" not in arch or
+                   rows[g]["memory_free_mib"] < required + 512 or
+                   required < math.ceil(rows[g]["memory_total_mib"] * fraction)
+                   for g, required in zip(gpus, vram)):
+                continue
+            if entry["runtime_revision"] != runtime_revision(backend):
+                raise SystemExit("capacity runtime revision differs from installed engine; prepare/calibrate again")
+        return entry
+    raise SystemExit("no verified specialized capacity fits selected GPUs and live host RAM/CPU, context and concurrency")
+
+
+def runtime_revision(backend):
+    if backend == "sglang-v100":
+        try:
+            return subprocess.check_output(
+                docker_prefix() + ["image", "inspect", "--format", "{{.Id}}", FLASH_ARTIFACTS[backend]],
+                text=True).strip()
+        except subprocess.CalledProcessError:
+            return None
+    return source_revision(backend)
 
 
 def ensure_repo(name: str, url: str, ref: str = "main") -> pathlib.Path:
@@ -204,6 +296,8 @@ def prepare(backend: str, model: str, gpus: list[int]) -> None:
         src = ensure_repo("vllm-flashnext-3090", "https://github.com/loktar00/qwen38-flash-next-vllm-3090-recipe.git")
         venv = STATE / "vllm-flashnext-3090-venv"; vsrc = STATE / "vllm-flashnext-3090-src"
         env = os.environ.copy(); env.update({"VENV": str(venv), "SRC": str(vsrc), "TORCH_CUDA_ARCH_LIST": "8.6", "CMAKE_BUILD_TYPE": "Release", "HF_HOME": str(CACHE / "hf-flashnext-3090")})
+        env.update({"BASE_SHA": "82399a9fcbebd892d9b2560827a3f8d3e050d2fd",
+                    "VLLM_REPO": "https://github.com/vllm-project/vllm", "WITH_FP8KV": "0"})
         run(["bash", "install.sh"], cwd=src, env=env)
         hf_download("VnimanieAI/Qwen3.8-Flash-Next-W4A16", revision="9236d703b25f25eb5c17e9640204f84fa1ce0c6e")
         return
@@ -231,28 +325,52 @@ def llama_build_path(srcname: str, prefix: str = "build-sm") -> pathlib.Path:
     return builds[0]
 
 
-def serve(backend: str, model: str, gpus: list[int], port: int, context: int, profile: str | None) -> None:
+def serve(backend: str, model: str, gpus: list[int], port: int, context: int, profile: str | None,
+          concurrency: int = 1, capacity: dict | None = None) -> None:
+    if not DRY:
+        from backend_runtime import require_free_port
+        require_free_port(port)
+    served_model = os.environ.get("PUSHBUTTON_BENCH_MODEL_ID", model)
     gpu_csv = ",".join(map(str, gpus)); env = os.environ.copy(); env["CUDA_VISIBLE_DEVICES"] = gpu_csv
     env["HF_HOME"] = str(CACHE / "huggingface"); env["LLAMA_CACHE"] = str(CACHE)
     if backend == "llama.cpp":
         build = llama_build_path("llama.cpp-bench")
-        hf = "unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL" if model == "qwen3.8:27b" else "unsloth/Qwen3.8-Flash-Next-GGUF:UD-IQ4_XS"
-        cmd = [str(build / "bin/llama-server"), "-hf", hf, "--host", "127.0.0.1", "--port", str(port), "-c", str(context), "-ngl", "999", "-np", "1", "--jinja", "--cache-type-k", "q8_0", "--cache-type-v", "q8_0", "-fa", "on"]
+        hf = {"qwen3.8:27b": "unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL",
+              "qwen3.8-flash-next": "unsloth/Qwen3.8-Flash-Next-GGUF:UD-IQ4_XS",
+              "qwen3-4b-instruct-2507": "unsloth/Qwen3-4B-Instruct-2507-GGUF:Q5_K_M"}[model]
+        cmd = [str(build / "bin/llama-server"), "-hf", hf, "--host", "127.0.0.1", "--port", str(port), "-c", str(context * concurrency), "-ngl", "999", "-np", str(concurrency), "--jinja", "--cache-type-k", "q8_0", "--cache-type-v", "q8_0", "-fa", "on", "--fit", "off"]
         if len(gpus) > 1: cmd += ["--split-mode", "layer"]
+        if os.environ.get("PUSHBUTTON_BENCH_MODEL_ID"): cmd += ["--alias", served_model]
         exec_cmd(cmd, env=env); return
     if backend == "llamampere":
         src = STATE / "src/llamAmpere"; model_path = find_largest(CACHE / "llamampere-qwen38", "*.gguf")
         env["GGML_Q8_TURBO3_MMA_FUSED"] = "1"
         cmd = [str(src / "build-sm86/bin/llama-server"), "-m", str(model_path), "--host", "127.0.0.1", "--port", str(port), "-c", str(context), "-b", "4096", "-ub", "1024", "-t", "8", "-tb", "8", "-ngl", "99", "-fa", "on", "-ctk", "q8_0", "-ctv", "turbo3", "--parallel", "1", "--jinja", "--fit", "off", "--cache-prompt", "--cache-ram", "8192", "--ctx-checkpoints", "24", "--checkpoint-min-step", "10240", "--spec-type", "draft-mtp", "--spec-draft-n-max", "3", "--spec-draft-p-min", "0", "--spec-draft-type-k", "q8_0", "--spec-draft-type-v", "q8_0", "--spec-draft-vocab-map", str(src / "docs/mtp-vocab/atx_65536.txt")]
+        cmd[cmd.index("-c") + 1] = str(context * concurrency)
+        cmd[cmd.index("--parallel") + 1] = str(concurrency)
+        if os.environ.get("PUSHBUTTON_BENCH_MODEL_ID"): cmd += ["--alias", served_model]
         exec_cmd(cmd, env=env); return
     if backend == "volta-llama":
         src = STATE / "src/volta-llama"; model_path = find_largest(CACHE / "volta-qwen38", "*.gguf")
         env.update({"GGML_CUDA_VOLTA_Q8_FATTN_TC":"1", "GGML_CUDA_VOLTA_Q5_X4":"1", "GGML_CUDA_VOLTA_Q6_W4R4":"1", "GGML_CUDA_QWEN35_MTP_SHORTLIST":str(src / "data/mtp-shortlists/qwen38-27b-exact-131072.i32")})
         cmd = [str(src / "build-sm70/bin/llama-server"), "--model", str(model_path), "--alias", "qwen3.8-27b", "--host", "127.0.0.1", "--port", str(port), "--ctx-size", str(context), "--parallel", "1", "--fit", "off", "--gpu-layers", "63", "--split-mode", "layer", "--flash-attn", "on", "--batch-size", "4096", "--ubatch-size", "1024", "--cache-type-k", "q8_0", "--cache-type-v", "q8_0", "--spec-type", "draft-mtp", "--spec-draft-n-max", "3", "--spec-mtp-defer-prompt", "--jinja"]
+        cmd[cmd.index("--ctx-size") + 1] = str(context * concurrency)
+        cmd[cmd.index("--parallel") + 1] = str(concurrency)
+        cmd[cmd.index("--alias") + 1] = served_model
         exec_cmd(cmd, env=env); return
     if backend == "sglang-v100":
         d = docker_prefix(); cache = CACHE / "huggingface"; cache.mkdir(parents=True, exist_ok=True)
         cmd = d + ["run", "--rm", "--gpus", f"device={gpu_csv}", "--network", "host", "--ipc", "host", "--ulimit", "memlock=-1", "--ulimit", "stack=67108864", "-v", f"{cache}:/root/.cache/huggingface", "-e", "FLASHINFER_DISABLE_VERSION_CHECK=1", "-e", "NCCL_P2P_LEVEL=NVL", "-e", "SGLANG_CUSTOM_ALLREDUCE_ALGO=1stage", "-e", "SGLANG_MAMBA_CONV_DTYPE=float16", "-e", "SGLANG_MAMBA_SSM_DTYPE=float16", "-e", "SGLANG_SM70_FORCE_FP16=1", "-e", "SGLANG_SM70_DENSE_GEMV=1", "-e", "SGLANG_SM70_QWEN_FUSIONS=1", "geesegeesegeese/sglang-v100:v100-qwen38-flash-next-v4", "python", "-m", "sglang.launch_server", "--trust-remote-code", "--model-path", "RadixArk/Qwen3.8-Flash-Next-NVFP4", "--served-model-name", "qwen3.8-flash-next", "--dtype", "float16", "--quantization", "modelopt_fp4", "--reasoning-parser", "auto", "--tool-call-parser", "auto", "--attention-backend", "tilelang_fa_v100", "--linear-attn-prefill-backend", "tilelang", "--linear-attn-decode-backend", "triton", "--kv-cache-dtype", "fp8_e5m2", "--tensor-parallel-size", str(len(gpus)), "--host", "127.0.0.1", "--port", str(port), "--mem-fraction-static", "0.80", "--context-length", str(context), "--max-running-requests", "1", "--chunked-prefill-size", "8192", "--cuda-graph-bs", "1", "--speculative-algorithm", "EAGLE", "--speculative-draft-model-path", "RadixArk/Qwen3.8-Flash-Next-NVFP4", "--speculative-num-steps", "3", "--speculative-eagle-topk", "1", "--speculative-num-draft-tokens", "4"]
+        cmd[cmd.index("--max-running-requests") + 1] = str(concurrency)
+        cmd[cmd.index("--served-model-name") + 1] = served_model
+        # Batch graph sizes above one are not verified by this recipe.
+        if concurrency > 1:
+            pos = cmd.index("--cuda-graph-bs"); del cmd[pos:pos + 2]
+            cmd.append("--disable-cuda-graph")
+        if capacity:
+            pos = cmd.index("--ipc")
+            cmd[pos:pos] = ["--memory", f"{capacity['host_mib']}m", "--memory-swap",
+                           f"{capacity['host_mib']}m", "--cpus", str(capacity["cpu_threads"])]
         exec_cmd(cmd); return
     if backend == "vllm-qwen38-3090":
         d = docker_prefix(); models = CACHE / "syv-qwen38-models"; vc = CACHE / "syv-qwen38-cache"; models.mkdir(parents=True, exist_ok=True); vc.mkdir(parents=True, exist_ok=True)
@@ -261,12 +379,39 @@ def serve(backend: str, model: str, gpus: list[int], port: int, context: int, pr
     if backend == "ninfer-3090":
         d = docker_prefix(); model_path = find_largest(CACHE / "ninfer-3090", "*.ninfer")
         cmd = d + ["run", "--rm", "--gpus", f"device={gpu_csv}", "-p", f"127.0.0.1:{port}:8080", "-v", f"{model_path.parent}:/workspace/models:ro", "pushbutton-ninfer-3090:sm86", "ninfer-serve", f"models/{model_path.name}", "--host", "0.0.0.0", "--port", "8080", "--max-context", str(context), "--kv-capacity", str(context), "--max-concurrency", "1", "--max-pending-requests", "16", "--prefill-chunk", "1024", "--kv-dtype", "int8", "--spec", "mtp", "--draft-tokens", "3", "--lm-head-draft"]
+        cmd[cmd.index("--max-concurrency") + 1] = str(concurrency)
+        cmd[cmd.index("--kv-capacity") + 1] = str(context * concurrency)
         exec_cmd(cmd); return
     if backend == "vllm-flashnext-3090":
-        src = STATE / "src/vllm-flashnext-3090"; hf = ensure_hf(); env = os.environ.copy()
+        hf = ensure_hf()
         snap = run([str(hf), "download", "VnimanieAI/Qwen3.8-Flash-Next-W4A16", "--revision", "9236d703b25f25eb5c17e9640204f84fa1ce0c6e"], capture=True)
         env.update({"MODEL": snap or str(CACHE / "hf-flashnext-3090"), "VENV": str(STATE / "vllm-flashnext-3090-venv"), "SRC": str(STATE / "vllm-flashnext-3090-src"), "GPUS": gpu_csv, "HOST": "127.0.0.1", "PORT": str(port), "PROFILE": profile or "mtp", "HF_HOME": str(CACHE / "hf-flashnext-3090"), "LAB": str(STATE / "vllm-flashnext-3090-runs"), "RUN": "pushbutton"})
-        exec_cmd(["bash", "serve.sh"], cwd=src, env=env); return
+        # Upstream serve.sh backgrounds vLLM and exits; the harness must own a
+        # foreground process for readiness, failure detection and teardown.
+        lane = profile or "mtp"
+        cuda = env.get("CUDA_HOME", "/usr/local/cuda-13.0")
+        env.update({"CUDA_HOME": cuda, "NCCL_P2P_LEVEL": "NVL",
+                    "VLLM_PLE_CPU_OFFLOAD": "1",
+                    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"})
+        env["PATH"] = f"{env['VENV']}/bin:{cuda}/bin:" + env.get("PATH", "")
+        for key in ("SPEC", "KV", "GPUUTIL", "COMPILE", "EXTRA", "QSA_FP8_SCALES_FILE"):
+            env.pop(key, None)
+        if capacity:
+            env["OMP_NUM_THREADS"] = str(capacity["cpu_threads"])
+        cmd = [str(STATE / "vllm-flashnext-3090-venv/bin/vllm"), "serve", env["MODEL"],
+               "--served-model-name", served_model, "--tensor-parallel-size", "4",
+               "--enable-expert-parallel", "--disable-custom-all-reduce",
+               "--max-model-len", str(context), "--max-num-seqs", str(concurrency),
+               "--max-num-batched-tokens", "1024" if lane == "mtp" else "2048",
+               "--gpu-memory-utilization", "0.97" if lane == "mtp" else "0.96",
+               "--kv-cache-dtype", "auto", "--compilation-config",
+               '{"mode":"VLLM_COMPILE","cudagraph_mode":"FULL"}',
+               "--no-enable-flashinfer-autotune", "--enable-prefix-caching",
+               "--reasoning-parser", "qwen3", "--default-chat-template-kwargs",
+               '{"preserve_thinking":true}', "--host", "127.0.0.1", "--port", str(port)]
+        if lane == "mtp":
+            cmd += ["--speculative-config", '{"method":"mtp","num_speculative_tokens":4}']
+        exec_cmd(cmd, env=env); return
     raise SystemExit(f"serve not implemented for {backend}")
 
 
@@ -278,23 +423,37 @@ def main() -> int:
     sub.add_parser("list")
     for name in ("check", "prepare", "serve", "fingerprint"):
         p = sub.add_parser(name); p.add_argument("backend"); p.add_argument("model"); p.add_argument("--gpus"); p.add_argument("--force", action="store_true")
+        if name in ("serve", "check"):
+            p.add_argument("--context", type=int, default=65536)
+            p.add_argument("--concurrency", type=int, default=1)
+            p.add_argument("--profile")
+            p.add_argument("--capacity", help="measured specialized Flash-Next capacity JSON")
         if name == "serve":
-            p.add_argument("--port", type=int, default=20880); p.add_argument("--context", type=int, default=65536); p.add_argument("--profile"); p.add_argument("--no-prepare", action="store_true")
+            p.add_argument("--port", type=int, default=20880); p.add_argument("--no-prepare", action="store_true")
     args = ap.parse_args(); DRY = args.dry_run
     reg = registry()["backends"]
     if args.cmd == "list":
         for k, v in reg.items(): print(f"{k:24} {v['status']:12} models={','.join(v['models'])}  {v['name']}")
         return 0
     model = canonical_model(args.model); gpus = select_gpus(args.backend, args.gpus); validate(args.backend, model, gpus, args.force)
+    capacity = None
+    if args.cmd in ("check", "serve"):
+        capacity = validate_capacity(args.backend, model, gpus, args.context, args.concurrency, args.profile, args.capacity)
     if args.cmd == "check":
         print(json.dumps({"backend": args.backend, "model": model, "gpus": gpus, "ok": True}, indent=2)); return 0
     if args.cmd == "prepare": prepare(args.backend, model, gpus); return 0
     if args.cmd == "fingerprint":
         info = reg[args.backend].copy(); info.update({"id": args.backend, "model": model, "gpus": gpus, "source_revision": source_revision(args.backend)})
+        if args.backend in FLASH_BACKENDS:
+            info["artifact"] = FLASH_ARTIFACTS[args.backend]
+            info["runtime_revision"] = None if DRY else runtime_revision(args.backend)
         print(json.dumps(info, indent=2)); return 0
     if args.cmd == "serve":
         if not args.no_prepare: prepare(args.backend, model, gpus)
-        serve(args.backend, model, gpus, args.port, args.context, args.profile); return 0
+        # Builds/downloads may change free RAM/VRAM. Admission is never bypassed
+        # by --force, and is repeated immediately before the engine allocation.
+        capacity = validate_capacity(args.backend, model, gpus, args.context, args.concurrency, args.profile, args.capacity)
+        serve(args.backend, model, gpus, args.port, args.context, args.profile, args.concurrency, capacity); return 0
     return 2
 
 

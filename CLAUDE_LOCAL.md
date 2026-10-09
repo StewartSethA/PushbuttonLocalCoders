@@ -118,6 +118,59 @@ but its server ID, slots and routes never merge with Haiku. Follow the request-I
 verification procedure below; Haiku selection alone never redirects safety
 requests or changes permissions.
 
+### Dedicated four-GPU Fable group
+
+Use `--local-role-placement configs/flash-next-role-placement.json` for an
+explicit production **llama.cpp** layout:
+
+| Role | Reservation |
+|---|---|
+| Haiku | CPU only; measured memory metadata required |
+| Sonnet and Opus (same model) | physical GPU 4 |
+| Fable: Flash Next | physical GPUs 0,1,2,3, exclusively |
+| Dedicated classifier | physical GPU 5, independent server and slots |
+
+For example, after calibrating the CPU Haiku envelope:
+
+```bash
+./claude-local q3-4b q38 q38 q38next \
+  --local-role-placement configs/flash-next-role-placement.json \
+  --local-memory-metadata verified-memory.json \
+  --local-context 131072 --local-client-context 120000 \
+  --local-classifier-model q38 --local-classifier-gpu 5 \
+  --local-classifier-request-model OBSERVED_DISTINCT_REQUEST_ID \
+  --local-dry-run
+```
+
+Edit physical indices for your machine; repeat the exact command without
+`--local-dry-run` only after reviewing admission. Slots remain **two by default**.
+Four 32 GiB V100s can be considered for the existing IQ4_XS envelope at this
+context/slot combination; this is not a measured performance or fit guarantee.
+The catalogue does **not** establish a four-3090 GGUF fit, nor a four-V100 fit at
+262144 **per slot** with two slots. Insufficient capacity fails closed; neither
+context, quant quality floor nor slots are silently reduced.
+
+The JSON must list all four roles with `backend: "llama.cpp"` and a distinct
+physical `gpus` array (empty means explicitly CPU-only). Shared-model roles must
+declare the same placement. A classifier entry must match the existing explicit
+classifier GPU option. Reserved groups cannot overlap or borrow cards, and
+Flash Next requires exactly four cards in this mode. Fixed placements do not
+add automatic overflow replicas even with `allow-cpu-only`; CPU Haiku is an
+explicit calibrated primary, not a fallback for the classifier or Fable.
+The same joint host/cgroup RAM, GPU reserves, thread admission, startup warmup
+and gateway slot limits apply. A missing CPU calibration is an error.
+An explicitly CPU-pinned role is permitted even under `gpu-only`; that policy
+still forbids automatic CPU overflow or migration of the GPU-pinned roles.
+
+**Protocol boundary:** the Claude gateway forwards Anthropic messages, tools,
+streams and count-token requests unchanged. The specialized vLLM/SGLang adapters
+serve **OpenAI**, not a verified Anthropic interface. They are intentionally
+rejected in role placement rather than pretending to be wired into Claude Code.
+Evaluate them separately using the [four-GPU bake-off](benchmarks/README.md).
+Promoting a winner into Claude serving requires a validated Anthropic adapter,
+including tool-use, streaming and classifier isolation; none is claimed here.
+Selecting lightweight Haiku does not select or validate a safety classifier.
+
 ### Qwen3 4B Instruct 2507 profiles and evidence
 
 `qwen3-4b-instruct-2507` (aliases `q3-4b`, `qwen3-4b-2507`,

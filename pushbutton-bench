@@ -19,8 +19,11 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 
 ROOT = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT / "lib"))
+from backend_runtime import require_free_port
 BACKEND = ROOT / "pushbutton-backend"
 REGISTRY = json.loads((ROOT / "configs/backend-registry.json").read_text())["backends"]
 DEFAULT_RESULTS = ROOT / "benchmarks/results"
@@ -58,27 +61,43 @@ def hardware() -> dict:
     return out
 
 
-def backend_check(backend: str, model: str, gpus: str | None) -> tuple[bool, str]:
-    cmd = [str(BACKEND), "check", backend, model]
+def backend_check(backend: str, model: str, gpus: str | None, *, context=65536,
+                  concurrency=1, capacity=None, profile=None, dry_run=False) -> tuple[bool, str]:
+    cmd = [sys.executable, str(BACKEND), "check", backend, model]
+    if dry_run: cmd.insert(2, "--dry-run")
     if gpus: cmd += ["--gpus", gpus]
+    cmd += ["--context", str(context), "--concurrency", str(concurrency)]
+    if capacity: cmd += ["--capacity", str(capacity)]
+    if profile: cmd += ["--profile", profile]
     cp = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     return cp.returncode == 0, cp.stdout.strip()
 
 
-def wait_ready(port: int, proc: subprocess.Popen, timeout: int = 7200) -> None:
+def wait_ready(port: int, proc: subprocess.Popen, timeout: int = 7200,
+               expected_model: str | None = None) -> None:
     deadline = time.time() + timeout
-    urls = [f"http://127.0.0.1:{port}/health", f"http://127.0.0.1:{port}/v1/models"]
+    urls = [f"http://127.0.0.1:{port}/v1/models"] if expected_model else [
+        f"http://127.0.0.1:{port}/health", f"http://127.0.0.1:{port}/v1/models"]
     last = ""
     while time.time() < deadline:
         if proc.poll() is not None:
             raise RuntimeError(f"backend exited during startup with status {proc.returncode}")
         for u in urls:
+            ready = False
             try:
                 with urllib.request.urlopen(u, timeout=3) as r:
                     if 200 <= r.status < 300:
-                        return
+                        if expected_model:
+                            ids = [m.get("id") for m in json.load(r).get("data", [])]
+                            if expected_model not in ids:
+                                raise RuntimeError("readiness model does not match this launch")
+                        ready = True
             except Exception as exc:
                 last = str(exc)
+            if proc.poll() is not None:
+                raise RuntimeError(f"backend exited during startup with status {proc.returncode}")
+            if ready:
+                return
         time.sleep(2)
     raise TimeoutError(f"backend did not become ready within {timeout}s: {last}")
 
@@ -104,7 +123,7 @@ def request_stream(port: int, model_id: str, prompt: str, max_tokens: int) -> di
     }
     encoded = json.dumps(body).encode()
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3600)
-    start = time.perf_counter(); first = None; usage = {}; text_parts = []
+    start = time.perf_counter(); first = None; usage = {}; text_parts = []; reasoning_parts = []
     try:
         conn.request("POST", "/v1/chat/completions", body=encoded, headers={"Content-Type":"application/json", "Authorization":"Bearer pushbutton-bench"})
         resp = conn.getresponse()
@@ -123,24 +142,28 @@ def request_stream(port: int, model_id: str, prompt: str, max_tokens: int) -> di
             if not data or data == b"[DONE]": continue
             try: obj = json.loads(data)
             except Exception: continue
+            if obj.get("error"):
+                raise RuntimeError(f"stream error: {obj['error']}")
             if obj.get("usage"): usage = obj["usage"]
             choices = obj.get("choices") or []
             if choices:
                 delta = choices[0].get("delta") or {}
                 content = delta.get("content")
-                if content:
+                reasoning = delta.get("reasoning_content")
+                if content or reasoning:
                     if first is None: first = time.perf_counter()
-                    text_parts.append(content)
+                    if content: text_parts.append(content)
+                    if reasoning: reasoning_parts.append(reasoning)
         end = time.perf_counter()
     finally:
         conn.close()
-    return finish_metrics(start, first, end, usage, "".join(text_parts))
+    return finish_metrics(start, first, end, usage, "".join(text_parts), "".join(reasoning_parts))
 
 
 def request_stream_compat(port: int, model_id: str, prompt: str, max_tokens: int) -> dict:
     body = {"model":model_id,"messages":[{"role":"user","content":prompt}],"temperature":0.0,"max_tokens":max_tokens,"stream":True}
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3600)
-    start=time.perf_counter(); first=None; text_parts=[]
+    start=time.perf_counter(); first=None; text_parts=[]; reasoning_parts=[]; usage={}
     try:
         conn.request("POST","/v1/chat/completions",body=json.dumps(body).encode(),headers={"Content-Type":"application/json","Authorization":"Bearer pushbutton-bench"})
         resp=conn.getresponse()
@@ -153,26 +176,37 @@ def request_stream_compat(port: int, model_id: str, prompt: str, max_tokens: int
             if not data or data==b"[DONE]": continue
             try: obj=json.loads(data)
             except Exception: continue
+            if obj.get("error"): raise RuntimeError(f"stream error: {obj['error']}")
+            if obj.get("usage"): usage = obj["usage"]
             choices=obj.get("choices") or []
             if choices:
-                c=(choices[0].get("delta") or {}).get("content")
-                if c:
+                delta = choices[0].get("delta") or {}
+                c=delta.get("content")
+                reasoning=delta.get("reasoning_content")
+                if c or reasoning:
                     if first is None:first=time.perf_counter()
-                    text_parts.append(c)
+                    if c: text_parts.append(c)
+                    if reasoning: reasoning_parts.append(reasoning)
         end=time.perf_counter()
     finally: conn.close()
-    return finish_metrics(start,first,end,{},"".join(text_parts))
+    return finish_metrics(start,first,end,usage,"".join(text_parts),"".join(reasoning_parts))
 
 
-def finish_metrics(start: float, first: float | None, end: float, usage: dict, text: str) -> dict:
-    ttft = (first-start) if first else None; total=end-start
+def finish_metrics(start: float, first: float | None, end: float, usage: dict, text: str,
+                   reasoning: str = "") -> dict:
+    if not text and not reasoning:
+        raise RuntimeError("backend returned no generated content; refusing to report synthetic throughput")
+    ttft = (first-start) if first is not None else None; total=end-start
     pt = usage.get("prompt_tokens"); ct = usage.get("completion_tokens")
     estimated = False
     if not ct:
-        ct = max(1, round(len(text.split()) * 1.33)); estimated = True
+        ct = max(1, round((len(text.split()) + len(reasoning.split())) * 1.33)); estimated = True
     decode = None
     if ttft is not None and total > ttft and ct > 1: decode = (ct-1)/(total-ttft)
-    return {"ttft_s":ttft,"elapsed_s":total,"prompt_tokens":pt,"completion_tokens":ct,"completion_tokens_estimated":estimated,"decode_tok_s":decode,"chars":len(text)}
+    return {"ttft_s":ttft,"elapsed_s":total,"prompt_tokens":pt,"completion_tokens":ct,"completion_tokens_estimated":estimated,"decode_tok_s":decode,"chars":len(text),
+            "reasoning_chars":len(reasoning), "generation_scope":"content_and_reasoning",
+            "ttft_scope":"first_nonempty_content_or_reasoning_delta",
+            "completion_token_basis":"word_estimate_content_and_reasoning" if estimated else "server_usage"}
 
 
 def make_prompt(words: int) -> str:
@@ -181,14 +215,30 @@ def make_prompt(words: int) -> str:
     return filler + "\n\nWrite a long deterministic numbered list of concise software-engineering observations. Continue until the output limit; do not stop early."
 
 
-def cases(suite: str) -> list[dict]:
-    if suite == "quick": return [{"name":"1k-c1","words":1024,"output":256,"concurrency":1,"repetitions":1}]
+def cases(suite: str, *, concurrency=4, context=None, prompt_words=None, output_tokens=None) -> list[dict]:
+    if prompt_words is not None:
+        return [{"name": f"{prompt_words}w-c{c}", "words": prompt_words,
+                 "output": output_tokens or 512, "concurrency": c, "repetitions": 1}
+                for c in sorted({1, concurrency})]
+    if suite == "quick":
+        return [{"name": f"1k-c{c}", "words": 1024, "output": output_tokens or 256,
+                 "concurrency": c, "repetitions": 1} for c in sorted({1, concurrency})]
     base = [
         {"name":"1k-c1","words":1024,"output":1024,"concurrency":1,"repetitions":2},
         {"name":"25k-c1","words":25000,"output":1024,"concurrency":1,"repetitions":2},
-        {"name":"1k-c4","words":1024,"output":512,"concurrency":4,"repetitions":1},
+        {"name":f"1k-c{concurrency}","words":1024,"output":512,"concurrency":concurrency,"repetitions":1},
     ]
     if suite == "long": base.append({"name":"100k-c1","words":100000,"output":1024,"concurrency":1,"repetitions":1})
+    if context is not None:
+        output = output_tokens or 512
+        # This is explicitly a word-scale probe, not a promised token count.
+        # Usage from the actual tokenizer is recorded in each response.
+        words = max(1, int((context - output - 128) * .75))
+        base.extend({"name": f"context-{context}-{words}w-c{c}", "words": words,
+                     "output": output, "concurrency": c, "repetitions": 1}
+                    for c in sorted({1, concurrency}))
+    if output_tokens is not None:
+        for spec in base: spec["output"] = output_tokens
     return base
 
 
@@ -209,7 +259,7 @@ def run_case(port: int, model_id: str, spec: dict) -> dict:
 
 
 def fingerprint(backend: str, model: str, gpus: str | None) -> dict:
-    cmd=[str(BACKEND),"fingerprint",backend,model]
+    cmd=[sys.executable,str(BACKEND),"fingerprint",backend,model]
     if gpus: cmd += ["--gpus",gpus]
     try: return json.loads(subprocess.check_output(cmd,text=True))
     except Exception: return {"id":backend,"model":model,"source":REGISTRY[backend]["source"]}
@@ -227,7 +277,8 @@ def summarize(outdir: pathlib.Path) -> pathlib.Path:
             for c in x.get("cases",[]):
                 rows.append((x.get("timestamp_utc",""),x.get("label",""),x["backend"]["id"],x["model"],c["name"],c.get("median_decode_tok_s"),c.get("aggregate_output_tok_s"),c.get("median_ttft_s"),p.name))
         except Exception: pass
-    md=["# Collected Pushbutton benchmark results","","Generated by `pushbutton-bench --summarize`. Raw JSON is authoritative.","","| UTC | label | backend | model | case | median decode tok/s | aggregate output tok/s | median TTFT s | report |","|---|---|---|---|---|---:|---:|---:|---|"]
+    md=["# Collected Pushbutton benchmark results","","Generated by `pushbutton-bench --summarize`. Raw JSON is authoritative.",
+        "New reports include reasoning in generated output and TTFT; server usage is authoritative. See each request's scopes and estimate flag; older reports may be content-only.","","| UTC | label | backend | model | case | median decode tok/s | aggregate output tok/s | median TTFT s | report |","|---|---|---|---|---|---:|---:|---:|---|"]
     for r in rows:
         fmt=lambda v: "" if v is None else f"{v:.2f}"
         md.append(f"| {r[0]} | {r[1]} | {r[2]} | {r[3]} | {r[4]} | {fmt(r[5])} | {fmt(r[6])} | {fmt(r[7])} | [{r[8]}](results/{r[8]}) |")
@@ -241,13 +292,26 @@ def main() -> int:
     ap.add_argument("--suite", choices=["quick","standard","long"], default="standard")
     ap.add_argument("--gpus", help="physical GPU indices, comma-separated")
     ap.add_argument("--context", type=int, default=65536)
+    ap.add_argument("--concurrency", type=int, default=4, help="requested Cn (standard/long also measure C1)")
+    ap.add_argument("--prompt-words", type=int, help="custom prompt scale; measures C1 and requested Cn")
+    ap.add_argument("--output-tokens", type=int)
+    ap.add_argument("--capacity", type=pathlib.Path, help="calibrated specialized Flash-Next capacity JSON")
+    ap.add_argument("--profile", help="specialized engine recipe profile (default MTP)")
+    ap.add_argument("--dry-run", action="store_true", help="print commands/cases; no servers, downloads or metrics")
     ap.add_argument("--port-base", type=int, default=20880)
     ap.add_argument("--label", default="local")
     ap.add_argument("--output-dir", type=pathlib.Path, default=DEFAULT_RESULTS)
     ap.add_argument("--no-prepare", action="store_true")
     ap.add_argument("--stage", action="store_true", help="git add the report and regenerated benchmark index")
     ap.add_argument("--summarize", action="store_true")
-    args=ap.parse_args(); args.output_dir.mkdir(parents=True,exist_ok=True)
+    args=ap.parse_args()
+    if args.context < 1 or not 1 <= args.concurrency <= 64:
+        ap.error("context must be positive; concurrency must be 1..64")
+    if any(v is not None and v < 1 for v in (args.prompt_words, args.output_tokens)):
+        ap.error("prompt words and output tokens must be positive")
+    if (args.output_tokens or 512) + 128 >= args.context:
+        ap.error("context must leave room for output and prompt")
+    if not args.dry_run: args.output_dir.mkdir(parents=True,exist_ok=True)
     if args.summarize:
         print(summarize(args.output_dir)); return 0
     if not args.model: ap.error("MODEL is required unless --summarize is used")
@@ -255,37 +319,63 @@ def main() -> int:
     wanted=list(REGISTRY) if args.backend=="all" else [args.backend]
     wanted=[b for b in wanted if b in REGISTRY and model in REGISTRY[b]["models"]]
     if not wanted: raise SystemExit(f"no selected backends support {model}")
-    hw=hardware(); reports=[]
+    hw=hardware(); reports=[]; planned=0
+    specifications = cases(args.suite, concurrency=args.concurrency, context=args.context,
+                           prompt_words=args.prompt_words, output_tokens=args.output_tokens)
+    specifications = [s for s in specifications if s["words"] + s["output"] + 128 < args.context]
+    if not specifications:
+        ap.error("no benchmark case fits requested context; lower prompt/output scale")
+    server_concurrency = max(s["concurrency"] for s in specifications)
     for i,b in enumerate(wanted):
-        ok,msg=backend_check(b,model,args.gpus)
+        ok,msg=backend_check(b,model,args.gpus, context=args.context,
+                            concurrency=server_concurrency, capacity=args.capacity,
+                            profile=args.profile, dry_run=args.dry_run)
         if not ok:
             say(f"SKIP {b}: {msg}"); continue
         port=args.port_base+i
+        cmd=[sys.executable,str(BACKEND),"serve",b,model,"--port",str(port),"--context",str(args.context),
+             "--concurrency",str(server_concurrency)]
+        if args.gpus: cmd += ["--gpus",args.gpus]
+        if args.capacity: cmd += ["--capacity",str(args.capacity)]
+        if args.profile: cmd += ["--profile",args.profile]
+        if args.no_prepare: cmd.append("--no-prepare")
+        if args.dry_run:
+            print(json.dumps({"backend":b,"command":cmd,"cases":specifications,
+                              "context_per_request":args.context,"server_concurrency":server_concurrency,
+                              "capacity_verified":False},indent=2))
+            planned += 1
+            continue
+        require_free_port(port)
+        identity = "pushbutton-bench-" + uuid.uuid4().hex if b in (
+            "llama.cpp", "llamampere", "volta-llama", "sglang-v100", "vllm-flashnext-3090") else None
+        env = os.environ.copy()
+        env.pop("PUSHBUTTON_BENCH_MODEL_ID", None)
+        if identity: env["PUSHBUTTON_BENCH_MODEL_ID"] = identity
         logdir=pathlib.Path(os.environ.get("PUSHBUTTON_BACKEND_STATE",os.environ.get("CLAUDE_LOCAL_STATE",str(pathlib.Path.home()/".local/share/pushbutton/claude-local"))))/"optional-backends/logs"
         logdir.mkdir(parents=True,exist_ok=True); log=open(logdir/f"bench-{safe(b)}.log","w")
-        cmd=[str(BACKEND),"serve",b,model,"--port",str(port),"--context",str(args.context)]
-        if args.gpus: cmd += ["--gpus",args.gpus]
-        if args.no_prepare: cmd.append("--no-prepare")
         say(f"starting {b}; first run may compile and/or download model weights")
-        proc=subprocess.Popen(cmd,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
+        proc=subprocess.Popen(cmd,stdout=log,stderr=subprocess.STDOUT,start_new_session=True,env=env)
         try:
-            wait_ready(port,proc); mid=discover_model(port,model); say(f"{b} ready as model {mid!r}; running {args.suite} suite")
+            wait_ready(port,proc,expected_model=identity); mid=identity or discover_model(port,model); say(f"{b} ready as model {mid!r}; running {args.suite} suite")
             result_cases=[]
-            for spec in cases(args.suite):
-                if spec["words"] > args.context*0.90:
-                    say(f"skip {spec['name']}: requested prompt scale exceeds context {args.context}"); continue
+            for spec in specifications:
                 say(f"{b}: {spec['name']} c={spec['concurrency']} output={spec['output']}")
                 result_cases.append(run_case(port,mid,spec))
             now=dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
             gpu_sig=",".join(g.get("name","") for g in hw.get("gpus",[])); hid=hashlib.sha256(gpu_sig.encode()).hexdigest()[:8] if gpu_sig else "nogpu"
-            report={"schema_version":1,"timestamp_utc":now,"label":args.label,"hardware_id":hid,"hardware":hw,"backend":fingerprint(b,model,args.gpus),"model":model,"served_model":mid,"suite":args.suite,"context":args.context,"gpus":args.gpus,"cases":result_cases,"backend_log":str(log.name)}
-            name=f"{now[:10]}__{safe(args.label)}__{hid}__{safe(b)}__{safe(model)}.json"; path=args.output_dir/name; path.write_text(json.dumps(report,indent=2)+"\n"); reports.append(path); say(f"wrote {path}")
+            report={"schema_version":1,"timestamp_utc":now,"label":args.label,"hardware_id":hid,"hardware":hw,"backend":fingerprint(b,model,args.gpus),"model":model,"served_model":mid,"suite":args.suite,"context":args.context,"gpus":args.gpus,"cases":result_cases,"backend_log":str(log.name),
+                    "server_concurrency":server_concurrency,"requested_concurrency":args.concurrency,
+                    "profile":(args.profile or "mtp") if b in ("sglang-v100", "vllm-flashnext-3090") else None,
+                    "requested_profile":args.profile,"launch_command":cmd,
+                    "capacity":json.loads(args.capacity.read_text()) if args.capacity else None}
+            name=f"{safe(now)}__{safe(args.label)}__{hid}__{safe(b)}__{safe(model)}__ctx{args.context}-c{server_concurrency}.json"; path=args.output_dir/name; path.write_text(json.dumps(report,indent=2)+"\n"); reports.append(path); say(f"wrote {path}")
         finally:
             try: os.killpg(proc.pid,signal.SIGTERM); proc.wait(timeout=30)
             except Exception:
                 try: os.killpg(proc.pid,signal.SIGKILL)
                 except Exception: pass
             log.close()
+    if args.dry_run: return 0 if planned else 2
     index=summarize(args.output_dir)
     if args.stage and reports:
         subprocess.run(["git","-C",str(ROOT),"add",str(index),*[str(p) for p in reports]],check=True)

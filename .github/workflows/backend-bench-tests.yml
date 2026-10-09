@@ -6,12 +6,19 @@ on:
       - "pushbutton-backend"
       - "pushbutton-bench"
       - "configs/backend-registry.json"
+      - "tests/test_flash_next_backends.py"
+      - "lib/claude_local_resources.py"
+      - "lib/backend_runtime.py"
       - "benchmarks/**"
       - "install-coder-local.sh"
       - ".github/workflows/backend-bench-tests.yml"
 
 permissions:
   contents: read
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+  TMPDIR: ${{ github.workspace }}
 
 jobs:
   smoke:
@@ -20,8 +27,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Python syntax
         run: |
-          python3 -m py_compile pushbutton-backend pushbutton-bench
+          PYTHONPYCACHEPREFIX="$PWD/.workflow-checks/pycache" python3 -m py_compile pushbutton-backend pushbutton-bench lib/backend_runtime.py tests/test_flash_next_backends.py
           python3 -m json.tool configs/backend-registry.json >/dev/null
+      - name: Mocked engine and benchmark regressions
+        run: python3 -m unittest discover -s tests -p 'test_flash_next_backends.py' -v
       - name: Backend registry
         run: python3 pushbutton-backend --dry-run list
       - name: Dry-run all backend adapters
@@ -40,10 +49,17 @@ jobs:
           python3 pushbutton-backend --dry-run serve vllm-qwen38-3090 qwen3.8:27b --gpus 0 --no-prepare
           python3 pushbutton-backend --dry-run serve ninfer-3090 qwen3.8:27b --gpus 0 --no-prepare
           python3 pushbutton-backend --dry-run serve vllm-flashnext-3090 qwen3.8-flash-next --gpus 0,1,2,3 --no-prepare
+          python3 pushbutton-backend --dry-run serve sglang-v100 flash-next --gpus 0,1,2,3 --context 131072 --concurrency 2 --no-prepare
+          python3 pushbutton-backend --dry-run serve vllm-flashnext-3090 flash-next --gpus 0,1,2,3 --context 65536 --concurrency 2 --no-prepare
+          if python3 pushbutton-backend --dry-run serve vllm-flashnext-3090 flash-next --gpus 0,1 --force --no-prepare; then exit 1; fi
+      - name: Flash-Next C1 and requested concurrency plans
+        run: |
+          python3 pushbutton-bench flash-next --backend sglang-v100 --gpus 0,1,2,3 --context 131072 --concurrency 2 --dry-run
+          python3 pushbutton-bench flash-next --backend vllm-flashnext-3090 --gpus 0,1,2,3 --context 65536 --concurrency 2 --dry-run
       - name: Report index generator
         run: |
-          mkdir -p /tmp/pushbutton-results
-          python3 pushbutton-bench --summarize --output-dir /tmp/pushbutton-results
-          test -s /tmp/RESULTS.md
+          mkdir -p .workflow-checks/results
+          python3 pushbutton-bench --summarize --output-dir .workflow-checks/results
+          test -s .workflow-checks/RESULTS.md
       - name: Installer syntax
         run: bash -n install-coder-local.sh

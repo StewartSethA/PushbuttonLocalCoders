@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "roles": {
+    "haiku": {"backend": "llama.cpp", "gpus": []},
+    "sonnet": {"backend": "llama.cpp", "gpus": [4]},
+    "opus": {"backend": "llama.cpp", "gpus": [4]},
+    "fable": {"backend": "llama.cpp", "gpus": [0, 1, 2, 3]}
+  },
+  "classifier": {"backend": "llama.cpp", "gpus": [5]}
+}

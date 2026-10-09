@@ -9,6 +9,8 @@ on:
       - "lib/claude_local_*.sh"
       - "tests/test_claude_local.py"
       - "tests/test_claude_local_scheduler.py"
+      - "tests/test_cpu_fallback.py"
+      - "configs/flash-next-role-placement.json"
       - "tests/test_backend_row_protocol.sh"
       - ".github/workflows/claude-local-tests.yml"
   push:
@@ -21,11 +23,17 @@ on:
       - "lib/claude_local_*.sh"
       - "tests/test_claude_local.py"
       - "tests/test_claude_local_scheduler.py"
+      - "tests/test_cpu_fallback.py"
+      - "configs/flash-next-role-placement.json"
       - "tests/test_backend_row_protocol.sh"
       - ".github/workflows/claude-local-tests.yml"
 
 permissions:
   contents: read
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+  TMPDIR: ${{ github.workspace }}
 
 jobs:
   static-tests:
@@ -35,8 +43,10 @@ jobs:
       - name: Bash syntax
         run: bash -n ./claude-local ./install-claude-local.sh ./lib/claude_local_hostcc.sh ./lib/claude_local_entry.sh ./tests/test_backend_row_protocol.sh
       - name: Python syntax
-        run: python3 -m py_compile lib/claude_local_plan.py lib/claude_local_gateway.py tests/test_claude_local.py tests/test_claude_local_scheduler.py
+        run: PYTHONPYCACHEPREFIX="$PWD/.workflow-checks/pycache" python3 -m py_compile lib/claude_local_plan.py lib/claude_local_gateway.py lib/claude_local_resources.py lib/claude_local_validate.py tests/test_claude_local.py tests/test_claude_local_scheduler.py tests/test_cpu_fallback.py
       - name: Backend row protocol
         run: bash ./tests/test_backend_row_protocol.sh
       - name: Unit tests
-        run: python3 -m unittest -v tests/test_claude_local.py tests/test_claude_local_scheduler.py
+        run: |
+          python3 -m unittest discover -s tests -p 'test_claude_local*.py' -v
+          python3 -m unittest discover -s tests -p 'test_cpu_fallback.py' -v
