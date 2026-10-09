@@ -1,40 +1,54 @@
 #!/usr/bin/env python3
-"""Interactive model/backend selector with live hardware and benchmark guidance."""
+"""Interactive model/backend selector with live hardware, SLA and capability hints."""
 from __future__ import annotations
-import argparse, json, os, pathlib, re, socket, subprocess, sys, urllib.request
+import argparse, json, os, pathlib, re, socket, sys, urllib.request
 
 ROOT=pathlib.Path(__file__).resolve().parent
 sys.path.insert(0,str(ROOT/'lib'))
 import claude_local_plan as plan
 import pushbutton_metrics as metrics
+import pushbutton_policy as policy
+
+CATALOG_PATH=ROOT/'configs/model-catalog.json'
+def catalog():
+ try:return json.loads(CATALOG_PATH.read_text()).get('models',{})
+ except Exception:return {}
+
+def aliases():
+ a={'qwen38':'qwen3.8:27b','qwen3.8-27b':'qwen3.8:27b','q38':'qwen3.8:27b'}
+ for mid,m in catalog().items():
+  a[mid.lower()]=mid
+  for x in m.get('aliases',[]):a[str(x).lower()]=mid
+ return a
 
 UPSTREAM={
  ('qwen3.8:27b','llamampere'):{'artifact':'ATX-IQ4_XS-M (4.56 bpw)','tested_card_mib':24576,'hard_min_mib':None,'host_ram_mib':8192,'quality':'~97*','note':'3090/3090 Ti specialized path; reduced-memory behavior is recipe-dependent.'},
  ('qwen3.8:27b','vllm-qwen38-3090'):{'artifact':'patched vLLM W4A16/int8-requantized','tested_card_mib':24576,'hard_min_mib':None,'host_ram_mib':12288,'quality':'n/a','note':'single-3090 specialized stack; use measured rows for exact speed/context claims.'},
  ('qwen3.8:27b','ninfer-3090'):{'artifact':'NInfer groupwise 16.96 GiB','tested_card_mib':24576,'hard_min_mib':17368,'host_ram_mib':8192,'quality':'n/a','note':'artifact alone exceeds 16 GiB; published C1 peak is about 19.2 GiB.'},
 }
-ALIASES={'qwen38':'qwen3.8:27b','qwen3.8-27b':'qwen3.8:27b','q38':'qwen3.8:27b'}
+RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; BOLD='\033[1m'; CYAN='\033[36m'; RESET='\033[0m'
+def color(s,c):return f'{c}{s}{RESET}' if sys.stdout.isatty() else s
+def canon(x:str)->str:
+ k=x.lower().strip()
+ if k in aliases():return aliases()[k]
+ try:return plan.canonical_model(k)
+ except Exception:return k
 
-RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; BOLD='\033[1m'; RESET='\033[0m'
-def color(s,c): return f'{c}{s}{RESET}' if sys.stdout.isatty() else s
-
-def canon(x:str)->str:return ALIASES.get(x.lower(),x.lower())
 def parse_mem(s:str|None)->int|None:
  if not s:return None
  m=re.fullmatch(r'\s*(\d+(?:\.\d+)?)\s*([GM]?)I?B?\s*',s,re.I)
  if not m:raise ValueError(f'invalid memory size {s!r}')
- v=float(m.group(1));u=m.group(2).upper(); return int(v*1024) if u=='G' else int(v)
+ v=float(m.group(1));u=m.group(2).upper();return int(v*1024) if u=='G' else int(v)
 
 def ram_info():
  try:
-  text=pathlib.Path('/proc/meminfo').read_text(); vals={k:int(v) for k,v in re.findall(r'^(MemTotal|MemAvailable):\s+(\d+)',text,re.M)}
+  text=pathlib.Path('/proc/meminfo').read_text();vals={k:int(v) for k,v in re.findall(r'^(MemTotal|MemAvailable):\s+(\d+)',text,re.M)}
   return vals.get('MemTotal',0)//1024,vals.get('MemAvailable',0)//1024
  except Exception:return None,None
 
 def gpu_inventory():
  try:return plan.inventory()
  except Exception:return []
-
 def gpu_for(index:int|None):
  inv=gpu_inventory()
  if index is None:return inv[0] if len(inv)==1 else None
@@ -56,163 +70,192 @@ def known_endpoints():
    for line in p.read_text().splitlines():
     x=line.split('\t')
     if len(x)<4:continue
-    worker,mid,port,hf=x[:4]; port=int(port)
+    worker,mid,port,hf=x[:4];port=int(port)
     try:
-     with urllib.request.urlopen(f'http://127.0.0.1:{port}/v1/models',timeout=.25) as r: obj=json.load(r)
+     with urllib.request.urlopen(f'http://127.0.0.1:{port}/v1/models',timeout=.25) as r:obj=json.load(r)
      served=((obj.get('data') or [{}])[0]).get('id') or mid
      rows.append({'source':p.name,'worker':worker,'model_id':served,'port':port,'artifact':hf})
     except Exception:pass
   except Exception:pass
  return rows
 
+def benchmark_hint(model,short=False):
+ m=catalog().get(model,{})
+ b=m.get('benchmarks') or {}
+ order=['Terminal-Bench 2.1 (Claude Code)','Terminal-Bench 2.1','SWE-bench Verified','SWE-bench Pro','DeepSWE v1.1','DeepSWE','NL2Repo-Bench','NL2Repo','GPQA Diamond']
+ parts=[]
+ for name in order:
+  if name not in b:continue
+  label=name.replace('Terminal-Bench 2.1 (Claude Code)','TB2.1-CC').replace('Terminal-Bench 2.1','TB2.1').replace('SWE-bench Verified','SWE-V').replace('SWE-bench Pro','SWE-Pro').replace('DeepSWE v1.1','DeepSWE').replace('NL2Repo-Bench','NL2Repo').replace('GPQA Diamond','GPQA')
+  parts.append(f"{label} {b[name].get('score')}")
+  if short and len(parts)>=2:break
+ return ' | '.join(parts)
+
 def model_menu():
- names=list(plan.PROFILES)
+ names=[]
+ for m in list(plan.PROFILES)+list(catalog()):
+  if m not in names:names.append(m)
+ pref=['qwen3.8:27b','ornith-1.5:35b-a3b','ornith-1.5:9b','deepseek-v4.1-flash','ornith-1.5:397b']
+ names=sorted(names,key=lambda x:(pref.index(x) if x in pref else 100+names.index(x)))
  print('\nAvailable model families:')
  for i,m in enumerate(names,1):
-  profiles=plan.PROFILES[m]; q=profiles[0].quality if profiles else '-'
-  print(f' {i:>2}. {m:<26} best planner quality {q}')
+  c=catalog().get(m,{});h=benchmark_hint(m,True);desc=c.get('display') or m
+  if m in plan.PROFILES:desc=f'{desc}  [GGUF planner]'
+  print(f' {i:>2}. {desc:<43}'+(f'  {h}' if h else ''))
+ print('Benchmark hints are upstream/vendor harness results, not local speed measurements.')
  while True:
   s=input('Choose model [1]: ').strip() or '1'
   try:
    n=int(s)
    if 1<=n<=len(names):return names[n-1]
   except ValueError:
-   try:return plan.canonical_model(s)
-   except Exception:pass
-  print('Please enter a number or model name.')
+   m=canon(s)
+   if m in names:return m
+  print('Please enter a number or known model name.')
 
 def ask_caps(gpu):
- total,avail=ram_info()
- print('\nResource ceilings (blank = use detected availability).')
+ total,avail=ram_info();print('\nResource ceilings (blank = use detected availability).')
  rs=input(f'Host RAM ceiling [{avail/1024:.1f}G available]: ' if avail else 'Host RAM ceiling [auto]: ').strip()
- default_v=f'{gpu.free_mib/1024:.1f}G' if gpu else 'auto'
- vs=input(f'VRAM ceiling [{default_v}]: ').strip()
- return parse_mem(rs) if rs else avail, parse_mem(vs) if vs else (gpu.free_mib if gpu else None)
+ default_v=f'{gpu.free_mib/1024:.1f}G' if gpu else 'auto';vs=input(f'VRAM ceiling [{default_v}]: ').strip()
+ return parse_mem(rs) if rs else avail,parse_mem(vs) if vs else (gpu.free_mib if gpu else None)
 
 def estimate_llama_rates(gpu,req):
  if not gpu or not req:return None,None
- bw=max(150,getattr(gpu,'speed_score',200))
- weight_gib=max(4.0,(req/1024)*.88)
- tg=max(1.0,.76*bw/weight_gib)
- pp=tg*28.0
- return pp,tg
+ bw=max(150,getattr(gpu,'speed_score',200));weight_gib=max(4.0,(req/1024)*.88);tg=max(1.0,.76*bw/weight_gib);return tg*28.0,tg
 
-def measured_summary(model,backend,gpu_name,context):
- rows=metrics.observations(model,backend,gpu_name,context)
- s=metrics.summarize_observations(rows)
- return rows,s
+def measured_summary(model,backend,artifact,gpu_name,context):
+ rows=metrics.observations(model,backend,artifact,gpu_name,context);return rows,metrics.summarize_observations(rows)
+
+def catalog_rows(model,gpu,cap,ram_cap,context):
+ m=catalog().get(model,{})
+ if not m:return []
+ rows=[];gpu_name=gpu.name if gpu else None
+ quants=m.get('quants') or []
+ for q in quants:
+  weight=float(q['weight_gib'])*1024
+  scale=max(.125,min(1.0,context/max(1,int(m.get('context') or 262144))))
+  ctx_overhead=(5120 if '9b' in model else 9216)*scale
+  req=int(weight+ctx_overhead+1536);ram_req=max(2048,int(weight*.15));status='FIT'
+  if cap is not None and req>cap:status='BLOCK'
+  if ram_cap is not None and ram_req>ram_cap:status='BLOCK'
+  obs,sm=measured_summary(model,'llama.cpp',q['name'],gpu_name,context)
+  pp=(sm.get('pp') or {}).get('median');tg=(sm.get('tg') or {}).get('median');evidence='MEASURED' if pp or tg else 'ESTIMATED'
+  if evidence=='ESTIMATED':pp,tg=estimate_llama_rates(gpu,req)
+  rows.append({'model':model,'backend':'llama.cpp','artifact':q['name'],'req':req,'ram_req':ram_req,'quality':str(q.get('quality','n/a')),'pp':pp,'tg':tg,'status':status,'note':f"{m.get('gguf_repo')} — memory envelope estimated until locally profiled",'evidence':evidence,'spread':sm,'local':any(str(r.get('source','')).startswith('local') for r in obs)})
+ if model=='deepseek-v4.1-flash':
+  req=int(float(m.get('minimum_vram_gib',614))*1024);avail=sum(g.free_mib for g in gpu_inventory());status='FIT' if avail>=req else 'BLOCK'
+  if cap is not None and len(gpu_inventory())<=1 and cap<req:status='BLOCK'
+  rows.append({'model':model,'backend':'vllm','artifact':'native mixed MXFP4/MXFP8','req':req,'ram_req':32768,'quality':'native','pp':None,'tg':None,'status':status,'note':'vLLM 0.30+ dedicated DeepSeek V4.1 image; 614 GB minimum aggregate VRAM reference','evidence':'ESTIMATED','spread':{},'local':False})
+ elif model=='ornith-1.5:397b' and not quants:
+  rows.append({'model':model,'backend':'vllm/llama.cpp','artifact':'397B checkpoint / GGUF','req':None,'ram_req':None,'quality':'native','pp':None,'tg':None,'status':'UNVERIFIED','note':'large-node model; exact local quant/memory profile should be measured before automatic launch','evidence':'ESTIMATED','spread':{},'local':False})
+ return rows
 
 def rows_for(model,gpu,cap,ram_cap,context):
- rows=[]; gpu_name=gpu.name if gpu else None
+ rows=[];gpu_name=gpu.name if gpu else None
  if model in plan.PROFILES:
   for p in plan.PROFILES[model]:
-   req=plan.scaled_required_mib(p,context); ram_req=max(2048,int(req*.12))
-   status='FIT'
+   req=plan.scaled_required_mib(p,context);ram_req=max(2048,int(req*.12));status='FIT'
    if cap is not None and req>cap:status='BLOCK'
    if ram_cap is not None and ram_req>ram_cap:status='BLOCK'
-   obs,sm=measured_summary(model,'llama.cpp',gpu_name,context)
-   pp=(sm.get('pp') or {}).get('median'); tg=(sm.get('tg') or {}).get('median'); evidence='MEASURED' if pp or tg else 'ESTIMATED'
+   obs,sm=measured_summary(model,'llama.cpp',p.quant,gpu_name,context)
+   pp=(sm.get('pp') or {}).get('median');tg=(sm.get('tg') or {}).get('median');evidence='MEASURED' if pp or tg else 'ESTIMATED'
    if evidence=='ESTIMATED':pp,tg=estimate_llama_rates(gpu,req)
-   rows.append({'model':model,'backend':'llama.cpp','artifact':p.quant,'req':req,'ram_req':ram_req,'quality':str(p.quality),'pp':pp,'tg':tg,'status':status,'note':'quant-selectable GGUF lane','evidence':evidence,'spread':sm,'local':any(r.get('source')=='local' for r in obs)})
+   rows.append({'model':model,'backend':'llama.cpp','artifact':p.quant,'req':req,'ram_req':ram_req,'quality':str(p.quality),'pp':pp,'tg':tg,'status':status,'note':'quant-selectable GGUF lane','evidence':evidence,'spread':sm,'local':any(str(r.get('source','')).startswith('local') for r in obs)})
+ if model not in plan.PROFILES:rows+=catalog_rows(model,gpu,cap,ram_cap,context)
  for (m,b),d in UPSTREAM.items():
   if m!=model:continue
-  hard=d.get('hard_min_mib'); tested=d.get('tested_card_mib'); ram_req=d.get('host_ram_mib')
+  hard=d.get('hard_min_mib');tested=d.get('tested_card_mib');ram_req=d.get('host_ram_mib')
   if cap is None:status='FIT' if tested else 'UNVERIFIED'
   elif hard is not None and hard>cap:status='BLOCK'
   elif tested is not None and cap>=tested:status='FIT'
   else:status='UNVERIFIED'
   if ram_cap is not None and ram_req is not None and ram_req>ram_cap:status='BLOCK'
-  obs,sm=measured_summary(model,b,gpu_name,context)
-  pp=(sm.get('pp') or {}).get('median'); tg=(sm.get('tg') or {}).get('median')
-  evidence='MEASURED' if pp or tg else 'ESTIMATED'
-  rows.append({'model':model,'backend':b,'artifact':d['artifact'],'req':hard,'ram_req':ram_req,'quality':d.get('quality','n/a'),'pp':pp,'tg':tg,'status':status,'note':d['note'],'evidence':evidence,'spread':sm,'local':any(r.get('source')=='local' for r in obs)})
- rank={'FIT':0,'UNVERIFIED':1,'BLOCK':2}
- rows.sort(key=lambda r:(rank[r['status']],0 if r['evidence']=='MEASURED' else 1,-(r['tg'] or -1),-(int(r['quality']) if str(r['quality']).isdigit() else -1)))
+  obs,sm=measured_summary(model,b,d['artifact'],gpu_name,context);pp=(sm.get('pp') or {}).get('median');tg=(sm.get('tg') or {}).get('median');evidence='MEASURED' if pp or tg else 'ESTIMATED'
+  rows.append({'model':model,'backend':b,'artifact':d['artifact'],'req':hard,'ram_req':ram_req,'quality':d.get('quality','n/a'),'pp':pp,'tg':tg,'status':status,'note':d['note'],'evidence':evidence,'spread':sm,'local':any(str(r.get('source','')).startswith('local') for r in obs)})
+ for r in rows:
+  s,w=policy.speed_label(r.get('tg'),measured=r.get('evidence')=='MEASURED');r['speed_status']=s;r['speed_warning']=w
+ rank={'FIT':0,'UNVERIFIED':1,'BLOCK':2};sr={'OK':0,'UNKNOWN':1,'SLOW':2,'VERY_SLOW':3}
+ rows.sort(key=lambda r:(rank[r['status']],sr.get(r['speed_status'],4),0 if r['evidence']=='MEASURED' else 1,-(r['tg'] or -1),-(int(r['quality']) if str(r['quality']).isdigit() else -1)))
  return rows
 
 def fmt_mib(v):return '-' if v is None else f'{v/1024:.1f}G'
 def fmt_rate(v):return '-' if v is None else f'{v:.0f}'
 def ev_label(r):
- s='MEASURED' if r['evidence']=='MEASURED' else 'ESTIMATED'
- return color(s,GREEN if s=='MEASURED' else RED)
-
+ s='MEASURED' if r['evidence']=='MEASURED' else 'ESTIMATED';return color(s,GREEN if s=='MEASURED' else RED)
+def speed_label(r):
+ s=r.get('speed_status','UNKNOWN')
+ if s=='OK':return color(s,GREEN)
+ if s in {'SLOW','VERY_SLOW'}:return color(s,RED)
+ return color(s,YELLOW)
 def print_hw(gpu,ram_cap,vram_cap):
- total,avail=ram_info(); print('')
+ total,avail=ram_info();print('')
  if gpu:
-  used=max(0,gpu.total_mib-gpu.free_mib)
-  print(f"GPU {gpu.index}: {gpu.name}  {gpu.free_mib/1024:.1f}G free / {gpu.total_mib/1024:.1f}G total  ({used/1024:.1f}G occupied)")
-  if vram_cap and vram_cap>gpu.free_mib: print(color(f'WARNING: requested VRAM ceiling {fmt_mib(vram_cap)} exceeds currently free VRAM {fmt_mib(gpu.free_mib)}.',YELLOW),file=sys.stderr)
- elif gpu_inventory(): print('Multiple GPUs detected; use --gpu or select one interactively for card-specific guidance.')
- if total: print(f'Host RAM: {avail/1024:.1f}G available / {total/1024:.1f}G total  planning ceiling={fmt_mib(ram_cap)}')
+  used=max(0,gpu.total_mib-gpu.free_mib);print(f"GPU {gpu.index}: {gpu.name}  {gpu.free_mib/1024:.1f}G free / {gpu.total_mib/1024:.1f}G total  ({used/1024:.1f}G occupied)")
+  if vram_cap and vram_cap>gpu.free_mib:print(color(f'WARNING: requested VRAM ceiling {fmt_mib(vram_cap)} exceeds currently free VRAM {fmt_mib(gpu.free_mib)}.',YELLOW),file=sys.stderr)
+ elif gpu_inventory():print('Multiple GPUs detected; use --gpu or unified pushbutton placement for multi-card model planning.')
+ if total:print(f'Host RAM: {avail/1024:.1f}G available / {total/1024:.1f}G total  planning ceiling={fmt_mib(ram_cap)}')
 
-def print_table(rows,gpu,cap,ram_cap):
- print_hw(gpu,ram_cap,cap)
- print(f"{'#':>2} {'status':<10} {'backend':<19} {'quant/artifact':<28} {'VRAM':>7} {'RAM':>7} {'qual':>6} {'PP':>7} {'TG':>7} {'evidence':<10}")
- print('-'*116)
- for i,r in enumerate(rows,1):
-  print(f"{i:>2} {r['status']:<10} {r['backend']:<19} {r['artifact'][:28]:<28} {fmt_mib(r['req']):>7} {fmt_mib(r['ram_req']):>7} {r['quality']:>6} {fmt_rate(r['pp']):>7} {fmt_rate(r['tg']):>7} {ev_label(r):<10}")
- print('\nPP/TG are tok/s. Green MEASURED rows come from local or repo aggregate observations; red ESTIMATED rows are planning estimates only.')
+def print_benchmark_hints(model):
+ h=benchmark_hint(model)
+ if not h:return
+ print('\n'+color('Capability hints:',CYAN)+' '+h)
+ print('  upstream/vendor benchmark results; harness, context and sampling matter. They are hints, not local performance SLAs.')
+
+def print_table(rows,gpu,cap,ram_cap,model):
+ print_hw(gpu,ram_cap,cap);print(f"{'#':>2} {'status':<10} {'speed':<10} {'backend':<19} {'quant/artifact':<28} {'VRAM':>7} {'RAM':>7} {'qual':>6} {'PP':>7} {'TG':>7} {'evidence':<10}");print('-'*127)
+ for i,r in enumerate(rows,1):print(f"{i:>2} {r['status']:<10} {speed_label(r):<10} {r['backend']:<19} {r['artifact'][:28]:<28} {fmt_mib(r['req']):>7} {fmt_mib(r['ram_req']):>7} {r['quality']:>6} {fmt_rate(r['pp']):>7} {fmt_rate(r['tg']):>7} {ev_label(r):<10}")
+ print(f'\nPP/TG are tok/s. {policy.MIN_DECODE_TOK_S:.0f} TG/s is the Pushbutton normal-speed floor; sub-floor rows are explicitly SLOW.')
+ print('Green MEASURED rows come from local/repo observations; red ESTIMATED rows are planning estimates only.');print_benchmark_hints(model)
 
 def preview(row,gpu,cap,context):
- eps=known_endpoints(); same=[e for e in eps if row['model'].split(':')[0] in str(e['model_id']).lower() or row['model'].replace(':','-') in str(e['model_id']).lower()]
+ eps=known_endpoints();same=[e for e in eps if canon(row['model']) in canon(str(e['model_id'])) or row['model'].split(':')[0] in str(e['model_id']).lower()]
  print('\nPlacement preview:')
  if same:
-  e=same[0]; print(color(f"  REUSE resident endpoint http://127.0.0.1:{e['port']}/v1 ({e['model_id']})",GREEN)); return
- port=free_port(); print(f"  GPU: {gpu.index if gpu else 'auto'}   backend: {row['backend']}   artifact: {row['artifact']}")
- print(f"  VRAM plan: {fmt_mib(row['req'])} within lease {fmt_mib(cap)}   context: {context:,}   proposed port: {port}")
+  e=same[0];print(color(f"  REUSE resident endpoint http://127.0.0.1:{e['port']}/v1 ({e['model_id']})",GREEN));return
+ port=free_port();print(f"  GPU: {gpu.index if gpu else 'auto/multi-card planner'}   backend: {row['backend']}   artifact: {row['artifact']}");print(f"  VRAM plan: {fmt_mib(row['req'])} within lease {fmt_mib(cap)}   context: {context:,}   proposed port: {port}")
  print('  Existing listeners are not overwritten; launchers choose a free loopback port.')
- if row['status']=='UNVERIFIED': print(color('  WARNING: memory compatibility is not proven for this specialized backend/profile.',YELLOW),file=sys.stderr)
+ if row['status']=='UNVERIFIED':print(color('  WARNING: memory compatibility is not proven for this backend/profile.',YELLOW),file=sys.stderr)
 
 def main():
- ap=argparse.ArgumentParser(prog='pushbutton-select')
- ap.add_argument('model',nargs='?')
- ap.add_argument('--gpu',type=int)
- ap.add_argument('--vram-limit'); ap.add_argument('--ram-limit')
- ap.add_argument('--context',type=int,default=262144)
- ap.add_argument('--json',action='store_true'); ap.add_argument('--no-interactive',action='store_true')
- ap.add_argument('--telemetry-opt-in',action='store_true'); ap.add_argument('--telemetry-off',action='store_true'); ap.add_argument('--telemetry-upload-url')
- a=ap.parse_args()
+ ap=argparse.ArgumentParser(prog='pushbutton-select');ap.add_argument('model',nargs='?');ap.add_argument('--gpu',type=int);ap.add_argument('--vram-limit');ap.add_argument('--ram-limit');ap.add_argument('--context',type=int,default=262144);ap.add_argument('--json',action='store_true');ap.add_argument('--no-interactive',action='store_true');ap.add_argument('--telemetry-opt-in',action='store_true');ap.add_argument('--telemetry-off',action='store_true');ap.add_argument('--telemetry-upload-url');a=ap.parse_args()
  if a.telemetry_opt_in:
-  p=metrics.set_telemetry(True,a.telemetry_upload_url); print(f'Opt-in telemetry enabled in {p}. Only compact benchmark metadata is queued; prompts/text are excluded.')
+  p=metrics.set_telemetry(True,a.telemetry_upload_url);print(f'Opt-in telemetry enabled in {p}. Only compact performance metadata is queued; prompts/text are excluded.')
  if a.telemetry_off:
-  p=metrics.set_telemetry(False); print(f'Telemetry disabled in {p}.')
- inv=gpu_inventory(); gpu=gpu_for(a.gpu)
+  p=metrics.set_telemetry(False);print(f'Telemetry disabled in {p}.')
+ inv=gpu_inventory();gpu=gpu_for(a.gpu)
  if a.gpu is None and len(inv)>1 and not a.no_interactive and sys.stdin.isatty():
   print('Detected GPUs:')
   for g in inv:print(f' {g.index}: {g.name}  free {g.free_mib/1024:.1f}G/{g.total_mib/1024:.1f}G')
-  try:gpu=gpu_for(int(input(f'Choose GPU [{inv[0].index}]: ').strip() or inv[0].index))
-  except Exception:gpu=inv[0]
- ram_cap=parse_mem(a.ram_limit); cap=parse_mem(a.vram_limit)
- if not a.no_interactive and sys.stdin.isatty() and not a.model and not a.ram_limit and not a.vram_limit:
-  ram_cap,cap=ask_caps(gpu)
+  print('A single-card choice is useful for card-specific inspection; unified pushbutton may still choose multi-card placement.')
+  raw=input('Choose GPU for this selector view [0 / blank=aggregate-aware]: ').strip()
+  if raw:
+   try:gpu=gpu_for(int(raw))
+   except Exception:gpu=None
+ ram_cap=parse_mem(a.ram_limit);cap=parse_mem(a.vram_limit)
+ if not a.no_interactive and sys.stdin.isatty() and not a.model and not a.ram_limit and not a.vram_limit:ram_cap,cap=ask_caps(gpu)
  model=canon(a.model) if a.model else (model_menu() if not a.no_interactive and sys.stdin.isatty() else 'qwen3.8:27b')
- if model not in plan.PROFILES and not any(m==model for m,_ in UPSTREAM):raise SystemExit(f'unknown selector model {model}')
+ if model not in plan.PROFILES and model not in catalog() and not any(m==model for m,_ in UPSTREAM):raise SystemExit(f'unknown selector model {model}')
  if cap is None and gpu:cap=gpu.free_mib
  if ram_cap is None:_,ram_cap=ram_info()
  rs=rows_for(model,gpu,cap,ram_cap,a.context)
  if a.json:
-  print(json.dumps({'model':model,'gpu':None if gpu is None else gpu.__dict__,'ram_limit_mib':ram_cap,'vram_limit_mib':cap,'rows':rs,'resident':known_endpoints()},indent=2));return
- print_table(rs,gpu,cap,ram_cap)
- usable=[(i,r) for i,r in enumerate(rs,1) if r['status']=='FIT']
- if not usable:raise SystemExit('No proven configuration fits the current ceilings.')
- default=usable[0][0]
- choice=default
+  print(json.dumps({'model':model,'speed_floor_tg':policy.MIN_DECODE_TOK_S,'capability_benchmarks':catalog().get(model,{}).get('benchmarks',{}),'gpu':None if gpu is None else gpu.__dict__,'ram_limit_mib':ram_cap,'vram_limit_mib':cap,'rows':rs,'resident':known_endpoints()},indent=2));return
+ print_table(rs,gpu,cap,ram_cap,model);fits=[(i,r) for i,r in enumerate(rs,1) if r['status']=='FIT'];fast=[(i,r) for i,r in fits if r.get('speed_status')=='OK'];usable=fast or fits
+ if not usable:
+  print(color('No proven configuration fits the current ceilings; blocked/unverified rows remain visible as guidance.',YELLOW));return
+ default=usable[0][0];choice=default
  if sys.stdin.isatty() and not a.no_interactive:
   try:choice=int(input(f'\nSelect configuration [{default}]: ').strip() or default)
   except Exception:choice=default
  if not (1<=choice<=len(rs)):raise SystemExit('selection out of range')
  r=rs[choice-1]
  if r['status']=='BLOCK':raise SystemExit('selected configuration exceeds a requested resource ceiling')
+ if r.get('speed_status') in {'SLOW','VERY_SLOW'}:
+  print('\n'+color('*** SERIOUS SLOWNESS WARNING ***',RED),file=sys.stderr);print(color((r.get('speed_warning') or 'This configuration is below the normal Pushbutton speed floor')+'. Choose it only when quality/context requirements justify the latency.',RED),file=sys.stderr)
  preview(r,gpu,cap,a.context)
- gpu_clause=f'@gpu={gpu.index}' if gpu else ''
- vram_clause=((',' if gpu_clause else '@')+f'vram={cap}MiB') if cap else ''
- if r['backend']=='llama.cpp':print(f"\nRecommended launch:\n  qwen-local '{model}{gpu_clause}{vram_clause}' --agents 1 --local-context {a.context}")
- else:
-  gp=f' --gpus {gpu.index}' if gpu else ''
-  print(f"\nRecommended validation first:\n  pushbutton-bench {model} --backend {r['backend']}{gp} --context {a.context} --suite standard")
-  print('After a local benchmark, this selector will prefer the local measured PP/TG distribution over repo/upstream values.')
- cfg=metrics.telemetry_config()
- if cfg.get('enabled'):
-  try:n,msg=metrics.upload_pending(); print(f'\nTelemetry: {msg}')
-  except Exception as exc:print(f'\nTelemetry upload deferred: {exc}',file=sys.stderr)
+ if r['backend']=='llama.cpp' and model in plan.PROFILES:
+  gpu_clause=f'@gpu={gpu.index}' if gpu else '';vram_clause=((',' if gpu_clause else '@')+f'vram={cap}MiB') if cap else '';print(f"\nRecommended launch:\n  qwen-local '{model}{gpu_clause}{vram_clause}' --agents 1 --local-context {a.context}")
+ else:print('\nThis row is available to the unified pushbutton runtime; expert-mode backend commands remain available for diagnostics.')
+ if metrics.telemetry_config().get('enabled'):
+  _,msg=metrics.maybe_upload();print(f'\nTelemetry: {msg}')
 if __name__=='__main__':main()

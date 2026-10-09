@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
-# Select/provision a host compiler compatible with CUDA 12.8/12.9.
-# Intended to be sourced by install-claude-local.sh and the installed shim.
+# Select/provision a modern host compiler compatible with CUDA 12.8/12.9.
+# Intended to be sourced by install-claude-local.sh and runtime launchers.
+#
+# CUDA accepts some much older GCC versions, but current llama.cpp dependencies
+# (notably bundled BoringSSL) can exercise compiler bugs in old toolchains.  Use
+# GCC 11+ for the entire C/C++ build, while keeping <=14 for CUDA 12.x support.
 
 claude_local_hostcc_major() {
     local cc="$1" v
@@ -25,46 +29,50 @@ claude_local_bootstrap_micromamba() {
     printf '%s\n' "$mm"
 }
 
+claude_local_use_hostcc() {
+    local cc="$1" cxx="$2" major
+    major="$(claude_local_hostcc_major "$cc" 2>/dev/null || true)"
+    [[ "$major" =~ ^[0-9]+$ ]] || return 1
+    (( major >= 11 && major <= 14 )) || return 1
+    export CC="$cc" CXX="$cxx" NVCC_CCBIN="$cc" CUDAHOSTCXX="$cxx"
+    return 0
+}
+
 claude_local_prepare_hostcc() {
     local state="${CLAUDE_LOCAL_STATE:-$HOME/.local/share/pushbutton/claude-local}"
     local cc cxx major hostprefix mm
 
-    # Respect an explicitly selected CUDA host compiler if it is compatible.
-    if [[ -n "${NVCC_CCBIN:-}" ]]; then
-        major="$(claude_local_hostcc_major "$NVCC_CCBIN" 2>/dev/null || true)"
-        if [[ "$major" =~ ^[0-9]+$ ]] && (( major >= 6 && major <= 14 )); then
-            export NVCC_CCBIN
-            [[ -n "${CUDAHOSTCXX:-}" ]] || export CUDAHOSTCXX="$NVCC_CCBIN"
-            return 0
-        fi
-    fi
-
-    # If the normal system compiler is already CUDA-12.x-compatible, leave the
-    # ordinary C/C++ build toolchain untouched and only tell nvcc/CMake to use it.
+    # Respect an explicitly selected complete C/C++ toolchain when it is both
+    # modern enough for current dependencies and accepted by CUDA 12.x.
     cc="${CC:-$(command -v gcc 2>/dev/null || true)}"
     cxx="${CXX:-$(command -v g++ 2>/dev/null || true)}"
-    if [[ -n "$cc" && -n "$cxx" ]]; then
-        major="$(claude_local_hostcc_major "$cc" 2>/dev/null || true)"
-        if [[ "$major" =~ ^[0-9]+$ ]] && (( major >= 6 && major <= 14 )); then
-            export NVCC_CCBIN="$cc" CUDAHOSTCXX="$cxx"
-            return 0
-        fi
-    fi
-
-    # Prefer a distro-provided compatibility compiler without changing system
-    # alternatives or the compiler used for non-CUDA llama.cpp translation units.
-    if command -v gcc-14 >/dev/null 2>&1 && command -v g++-14 >/dev/null 2>&1; then
-        export NVCC_CCBIN="$(command -v gcc-14)" CUDAHOSTCXX="$(command -v g++-14)"
-        echo "[claude-local] Using GCC 14 as nvcc host compiler: $NVCC_CCBIN" >&2
+    if [[ -n "$cc" && -n "$cxx" ]] && claude_local_use_hostcc "$cc" "$cxx"; then
         return 0
     fi
 
-    # New distros such as Ubuntu 26.04 can default to GCC 15 while CUDA 12.8/12.9
-    # support GCC <=14. Keep a private compiler independent of the host's APT state.
+    if [[ -n "$cc" ]]; then
+        major="$(claude_local_hostcc_major "$cc" 2>/dev/null || true)"
+        if [[ "$major" =~ ^[0-9]+$ ]] && (( major < 11 )); then
+            echo "[claude-local] GCC $major is too old for a reliable current llama.cpp/BoringSSL build; selecting GCC 14 privately." >&2
+        elif [[ "$major" =~ ^[0-9]+$ ]] && (( major > 14 )); then
+            echo "[claude-local] GCC $major is newer than the CUDA 12.x supported host range; selecting GCC 14 privately." >&2
+        fi
+    fi
+
+    # Prefer a distro-provided GCC 14 without changing alternatives or system
+    # defaults.  Unlike the old logic, use it for ordinary C/C++ too, not only nvcc.
+    if command -v gcc-14 >/dev/null 2>&1 && command -v g++-14 >/dev/null 2>&1; then
+        cc="$(command -v gcc-14)"; cxx="$(command -v g++-14)"
+        claude_local_use_hostcc "$cc" "$cxx" || return 1
+        echo "[claude-local] Using GCC 14 for llama.cpp and CUDA host compilation: $CC" >&2
+        return 0
+    fi
+
+    # Keep a private compiler independent of the host's APT state.
     hostprefix="$state/gcc-14"
     if [[ ! -x "$hostprefix/bin/gcc" || ! -x "$hostprefix/bin/g++" ]]; then
         mm="$(claude_local_bootstrap_micromamba "$state")" || return 1
-        echo "[claude-local] Installing private GCC 14 host compiler (system compiler unchanged)..." >&2
+        echo "[claude-local] Installing private GCC 14 compiler (system compiler unchanged)..." >&2
         MAMBA_ROOT_PREFIX="$state/micromamba-root" "$mm" create -y -p "$hostprefix" \
           -c conda-forge "gcc=14" "gxx=14"
     fi
@@ -73,6 +81,6 @@ claude_local_prepare_hostcc() {
         echo "[claude-local] private GCC 14 installation did not provide gcc/g++" >&2
         return 1
     }
-    export NVCC_CCBIN="$hostprefix/bin/gcc" CUDAHOSTCXX="$hostprefix/bin/g++"
-    echo "[claude-local] Using private GCC 14 as nvcc host compiler: $NVCC_CCBIN" >&2
+    claude_local_use_hostcc "$hostprefix/bin/gcc" "$hostprefix/bin/g++" || return 1
+    echo "[claude-local] Using private GCC 14 for llama.cpp and CUDA host compilation: $CC" >&2
 }

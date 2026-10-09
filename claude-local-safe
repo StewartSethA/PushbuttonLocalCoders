@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# claude-local-safe — Claude Code first, local llama.cpp only, hardware-aware.
+#
+# This is the installed Claude entrypoint. The existing claude-local script owns
+# planning, CUDA/toolchain provisioning, GGUF selection, llama-server startup and
+# the Anthropic-wire gateway. This wrapper hardens workstation contamination and
+# forces a low-latency agent/tool policy on every launch.
+set -euo pipefail
+SELF="${BASH_SOURCE[0]}"
+command -v readlink >/dev/null 2>&1 && SELF="$(readlink -f "$SELF" 2>/dev/null || printf '%s' "$SELF")"
+ROOT="$(cd "$(dirname "$SELF")" && pwd)"
+CORE="$ROOT/claude-local"
+[[ -x "$CORE" ]] || { echo "claude-local-safe: missing executable $CORE" >&2; exit 1; }
+
+# Do not allow a previous Ollama/local-provider setup to bleed into Claude Code.
+# claude-local sets a fresh ANTHROPIC_BASE_URL and credentials pointing only at
+# its own loopback gateway immediately before it invokes Claude Code.
+unset OLLAMA_HOST OLLAMA_MODELS OLLAMA_KEEP_ALIVE OLLAMA_NUM_PARALLEL || true
+unset OPENAI_BASE_URL OPENAI_API_BASE OPENAI_API_KEY || true
+unset ANTHROPIC_BASE_URL ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN || true
+
+# Qwen3.6/3.8 natively emit XML-style tool calls. Do NOT force the template into
+# a JSON dialect: current llama.cpp's Qwen parser is designed around the native
+# format. For coding-agent traffic we disable generation/preservation of long
+# reasoning by default; the gateway repeats these kwargs per request.
+export LLAMA_ARG_CHAT_TEMPLATE_KWARGS='{"enable_thinking":false,"preserve_thinking":false,"preserve_reasoning":false}'
+
+# Never silently reuse an old cached community template. It is tiny compared with
+# model weights and current tool-parser behavior matters more than saving one HTTP
+# request. The gateway's real tool-call startup probe then verifies the result.
+export CLAUDE_LOCAL_REFRESH_TEMPLATE=1
+
+say(){ printf '\033[1;34m[claude-local]\033[0m %s\n' "$*" >&2; }
+
+# With no explicit model selectors, use the requested high-value dual-3090 split:
+# Qwen3.8 dense on the fast/secondary role and Qwen3.6 MoE as Sonnet/daily driver.
+# The core planner still chooses the exact quant from live free VRAM.
+auto_models=()
+case "${1:-}" in
+  install|doctor|models|help|-h|--help) ;;
+  ""|-*)
+    if command -v nvidia-smi >/dev/null 2>&1; then
+      mapfile -t _pb_gpus < <(nvidia-smi --query-gpu=name,memory.free --format=csv,noheader,nounits 2>/dev/null || true)
+      if [[ ${#_pb_gpus[@]} -eq 2 ]]; then
+        ok=1
+        for row in "${_pb_gpus[@]}"; do
+          name="${row%,*}"; free="${row##*,}"; free="${free// /}"
+          [[ "${name,,}" == *3090* ]] || ok=0
+          [[ "$free" =~ ^[0-9]+$ ]] && (( free >= 22528 )) || ok=0
+        done
+        if (( ok )); then
+          auto_models=(qwen3.8:27b qwen3.6:35b)
+          say "2x RTX 3090 detected: secondary=qwen3.8:27b, primary=qwen3.6:35b; exact GGUF quants will be chosen from live VRAM"
+        fi
+      fi
+    fi
+    ;;
+esac
+
+say "engine policy: llama.cpp + Hugging Face GGUF only; Ollama endpoint variables cleared"
+say "agent policy: native Qwen tool format; thinking/preserved reasoning disabled; each backend must pass a Claude-shaped tool probe before launch"
+exec "$CORE" "${auto_models[@]}" "$@"
