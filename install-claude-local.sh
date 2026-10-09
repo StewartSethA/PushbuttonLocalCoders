@@ -82,7 +82,8 @@ if [[ -d "$DEST/.git" ]]; then
     say "Updating PushbuttonLocalCoders ($REF)..."
     git -C "$DEST" remote set-url origin "$REPO_URL"
     git -C "$DEST" fetch --depth=1 origin "$REF"
-    git -C "$DEST" checkout -q --detach FETCH_HEAD
+    # This is an installer-managed checkout; replace locally edited tracked files.
+    git -C "$DEST" checkout -q -f --detach FETCH_HEAD
 else
     say "Installing PushbuttonLocalCoders ($REF)..."
     rm -rf "$DEST.tmp"

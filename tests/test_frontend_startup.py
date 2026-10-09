@@ -399,12 +399,32 @@ class StartupTests(unittest.TestCase):
         shutil.copy2(ROOT / "lib" / "claude_local_entry.sh", entry)
         (template / "configs").mkdir(exist_ok=True)
         (template / "configs" / "backend-registry.json").write_text("{}")
+        (template / ".git").mkdir()
         git = self.bin / "git"
-        git.write_text("#!" + sys.executable + "\nimport os, shutil, sys\n"
-                       "if sys.argv[1] == 'clone': shutil.copytree(os.environ['TEMPLATE'], sys.argv[-1])\n")
+        git.write_text("#!" + sys.executable + "\nimport os, pathlib, shutil, sys\n"
+                       "args = sys.argv[1:]\n"
+                       "if 'clone' in args: shutil.copytree(os.environ['TEMPLATE'], args[-1])\n"
+                       "elif 'checkout' in args:\n"
+                       "  if '-f' not in args: sys.exit(1)\n"
+                       "  dest = pathlib.Path(args[args.index('-C') + 1])\n"
+                       "  shutil.copy2(pathlib.Path(os.environ['TEMPLATE']) / 'lib/claude_local_entry.sh', "
+                       "dest / 'lib/claude_local_entry.sh')\n")
         git.chmod(0o755)
         self.env.update(PUSHBUTTON_DIR=str(self.root / "installed"), TEMPLATE=str(template))
         return installer
+
+    def test_claude_installer_update_replaces_local_edits(self):
+        installer = self.prepare_installer("claude-local")
+        result = self.run_script(installer)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        installed_entry = self.root / "installed/PushbuttonLocalCoders/lib/claude_local_entry.sh"
+        installed_entry.write_text("local edit\n")
+        result = self.run_script(installer)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(installed_entry.read_text(),
+                         (self.root / "template/lib/claude_local_entry.sh").read_text())
 
     def test_piped_installer_noargs_installs_and_prints_help(self):
         for name in FRONTENDS:
