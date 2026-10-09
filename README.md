@@ -326,6 +326,8 @@ The hardware-aware local planner currently knows these selectors:
 
 | Selector | Intended use |
 |---|---|
+| `ornith-1.5:9b` | Small dense coder; GGUF joint placement |
+| `ornith-1.5:35b-a3b` | MoE coder; GGUF joint placement |
 | `qwen3.8-flash-next` | Highest-end local coding agent; multi-GPU |
 | `qwen3.8:27b` | Strong dense coder; excellent single 24/32 GB GPU target |
 | `qwen3.6:35b` | Fast MoE coder; excellent V100/3090 target |
@@ -336,6 +338,12 @@ The hardware-aware local planner currently knows these selectors:
 Aliases such as `q38`, `q36`, `nemotron`, `deepseek`, and `glm` are also accepted.
 Pushbutton chooses the actual quant based on live free VRAM and the requested
 worker layout.
+
+Ornith aliases `ornith`, `ornith-9b`, and `ornith-35b` are also accepted.
+Its GGUF profiles use conservative memory estimates and the embedded chat
+template. FIT does not validate GPU execution or speed; vendor capability
+benchmarks remain upstream hints, not local measurements. Ornith 397B remains
+catalog-only because it has no concrete GGUF planning profiles.
 
 ---
 

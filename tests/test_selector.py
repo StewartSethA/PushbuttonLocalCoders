@@ -337,14 +337,47 @@ class SelectorTests(unittest.TestCase):
         code, out, _, launch, _ = self.run_sel(
             'ornith-9b', '--json', gpus=selector.workers.synthetic_3090(1))
         obj = json.loads(out)
-        self.assertEqual(code, 2)  # Catalog inspection is not a joint frontend profile.
+        self.assertEqual(code, 0)
+        self.assertIsNone(obj['error'])
+        self.assertEqual(obj['plan']['workers'][0]['model'], 'ornith-1.5:9b')
         self.assertEqual(obj['speed_floor_tg'], 25.0)
         self.assertIn('SWE-bench Verified', obj['capability_benchmarks']['ornith-1.5:9b'])
         rows = obj['rows']['ornith-1.5:9b']
         self.assertTrue(any(r['status'] == 'FIT' for r in rows))
         self.assertTrue(all(r['tg'] is None and r['evidence'] == 'UNKNOWN' for r in rows))
         self.assertTrue(all('speed_status' in r for r in rows))
-        self.assertTrue(all(not r['frontend_integrated'] for r in rows))
+        self.assertTrue(all(r['frontend_integrated'] for r in rows))
+        launch.assert_not_called()
+
+    def test_ornith_qwen_menu_joint_role_plan(self):
+        for frontend in ('claude-local', 'hermes-local'):
+            with self.subTest(frontend=frontend):
+                code, out, err, launch, _ = self.run_sel(
+                    '--frontend', frontend, tty=True, inputs=['1', '3 1', '', 'no'],
+                    gpus=selector.workers.synthetic_v100(2))
+                self.assertEqual(code, 0, err)
+                self.assertIn('Joint placement preview', out)
+                self.assertIn('"haiku": "ornith-1.5:9b"', out)
+                self.assertIn('"sonnet": "qwen3.8:27b"', out)
+                self.assertIn('Benchmark hints are upstream/vendor', out)
+                launch.assert_not_called()
+
+    def test_ornith_coder_pins_and_vram_limits(self):
+        code, out, _, launch, _ = self.run_sel(
+            'ornith-9b@gpu=0,vram=16G', 'q38@gpu=1,vram=16G',
+            '--json', gpus=selector.workers.synthetic_3090(2))
+        obj = json.loads(out)
+        self.assertEqual(code, 0, obj)
+        ws = obj['plan']['workers']
+        self.assertEqual([w['cuda_visible_devices'] for w in ws], ['0', '1'])
+        self.assertEqual(ws[0]['profile']['quant'], 'Q6_K')
+        self.assertEqual(ws[0]['profile']['repo'], 'ornith-ai/Ornith-1.5-9B-GGUF')
+        launch.assert_not_called()
+        code, out, _, launch, _ = self.run_sel(
+            'ornith-9b', '--vram-limit', '12G', '--json',
+            gpus=selector.workers.synthetic_3090(1))
+        self.assertEqual(code, 2)
+        self.assertIsNone(json.loads(out)['launch_argv'])
         launch.assert_not_called()
 
     def test_unified_runtime_consumes_joint_json_and_catalog_only_rows(self):

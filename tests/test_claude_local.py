@@ -30,6 +30,35 @@ gwmod = load("claude_local_gateway", ROOT / "lib" / "claude_local_gateway.py")
 
 
 class PlannerTests(unittest.TestCase):
+    def test_ornith_catalog_aliases_and_profiles(self):
+        catalog = json.loads((ROOT / "configs/model-catalog.json").read_text())["models"]
+        for model in ("ornith-1.5:9b", "ornith-1.5:35b-a3b"):
+            meta = catalog[model]
+            for alias in [model, *meta["aliases"]]:
+                with self.subTest(alias=alias):
+                    self.assertEqual(planmod.canonical_model(alias), model)
+            profiles = planmod.PROFILES[model]
+            self.assertEqual([p.quant for p in profiles], [q["name"] for q in meta["quants"]])
+            self.assertTrue(all(p.repo == meta["gguf_repo"] and
+                                p.native_context == meta["context"] and
+                                p.template == "embedded" for p in profiles))
+
+    def test_ornith_mixed_role_placement(self):
+        gpus = [
+            planmod.GPU(0, "Tesla V100", 32768, 32000, "7.0"),
+            planmod.GPU(1, "RTX 3090", 24576, 24000, "8.6"),
+        ]
+        p = planmod.plan(["ornith-9b", "q38"], gpus, 262144)
+        self.assertEqual(p["roles"]["haiku"], "ornith-1.5:9b")
+        self.assertEqual(p["roles"]["opus"], "qwen3.8:27b")
+        self.assertEqual(len(p["servers"]), 2)
+        self.assertNotEqual(p["servers"][0]["cuda_visible_devices"],
+                            p["servers"][1]["cuda_visible_devices"])
+        large = planmod.plan(["ornith-35b"], gpus, 262144)["servers"][0]
+        self.assertEqual(large["model"], "ornith-1.5:35b-a3b")
+        self.assertEqual(large["profile"]["quant"], "Q8_0")
+        self.assertEqual(len(large["gpus"]), 2)
+
     def test_role_mapping(self):
         self.assertEqual(planmod.role_map(["q38"])["fable"], "qwen3.8:27b")
         r = planmod.role_map(["nemotron", "q36", "q38", "glm53"])
