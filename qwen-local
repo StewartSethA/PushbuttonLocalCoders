@@ -11,6 +11,13 @@ ROOT="$(cd "$(dirname "$SELF")" && pwd)"
 STATE_DIR="${CLAUDE_LOCAL_STATE:-$HOME/.local/share/pushbutton/claude-local}"
 HOSTCC_SH="$ROOT/lib/claude_local_hostcc.sh"
 
+if CODER_LOCAL_MENU_FRONTEND=qwen-local CODER_LOCAL_STARTUP_ONLY=1 "$ROOT/coder-local" --frontend qwen "$@"; then
+  exit 0
+else
+  startup_rc=$?
+  [[ $startup_rc -eq 125 ]] || exit "$startup_rc"
+fi
+
 # Select/provision the compiler before inspecting CMake caches.  This affects the
 # whole llama.cpp/BoringSSL build; coder-local will source the helper again later
 # (idempotently) before invoking CMake/nvcc.

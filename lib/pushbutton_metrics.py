@@ -194,7 +194,9 @@ def observations(model: str, backend: str, artifact: str | None = None, gpu_name
     if isinstance(gpu_name,(int,float)) and context is None:context=int(gpu_name); gpu_name=artifact; artifact=None
     if backend=='llama.cpp' and artifact is None:return []
     out=[]
-    for r in local_rows()+_remote_rows():
+    rows = [dict(r, evidence_origin="local") for r in local_rows()]
+    rows += [dict(r, evidence_origin="reference") for r in _remote_rows()]
+    for r in rows:
         if r.get("model")!=model or r.get("backend")!=backend:continue
         if artifact:
             ra=r.get("artifact")
