@@ -10,6 +10,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 
@@ -76,6 +77,42 @@ class GatewayTests(unittest.TestCase):
     def test_unknown_internal_model_stays_local(self):
         self.assertEqual(self.router.resolve("unexpected-internal-id")["model_id"], "local-sonnet")
 
+    def test_count_tokens_cannot_bypass_smaller_route_capacity(self):
+        import json
+        import threading
+        import urllib.request
+        import urllib.error
+        from http.server import ThreadingHTTPServer
+        cfg = {"roles": {
+            "sonnet": {"model_id": "large", "backend_alias": "large", "url": "http://local",
+                       "capacity": {"context": 128, "output_tokens": 32, "input_tokens": 80}},
+            "haiku": {"model_id": "small", "backend_alias": "small", "url": "http://local",
+                      "capacity": {"context": 64, "output_tokens": 16, "input_tokens": 32}},
+        }}
+        server = ThreadingHTTPServer(("127.0.0.1", 0), gwmod.Handler)
+        server.router = gwmod.Router(cfg)
+        server.verbose = False
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        def backend(endpoint, path, body=None, headers=None):
+            return {"n_ctx_per_slot": 128} if path == "/props" else {"input_tokens": 40}
+        try:
+            with patch.object(gwmod.request_budget, "backend_json", side_effect=backend):
+                for model, expected in (("large", 200), ("small", 400)):
+                    request = urllib.request.Request(
+                        f"http://127.0.0.1:{server.server_port}/v1/messages/count_tokens",
+                        json.dumps({"model": model, "messages": [], "tools": [{"name": "run"}]}).encode(),
+                        {"Content-Type": "application/json"})
+                    try:
+                        with urllib.request.urlopen(request, timeout=5) as response:
+                            self.assertEqual(response.status, expected)
+                            self.assertEqual(json.load(response)["input_tokens"], 40)
+                    except urllib.error.HTTPError as exc:
+                        self.assertEqual(exc.code, expected)
+                        self.assertIn("compact/summarize", exc.read().decode())
+        finally:
+            server.shutdown()
+            server.server_close()
+
 
 class ContextPolicyTests(unittest.TestCase):
     def test_derived_131072_budget(self):
@@ -92,6 +129,51 @@ class ContextPolicyTests(unittest.TestCase):
             "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "100000",
             "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "4096"})
         self.assertEqual((p["client_context"], p["compact_window"], p["max_output_tokens"]), (105000, 100000, 4096))
+
+    def test_shared_policy_combines_global_and_per_model_windows(self):
+        routes = {
+            "haiku": {"context_capacity": 131072, "capacity": {
+                "output_tokens": 4096, "client_context": 110000, "compact_trigger": 105000}},
+            "sonnet": {"context_capacity": 262144, "capacity": {
+                "output_tokens": 8192, "client_context": 200000, "compact_trigger": 150000}},
+        }
+        policy = budgetmod.shared_policy(routes, "", {})
+        self.assertEqual(policy["capacity"], 131072)
+        self.assertEqual((policy["max_output_tokens"], policy["client_context"], policy["compact_window"]),
+                         (4096, 110000, 105000))
+        for client, env in [
+            ("115000", {}), ("", {"CLAUDE_CODE_MAX_CONTEXT_TOKENS": "115000"}),
+            ("", {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": "8192"}),
+            ("", {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "106000"}),
+        ]:
+            with self.subTest(client=client, env=env), self.assertRaises(budgetmod.BudgetError):
+                budgetmod.shared_policy(routes, client, env)
+        routes["haiku"]["capacity"]["compact_trigger"] = 99999
+        with self.assertRaisesRegex(budgetmod.BudgetError, "minimum"):
+            budgetmod.shared_policy(routes, "", {})
+
+    def test_prepare_config_preserves_model_capacity_and_admission(self):
+        capacity = {"context": 131072, "slots": 2, "output_tokens": 4096, "input_tokens": 100000,
+                    "client_context": 110000, "compact_trigger": 105000,
+                    "safety_tokens": 8192, "admission_limit": 2, "admission_explicit": True}
+        plan = {"role_ids": {"sonnet": "local"}, "servers": [{"id": "local", "capacity": capacity}]}
+        replies = [{"total_slots": 2, "n_ctx_slot": 262144}, {"input_tokens": 40}]
+        with mock.patch.object(budgetmod, "request_json", side_effect=replies):
+            config = budgetmod.prepare_config(plan, {"local": 1}, 262144, "", {})
+        route = config["roles"]["sonnet"]
+        self.assertEqual(route["context_capacity"], 131072)
+        for key, value in capacity.items():
+            self.assertEqual(route["capacity"][key], value)
+        self.assertTrue(route["capacity"]["no_context_shift"])
+        router = gwmod.Router(config)
+        self.assertTrue(router.gates[(route["url"], route["backend_alias"])].acquire(blocking=False))
+        self.assertTrue(router.gates[(route["url"], route["backend_alias"])].acquire(blocking=False))
+        self.assertFalse(router.gates[(route["url"], route["backend_alias"])].acquire(blocking=False))
+        self.assertEqual(config["budget"]["compact_window"], 105000)
+        with mock.patch.object(budgetmod, "request_json", return_value={
+                "total_slots": 2, "n_ctx_slot": 65536}), self.assertRaisesRegex(
+                    budgetmod.BudgetError, "model requires 131072"):
+            budgetmod.prepare_config(plan, {"local": 1}, 262144, "", {})
 
     def test_unsafe_explicit_overrides(self):
         for client, env in [
@@ -120,10 +202,17 @@ class ContextPolicyTests(unittest.TestCase):
         self.assertEqual(budgetmod.effective_context({
             "total_slots": 1, "n_ctx_train": 262144,
             "default_generation_settings": {"n_ctx": 131072}}), 131072)
-        for props in ({}, {"total_slots": 2, "default_generation_settings": {"n_ctx": 262144}},
+        self.assertEqual(budgetmod.effective_context({
+            "total_slots": 2, "n_ctx_slot": 131072,
+            "default_generation_settings": {"n_ctx": 262144}}, expected_slots=2), 131072)
+        for props in ({}, {"total_slots": 0, "default_generation_settings": {"n_ctx": 262144}},
+                      {"total_slots": 2, "default_generation_settings": {"n_ctx": 262144}},
                       {"total_slots": 1, "default_generation_settings": {"n_ctx": 0}}):
             with self.assertRaises(budgetmod.BudgetError):
                 budgetmod.effective_context(props)
+        with self.assertRaises(budgetmod.BudgetError):
+            budgetmod.effective_context({
+                "total_slots": 1, "default_generation_settings": {"n_ctx": 262144}}, expected_slots=2)
 
     def test_all_roles_use_smallest_runtime_capacity_and_report_mismatch(self):
         plan = {"role_ids": dict(zip(("haiku", "sonnet", "opus", "fable"), ("small", "large", "large", "large")))}
@@ -425,6 +514,21 @@ class GatewayBudgetHTTPTests(unittest.TestCase):
             self.assertEqual(self.request()[0], 503)
         self.assertFalse(any(p == "/v1/messages" for p, _ in self.requests))
 
+    def test_capacity_only_route_requires_native_count_even_with_hard_guard(self):
+        route = self.gateway.router.roles["haiku"]
+        route.pop("context_capacity")
+        route.pop("prompt_reserve")
+        route["capacity"] = {"context": 131072, "output_tokens": 8192,
+                             "input_tokens": 110000, "no_context_shift": True}
+        self.count_status = 404
+        for path in ("/v1/messages", "/v1/messages/count_tokens"):
+            with self.subTest(path=path):
+                status, raw, _ = self.request(path=path)
+                self.assertEqual(status, 503)
+                self.assertIn(b"authoritative native token count unavailable", raw)
+        self.assertEqual([path for path, _ in self.requests],
+                         ["/v1/messages/count_tokens", "/v1/messages/count_tokens"])
+
     def test_transient_tokenizer_and_inference_5xx_retry_before_commit(self):
         self.count_fail_once = True
         self.inference_fail_once = True
@@ -437,6 +541,84 @@ class GatewayBudgetHTTPTests(unittest.TestCase):
         status, raw, body = self.request(path="/v1/messages/count_tokens")
         self.assertEqual((status, json.loads(raw)["input_tokens"]), (200, 147023))
         self.assertEqual(self.requests[0][1]["messages"], body["messages"])
+
+    def test_combined_capacity_uses_smaller_context_and_larger_reserve(self):
+        route = self.gateway.router.roles["haiku"]
+        route["capacity"] = {"context": 100000, "output_tokens": 8192,
+                             "input_tokens": 100000, "safety_tokens": 10000}
+        self.prompt_tokens = 100000 - 8192 - 10000
+        self.assertEqual(self.request()[0], 200)
+        self.prompt_tokens += 1
+        self.gateway.router.token_counts.clear()
+        status, raw, _ = self.request()
+        self.assertEqual(status, 400)
+        self.assertIn(b"100000 tokens", raw)
+        self.assertEqual(sum(p == "/v1/messages" for p, _ in self.requests), 1)
+        route["capacity"]["context"] = 262144
+        route["capacity"]["safety_tokens"] = 0
+        self.prompt_tokens = 131072 - 8192 - 8192 + 1
+        self.gateway.router.token_counts.clear()
+        self.assertEqual(self.request()[0], 400)
+
+    def test_combined_capacity_uses_backend_physical_context(self):
+        route = self.gateway.router.roles["sonnet"]
+        route["capacity"] = {"context": 262144, "output_tokens": 8192,
+                             "input_tokens": 240000, "safety_tokens": 0}
+        self.prompt_tokens = 147023
+        status, raw, _ = self.request({"model": "sonnet", "max_tokens": 8192, "messages": []})
+        self.assertEqual(status, 400)
+        self.assertIn(b"131072 tokens", raw)
+        self.assertFalse(any(p == "/v1/messages" for p, _ in self.requests))
+
+    def test_combined_capacity_enforces_input_output_and_count_budgets(self):
+        self.gateway.router.roles["haiku"]["capacity"] = {
+            "context": 131072, "output_tokens": 4096, "input_tokens": 80, "safety_tokens": 0}
+        self.assertEqual(self.request()[0], 400)
+        self.assertEqual(self.requests, [])
+        status, raw, _ = self.request({"model": "haiku", "max_tokens": 4096, "messages": []})
+        self.assertEqual(status, 400)
+        self.assertIn(b"route input budget 80", raw)
+        status, raw, _ = self.request(path="/v1/messages/count_tokens")
+        self.assertEqual(status, 400)
+        self.assertIn(b"route input budget 80", raw)
+        self.prompt_tokens = 80
+        self.gateway.router.token_counts.clear()
+        status, raw, _ = self.request(path="/v1/messages/count_tokens")
+        self.assertEqual((status, json.loads(raw)["input_tokens"]), (200, 80))
+        self.assertFalse(any(p == "/v1/messages" for p, _ in self.requests))
+
+    def test_combined_count_cache_still_rechecks_route_budgets(self):
+        self.gateway.router.roles["haiku"]["capacity"] = {
+            "context": 131072, "output_tokens": 8192, "input_tokens": 1000}
+        _, _, body = self.request(path="/v1/messages/count_tokens")
+        self.gateway.router.roles["haiku"]["capacity"]["input_tokens"] = 80
+        self.assertEqual(self.request(body)[0], 400)
+        self.assertEqual(sum(p.endswith("/count_tokens") for p, _ in self.requests), 1)
+        self.assertFalse(any(p == "/v1/messages" for p, _ in self.requests))
+
+    def test_generation_gate_is_released_after_budget_rejection(self):
+        route = self.gateway.router.roles["haiku"]
+        gate = mock.Mock()
+        released = threading.Event()
+        gate.release.side_effect = released.set
+        gate.acquire.return_value = True
+        self.gateway.router.gates[(route["url"], route["backend_alias"])] = gate
+        self.prompt_tokens = 147023
+        self.assertEqual(self.request()[0], 400)
+        self.assertTrue(released.wait(1))
+        gate.acquire.assert_called_once_with(timeout=60)
+        gate.release.assert_called_once_with()
+
+    def test_count_endpoint_does_not_take_generation_admission_slot(self):
+        route = self.gateway.router.roles["haiku"]
+        gate = mock.Mock()
+        gate.acquire.return_value = False
+        self.gateway.router.gates[(route["url"], route["backend_alias"])] = gate
+        self.assertEqual(self.request()[0], 429)
+        self.assertEqual(self.requests, [])
+        self.assertEqual(self.request(path="/v1/messages/count_tokens")[0], 200)
+        gate.acquire.assert_called_once_with(timeout=60)
+        gate.release.assert_not_called()
 
     def test_identical_count_then_inference_reuses_digest_only_cache(self):
         _, _, body = self.request(path="/v1/messages/count_tokens")

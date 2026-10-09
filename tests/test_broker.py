@@ -9,17 +9,32 @@ def free_port():
 
 
 class FakeState:
-    lock=threading.Lock();active=0;max_active=0;calls=0
+    lock=threading.Lock();active=0;max_active=0;calls=0;native_calls=0
 
 
 class FakeBackend(BaseHTTPRequestHandler):
     def log_message(self,*a):pass
     def do_GET(self):
+        if self.path == '/props':
+            b=json.dumps({'default_generation_settings':{'n_ctx':128},'total_slots':1}).encode();self.send_response(200);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(b)));self.end_headers();self.wfile.write(b);return
         if self.path.endswith('/models'):
             b=json.dumps({'data':[{'id':'backend-real-id'}]}).encode();self.send_response(200);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(b)));self.end_headers();self.wfile.write(b);return
         self.send_error(404)
     def do_POST(self):
         n=int(self.headers.get('Content-Length') or 0);obj=json.loads(self.rfile.read(n) or b'{}')
+        if self.path == '/apply-template':
+            out={'prompt': ''.join(m.get('content','') for m in obj.get('messages',[])) + json.dumps(obj.get('tools',[]))}
+        elif self.path == '/tokenize':
+            if 'messages' in obj:
+                count=len(''.join(m.get('content','') for m in obj['messages']))+len(json.dumps(obj.get('tools',[])))
+                out={'count':count,'tokens':list(range(count)),'max_model_len':128}
+                FakeState.native_calls+=1
+            else:
+                out={'tokens': list(range(len(obj.get('content',''))))}
+        else:
+            out=None
+        if out is not None:
+            b=json.dumps(out).encode();self.send_response(200);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(b)));self.end_headers();self.wfile.write(b);return
         with FakeState.lock:
             FakeState.active+=1;FakeState.calls+=1;FakeState.max_active=max(FakeState.max_active,FakeState.active)
         time.sleep(.18)
@@ -32,8 +47,9 @@ class FakeBackend(BaseHTTPRequestHandler):
 class BrokerTests(unittest.TestCase):
     def setUp(self):
         FakeState.active=FakeState.max_active=FakeState.calls=0
+        FakeState.native_calls=0
         self.backend_port=free_port();self.backend=ThreadingHTTPServer(('127.0.0.1',self.backend_port),FakeBackend);self.bt=threading.Thread(target=self.backend.serve_forever,daemon=True);self.bt.start()
-        self.td=tempfile.TemporaryDirectory();state=pathlib.Path(self.td.name);self.broker_port=free_port()
+        self.td=tempfile.TemporaryDirectory(dir=ROOT);state=pathlib.Path(self.td.name);self.broker_port=free_port()
         reg={'instances':[{'id':'i1','model':'logical-model','backend':'llama.cpp','endpoint':f'http://127.0.0.1:{self.backend_port}/v1','max_context':128,'framework_max_concurrency':1,'measured_envelopes':[{'concurrency':1,'max_context':128,'safe':True,'evidence':'PROVEN'}],'tg':50.0,'tg_measured':True,'healthy':True}]}
         (state/'instances.json').write_text(json.dumps(reg))
         env=os.environ.copy();env['PUSHBUTTON_RUNTIME_STATE']=self.td.name;env['PUSHBUTTON_CONFIG_DIR']=str(state/'cfg');env['PUSHBUTTON_CACHE_DIR']=str(state/'cache')
@@ -66,7 +82,32 @@ class BrokerTests(unittest.TestCase):
     def test_context_over_limit_is_rejected_before_backend(self):
         before=FakeState.calls
         with self.assertRaises(urllib.error.HTTPError) as cm:self.request(text='x'*1600,max_tokens=32)
-        self.assertEqual(cm.exception.code,503);self.assertEqual(FakeState.calls,before)
+        self.assertEqual(cm.exception.code,400);self.assertEqual(FakeState.calls,before)
+    def test_invalid_output_rejected(self):
+        for value in (0,-1,True,1.5,"4"):
+            with self.subTest(value=value), self.assertRaises(urllib.error.HTTPError) as cm:
+                self.request(max_tokens=value)
+            self.assertEqual(cm.exception.code,400)
+        self.assertEqual(FakeState.calls,0)
+    def test_auto_skips_smaller_route_but_explicit_switch_rechecks(self):
+        path=pathlib.Path(self.td.name)/'instances.json'
+        large=json.loads(path.read_text())['instances'][0]
+        small=dict(large,id='a-small',max_context=32,aliases=['small'])
+        path.write_text(json.dumps({'instances':[small,large]}))
+        self.request(text='x'*70)
+        self.assertEqual(FakeState.calls,1)
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            self.request(model='small',text='x'*70)
+        self.assertEqual(cm.exception.code,400)
+        self.assertEqual(FakeState.calls,1)
+    def test_known_vllm_route_uses_native_chat_tokenizer(self):
+        path=pathlib.Path(self.td.name)/'instances.json'
+        registry=json.loads(path.read_text())
+        registry['instances'][0]['backend']='vllm-qwen38-3090'
+        path.write_text(json.dumps(registry))
+        self.request()
+        self.assertEqual(FakeState.native_calls,1)
+        self.assertEqual(FakeState.calls,1)
     def test_maintenance_lease_queues_new_work_until_release(self):
         lease=self.control('/pushbutton/maintenance/acquire',{'id':'i1'});self.assertTrue(lease['ok'])
         out=[]

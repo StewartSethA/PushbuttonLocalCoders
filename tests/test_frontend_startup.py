@@ -1,24 +1,291 @@
 """Startup routing tests requiring neither GPUs nor installed coding clients."""
 import json
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
 import pathlib
 import pty
+import re
 import select
+import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+FIXTURE_DIR = pathlib.Path("/tmp/pushbutton-test-fixtures")
 FRONTENDS = ("coder-local", "claude-local", "hermes-local")
 WRAPPERS = ("qwen-local", "opencode-local", "deepseek-local", "mini-swe-local")
 
 
+def shell_function(frontend, name):
+    text = (ROOT / frontend).read_text()
+    match = re.search(r"^" + name + r"\(\)\s*\{.*?^\}", text, re.M | re.S)
+    if not match:
+        raise AssertionError(f"missing {frontend}:{name}")
+    return match.group(0)
+
+
+class CapacityIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        FIXTURE_DIR.mkdir(exist_ok=True)
+        self.scratch = tempfile.TemporaryDirectory(dir=FIXTURE_DIR)
+        self.addCleanup(self.scratch.cleanup)
+        self.root = pathlib.Path(self.scratch.name)
+        self.capacity = dict(context=8192, slots=3, output_tokens=1024,
+                             client_context=7000, compact_trigger=4500,
+                             input_tokens=5720, safety_tokens=256,
+                             min_tps=None, admission_limit=2)
+        self.server = dict(id="model-a", worker=1, model="qwen3.8:27b",
+                           cuda_visible_devices="0", multi_gpu=False,
+                           gpus=[], required_mib=16384,
+                           vram_limit_mib_per_gpu=None, capacity=self.capacity,
+                           profile=dict(hf_spec="repo:quant", kv_k="q8_0",
+                                        kv_v="q4_0", batch=512, ubatch=256,
+                                        flash_attn="on", template="", extra_env={},
+                                        quality=1, quant="Q4_K_M"))
+        self.plan = self.root / "plan.json"
+        self.plan.write_text(json.dumps(dict(context=262144, agents=1, unused_gpus=[],
+                                             roles=dict(haiku="qwen3.8:27b", sonnet="qwen3.8:27b",
+                                                        opus="qwen3.8:27b", fable="qwen3.8:27b"),
+                                             servers=[self.server],
+                                             workers=[self.server],
+                                             role_ids=dict(haiku="model-a", sonnet="model-a",
+                                                           opus="model-a", fable="model-a"))))
+
+    def run_functions(self, frontend, names, body):
+        prelude = f"""set -euo pipefail
+STATE_DIR={shlex.quote(str(self.root))}
+CACHE_DIR="$STATE_DIR/cache"
+ROOT={shlex.quote(str(ROOT))}
+PLAN_FILE={shlex.quote(str(self.plan))}
+BUDGET_PY="$ROOT/lib/claude_local_budget.py"
+CLAUDE_ARGS=()
+PORT_BASE=18000
+CTX=262144
+CLIENT_CTX=200000
+WEB_SEARCH_BACKEND=exa
+WEB_EXTRACT_BACKEND=firecrawl
+PIDS=()
+ALLOW_OFFLOAD=0
+LLAMA_SERVER=llama-server
+CAPTURE="$STATE_DIR/capture"
+"""
+        command = prelude + "\n".join(shell_function(frontend, name) for name in names) + "\n" + body
+        result = subprocess.run(["bash", "-c", command], text=True, capture_output=True,
+                                timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result
+
+    def test_all_backends_launch_total_context_and_parallel_slots_and_keep_capacity(self):
+        for frontend in FRONTENDS:
+            with self.subTest(frontend=frontend):
+                row_function = "worker_rows" if frontend == "coder-local" else "server_rows"
+                body = """
+say(){ :; }; die(){ echo "$*" >&2; exit 1; }
+validate_download_space(){ :; }
+download_model_fast(){ printf -v "$3" '%s' model.gguf; }
+free_port(){ echo 18001; }; curl(){ return 0; }
+verify_capacity(){ printf '%s' "$2" >"$STATE_DIR/verified"; }
+start_log_follower(){ echo ''; }; stop_log_follower(){ :; }
+env(){ printf '%s\\n' "$@" >"$CAPTURE"; }
+start_backends
+wait
+"""
+                self.run_functions(frontend, [row_function, "start_backends"], body)
+                args = (self.root / "capture").read_text().splitlines()
+                self.assertEqual(args[args.index("-c") + 1], "24576")
+                self.assertEqual(args[args.index("-np") + 1], "3")
+                self.assertEqual(args[args.index("--cache-type-k") + 1], "q8_0")
+                self.assertIn("--no-context-shift", args)
+                self.assertEqual(json.loads((self.root / "verified").read_text()), self.capacity)
+                registry = next(self.root.glob("coder-backends.*.tsv")) if frontend == "coder-local" else \
+                    next(self.root.glob("backends.*" if frontend == "claude-local" else "hermes-backends.*"))
+                self.assertEqual(json.loads(registry.read_text().strip().split("\t")[-1]), self.capacity)
+
+    def test_gateway_routes_carry_capacity(self):
+        capacity = {**self.capacity, "context":262144, "client_context":200000,
+                    "compact_trigger":150000, "input_tokens":198720}
+        plan = json.loads(self.plan.read_text())
+        plan["servers"][0]["capacity"] = capacity
+        self.plan.write_text(json.dumps(plan))
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.reply(dict(default_generation_settings=dict(n_ctx=262144), total_slots=3))
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                self.reply(dict(input_tokens=20))
+
+            def reply(self, data):
+                raw = json.dumps(data).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        claude = self.root / "claude"
+        claude.write_text(
+            "#!/bin/sh\n"
+            "# CLAUDE_CODE_AUTO_COMPACT_WINDOW CLAUDE_CODE_MAX_CONTEXT_TOKENS CLAUDE_CODE_MAX_OUTPUT_TOKENS\n"
+            'case "$1" in --version) echo "2.1.221";; --help) echo "--autocompact --setting-sources --settings";; esac\n')
+        claude.chmod(0o755)
+        backends = self.root / "backends"
+        backends.write_text(f"model-a\t{server.server_port}\trepo:quant\t" + json.dumps(capacity) + "\n")
+        self.run_functions("claude-local", ["write_gateway_config"],
+                           f'export PATH={shlex.quote(str(self.root))}:"$PATH"\n'
+                           f'BACKENDS_TSV={shlex.quote(str(backends))}\nwrite_gateway_config')
+        config = json.loads(next(self.root.glob("gateway.*.json")).read_text())
+        self.assertTrue(all(route["capacity"] == {**capacity, "no_context_shift":True}
+                            for route in config["roles"].values()))
+        self.assertEqual(config["budget"]["max_output_tokens"], 1024)
+        self.assertEqual(config["budget"]["compact_window"], 150000)
+        self.assertTrue(all(route["context_capacity"] == 262144 and route["prompt_reserve"] == 8192
+                            for route in config["roles"].values()))
+
+    def test_startup_requested_throughput_warns_not_proven(self):
+        plan = json.loads(self.plan.read_text())
+        for row in plan["workers"] + plan["servers"]:
+            row["capacity"]["min_tps"] = 25
+        self.plan.write_text(json.dumps(plan))
+        for frontend in FRONTENDS:
+            with self.subTest(frontend=frontend):
+                result = self.run_functions(frontend, ["print_plan"], "print_plan")
+                self.assertIn("min_tps=25 is requested, not proven", result.stdout)
+
+    def test_qwen_model_context_and_output_are_per_model_and_guarded(self):
+        backends = self.root / "backends"
+        second = {**self.capacity, "client_context":12000, "output_tokens":2048}
+        backends.write_text("1\tmodel-a\t18001\trepo:a\t" + json.dumps(self.capacity) + "\n" +
+                            "2\tmodel-b\t18002\trepo:b\t" + json.dumps(second) + "\n")
+        self.run_functions("coder-local", ["configure_qwen"],
+                           f'BACKENDS={shlex.quote(str(backends))}\nCAPACITY_PROXY_PORT=19000\nsay(){{ :; }}\nconfigure_qwen')
+        config = json.loads((self.root / "frontends/qwen/settings.json").read_text())
+        models = config["modelProviders"]["openai"]
+        self.assertEqual([m["generationConfig"]["contextWindowSize"] for m in models], [7000, 12000])
+        self.assertEqual([m["generationConfig"]["samplingParams"]["max_tokens"] for m in models], [1024, 2048])
+        self.assertTrue(all(m["baseUrl"] == "http://127.0.0.1:19000/v1" for m in models))
+        self.assertEqual(config["context"]["autoCompactThreshold"],
+                         min(self.capacity["compact_trigger"]/7000, second["compact_trigger"]/12000))
+
+    def test_hermes_profile_uses_own_context(self):
+        result = self.run_functions("hermes-local", ["configure_profile"],
+                                    'hermes(){ printf "%s\\n" "$*" >>"$CAPTURE"; }\n'
+                                    'configure_profile fast model-a http://127.0.0.1:19000/v1 low')
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("config set model.context_length 7000", (self.root / "capture").read_text())
+        self.assertIn("config set compression.enabled true", (self.root / "capture").read_text())
+        self.assertIn("config set compression.threshold_tokens 4500", (self.root / "capture").read_text())
+        self.assertIn("config set model.provider custom:pushbutton", (self.root / "capture").read_text())
+        self.assertIn("config set providers.pushbutton.base_url http://127.0.0.1:19000/v1",
+                      (self.root / "capture").read_text())
+        self.assertIn("config set providers.pushbutton.transport chat_completions",
+                      (self.root / "capture").read_text())
+        self.assertIn("config set providers.pushbutton.extra_body.max_tokens 1024",
+                      (self.root / "capture").read_text())
+
+    def test_claude_uses_smallest_shared_output_budget(self):
+        plan = json.loads(self.plan.read_text())
+        second = {**self.server, "id":"model-b", "capacity":{**self.capacity, "output_tokens":512}}
+        plan["servers"].append(second)
+        self.plan.write_text(json.dumps(plan))
+        config = self.root / "gateway.json"
+        config.write_text(json.dumps({"budget":{"client_context":131072,
+                                               "compact_window":100000,
+                                               "max_output_tokens":512}}))
+        result = self.run_functions("claude-local", ["run_claude"],
+            f'GATEWAY_CONFIG={shlex.quote(str(config))}\n'
+            'GATEWAY_PORT=19000\nENABLE_TEAMS=0\nCLAUDE_ARGS=()\n'
+            'say(){ :; }; contains_claude_flag(){ return 0; }\n'
+            'role_rows(){ printf "sonnet\\tmodel-a\\n"; }\n'
+            'claude(){ printf "BUDGET:%s/%s/%s\\n" "$CLAUDE_CODE_MAX_CONTEXT_TOKENS" "$CLAUDE_CODE_MAX_OUTPUT_TOKENS" "$CLAUDE_CODE_AUTO_COMPACT_WINDOW"; }\n'
+            'run_claude')
+        self.assertIn("BUDGET:131072/512/100000", result.stdout)
+
+    def test_readiness_refuses_reduced_or_unproven_per_slot_context(self):
+        props = {}
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                raw = json.dumps(props).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        cases = [
+            (dict(default_generation_settings=dict(n_ctx=8192), total_slots=3), True),
+            (dict(default_generation_settings=dict(n_ctx=4096), total_slots=3), False),
+            (dict(default_generation_settings=dict(n_ctx=8192), total_slots=1), False),
+            (dict(default_generation_settings=dict(n_ctx=8192)), False),
+            (dict(n_ctx=24576, total_slots=3), False),
+            ({}, False),
+        ]
+        for frontend in FRONTENDS:
+            for payload, accepted in cases:
+                with self.subTest(frontend=frontend, props=payload):
+                    props.clear()
+                    props.update(payload)
+                    command = "ROOT=" + shlex.quote(str(ROOT)) + "\n" + shell_function(frontend, "verify_capacity") + "\nverify_capacity " + \
+                        str(server.server_port) + " " + shlex.quote(json.dumps(self.capacity))
+                    result = subprocess.run(["bash", "-c", command], text=True,
+                                            capture_output=True, timeout=5)
+                    self.assertEqual(result.returncode == 0, accepted, result.stderr)
+
+    def test_direct_frontends_start_guard_with_capacity_routes(self):
+        (self.root / "logs").mkdir()
+        for frontend in ("coder-local", "hermes-local"):
+            with self.subTest(frontend=frontend):
+                backends = self.root / "backends"
+                row = "model-a\t18001\trepo:a\t" + json.dumps(self.capacity) + "\n"
+                if frontend == "coder-local":
+                    row = "1\t" + row
+                backends.write_text(row)
+                with socket.socket() as probe:
+                    probe.bind(("127.0.0.1", 0))
+                    port = probe.getsockname()[1]
+                registry_var = "BACKENDS" if frontend == "coder-local" else "BACKENDS_TSV"
+                result = self.run_functions(frontend, ["free_port", "start_capacity_proxy"],
+                    f'{registry_var}={shlex.quote(str(backends))}\nPORT_BASE={port}\n'
+                    'say(){ :; }; die(){ echo "$*" >&2; exit 1; }\n'
+                    'trap \'for pid in "${PIDS[@]}"; do kill "$pid" 2>/dev/null || true; done\' EXIT\n'
+                    'start_capacity_proxy\n' +
+                    ('[[ "$PUSHBUTTON_CAPACITY_CONFIG" == "$CAPACITY_PROXY_CONFIG" ]]\n'
+                     '[[ "$(python3 -c \'import os; print(os.environ["PUSHBUTTON_CAPACITY_CONFIG"])\')" == "$CAPACITY_PROXY_CONFIG" ]]\n'
+                     if frontend == "coder-local" else '') +
+                    'curl -fsS "http://127.0.0.1:$CAPACITY_PROXY_PORT/v1/models"')
+                models = json.loads(result.stdout)["data"]
+                self.assertEqual([model["id"] for model in models], ["model-a"])
+                config = json.loads(next(self.root.glob(
+                    "coder-capacity.*.json" if frontend == "coder-local" else "hermes-capacity.*.json")).read_text())
+                self.assertEqual(config["routes"]["model-a"]["capacity"],
+                                 {**self.capacity, "no_context_shift":True})
+
+
 class StartupTests(unittest.TestCase):
     def setUp(self):
-        self.scratch = tempfile.TemporaryDirectory(dir="/tmp")
+        FIXTURE_DIR.mkdir(exist_ok=True)
+        self.scratch = tempfile.TemporaryDirectory(dir=FIXTURE_DIR)
         self.addCleanup(self.scratch.cleanup)
         self.root = pathlib.Path(self.scratch.name)
         self.bin = self.root / "bin"
@@ -159,6 +426,15 @@ class StartupTests(unittest.TestCase):
                                  ["--frontend", name, "--menu", "--context", "32768",
                                   "--client-context", "16000", *controlled, "q38",
                                   *["--launch-arg=" + x for x in forwarded]])
+
+    def test_per_model_capacity_suffix_and_global_slots_survive_selection(self):
+        self.selector_recorder()
+        model = "q38@context=8192,slots=3,output=1024,client_context=7000,compact=4000,kv_k=q8_0"
+        for frontend in FRONTENDS:
+            with self.subTest(frontend=frontend):
+                argv = self.recorded(frontend, ["--select", model, "--slots", "2"])["argv"]
+                self.assertIn(model, argv)
+                self.assertEqual(argv[argv.index("--slots") + 1], "2")
 
     def test_qwen_alias_preserves_frontend(self):
         self.selector_recorder()
@@ -441,7 +717,8 @@ class StartupTests(unittest.TestCase):
         (template / "lib").mkdir(exist_ok=True)
         shutil.copy2(ROOT / "lib/pushbutton_folders.sh",
                      template / "lib/pushbutton_folders.sh")
-        for asset in ("pushbutton_metrics.py", "coder_local_plan.py", "claude_local_plan.py"):
+        for asset in ("pushbutton_metrics.py", "coder_local_plan.py", "claude_local_plan.py",
+                      "pushbutton_capacity.py", "pushbutton_request_budget.py", "pushbutton_capacity_proxy.py"):
             (template / "lib" / asset).touch()
         entry = template / "lib" / "claude_local_entry.sh"
         shutil.copy2(ROOT / "lib" / "claude_local_entry.sh", entry)
@@ -495,6 +772,18 @@ class StartupTests(unittest.TestCase):
         self.assertIn("Installed unified runtime", result.stdout)
         self.assertNotIn("UNEXPECTED_TOOL", result.stdout)
         self.assertTrue((self.root / "home/.local/bin/pushbutton").exists())
+
+    def test_installers_refuse_missing_capacity_runtime_modules(self):
+        for frontend in FRONTENDS:
+            for module in ("pushbutton_capacity.py", "pushbutton_request_budget.py", "pushbutton_capacity_proxy.py"):
+                with self.subTest(frontend=frontend, module=module):
+                    installer = self.prepare_installer(frontend)
+                    (self.root / "template/lib" / module).unlink()
+                    result = self.run_script(installer)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(module, result.stderr)
+                    self.assertNotIn("UNEXPECTED_TOOL", result.stdout)
+                    shutil.rmtree(self.root / "installed")
 
     def test_installed_claude_shim_options_preflight_before_mcp_state(self):
         installer = self.prepare_installer("claude-local")

@@ -12,6 +12,7 @@ import unittest
 from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+FIXTURE_DIR = ROOT / ".git" / "pushbutton-test-fixtures"
 SEL = ROOT / 'pushbutton-select'
 loader = importlib.machinery.SourceFileLoader('selector', str(SEL))
 spec = importlib.util.spec_from_loader(loader.name, loader)
@@ -23,6 +24,9 @@ runtime = importlib.util.module_from_spec(runtime_spec)
 runtime_loader.exec_module(runtime)
 
 class SelectorTests(unittest.TestCase):
+    def setUp(self):
+        FIXTURE_DIR.mkdir(exist_ok=True)
+
     def run_sel(self, *args, gpus=None, tty=False, inputs=()):
         out, err = io.StringIO(), io.StringIO()
         with contextlib.ExitStack() as stack:
@@ -77,7 +81,7 @@ class SelectorTests(unittest.TestCase):
         self.assertIn('No model supplied', cp.stdout)
 
     def test_telemetry_is_explicit_opt_in(self):
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory(dir=FIXTURE_DIR) as td:
             with mock.patch.object(selector.metrics, 'CONFIG', pathlib.Path(td)):
                 code, _, err, _, _ = self.run_sel(
                     'qwen3.8:27b', '--vram-limit', '16G', '--no-interactive',
@@ -121,7 +125,8 @@ class SelectorTests(unittest.TestCase):
         self.assertEqual(obj['plan']['workers'][0]['profile']['quant'], 'UD-IQ4_XS')
         self.assertEqual(obj['plan']['workers'][1]['vram_limit_mib_per_gpu'], 30720)
         self.assertEqual(len(obj['plan']['unused_gpus']), 1)
-        self.assertIn('qwen3.8:27b@gpu=4,vram=30720MiB', obj['launch_argv'])
+        self.assertTrue(any(arg.startswith('qwen3.8:27b@gpu=4,vram=30720MiB,')
+                            for arg in obj['launch_argv']))
         flash = obj['rows']['qwen3.8-flash-next']
         self.assertEqual(len([r for r in flash if r['backend'] == 'llama.cpp']), 6)
         self.assertTrue(all(r['pp'] is None and r['tg'] is None for r in flash))
@@ -140,6 +145,98 @@ class SelectorTests(unittest.TestCase):
         self.assertEqual([len(w['gpus']) for w in ws], [4, 4])
         self.assertTrue(set(g['index'] for g in ws[0]['gpus']).isdisjoint(
             g['index'] for g in ws[1]['gpus']))
+
+    def test_per_model_capacities_and_precision_survive_preview_replan(self):
+        code, out, _, launch, _ = self.run_sel(
+            "q38@context=8192,slots=3,output=1024,client_context=7000,compact=4500,safety=128,kv_k=q8_0",
+            "--slots", "2", "--json", gpus=selector.workers.synthetic_v100(2))
+        obj = json.loads(out)
+        self.assertEqual(code, 0, obj)
+        worker = obj["plan"]["workers"][0]
+        self.assertEqual(worker["capacity"]["slots"], 3)
+        self.assertEqual(worker["capacity"]["context"], 8192)
+        self.assertEqual(worker["capacity"]["client_context"], 7000)
+        self.assertEqual(worker["profile"]["kv_k"], "q8_0")
+        model_spec = next(arg for arg in obj["launch_argv"] if "@gpu=" in arg)
+        request = selector.workers.parse_model_spec(model_spec)
+        replanned = selector.workers.build_plan([request], 1, selector.workers.synthetic_v100(2), 262144, 2)
+        self.assertEqual(replanned["workers"][0]["capacity"], worker["capacity"])
+        launch.assert_not_called()
+
+    def test_role_capacity_suffix_is_not_stripped(self):
+        for frontend in ("claude-local", "hermes-local"):
+            with self.subTest(frontend=frontend):
+                model = "q38@context=8192,slots=2,output=1024,client_context=7000,compact=4000"
+                code, out, _, launch, _ = self.run_sel(
+                    model, "--frontend", frontend, "--json",
+                    gpus=selector.workers.synthetic_v100(2))
+                obj = json.loads(out)
+                self.assertEqual(code, 0, obj)
+                self.assertEqual(obj["plan"]["servers"][0]["capacity"]["slots"], 2)
+                self.assertIn(model.replace("q38", "qwen3.8:27b"), obj["launch_argv"])
+                self.assertNotIn("--local-client-context", obj["launch_argv"])
+                launch.assert_not_called()
+
+    def test_explicit_global_client_context_validates_each_model_hard_limit(self):
+        for frontend in ("qwen-local", "claude-local", "hermes-local"):
+            with self.subTest(frontend=frontend):
+                code, out, _, launch, _ = self.run_sel(
+                    "q38@context=8192,client_context=7000", "--client-context", "12000",
+                    "--frontend", frontend, "--json",
+                    gpus=selector.workers.synthetic_v100(2))
+                self.assertEqual(code, 2, out)
+                self.assertIsNotNone(json.loads(out)["error"])
+                launch.assert_not_called()
+
+    def test_slots_are_controlled_before_forwarded_client_separator(self):
+        code, out, _, _, _ = self.run_sel(
+            "q38@context=8192", "--slots", "2", "--json", "--launch-arg=--",
+            "--launch-arg=a prompt", gpus=selector.workers.synthetic_v100(2))
+        self.assertEqual(code, 0, out)
+        args = json.loads(out)["launch_argv"]
+        self.assertLess(args.index("--slots"), args.index("--"))
+
+    def test_requested_throughput_is_not_promised_by_preview(self):
+        code, out, _, launch, _ = self.run_sel(
+            "q38@context=8192,min_tps=25", "--no-interactive",
+            gpus=selector.workers.synthetic_v100(2))
+        self.assertEqual(code, 0, out)
+        self.assertIn("min_tps=25.0 is requested, not proven", out)
+        launch.assert_not_called()
+
+    def test_capacity_specific_rows_match_joint_plan_memory_and_quant(self):
+        code, out, _, _, _ = self.run_sel(
+            "q38@gpu=0,context=8192,slots=3,quant=UD-Q4_K_M,kv_k=q8_0",
+            "--json", gpus=selector.workers.synthetic_v100(2))
+        obj = json.loads(out)
+        self.assertEqual(code, 0, obj)
+        worker = obj["plan"]["workers"][0]
+        rows = obj["instances"][0]["rows"]
+        selected = next(row for row in rows if row["artifact"] == worker["profile"]["quant"])
+        self.assertEqual(selected["req"], worker["required_mib"])
+        self.assertEqual(selected["status"], "FIT")
+        self.assertEqual(selected["capacity"]["slots"], 3)
+        self.assertEqual(selected["capacity"]["kv_k"], "q8_0")
+        self.assertTrue(all(row["status"] == "UNAVAILABLE" for row in rows
+                            if row["backend"] == "llama.cpp" and row is not selected))
+        self.assertTrue(all(row["status"] == "UNAVAILABLE" for row in rows
+                            if row["backend"] != "llama.cpp"))
+        self.assertTrue(all(row["evidence"] == "UNKNOWN" for row in rows))
+
+    def test_repeated_model_instances_have_distinct_capacity_tables(self):
+        code, out, _, _, _ = self.run_sel(
+            "q38@gpu=0,context=8192,slots=2,quant=UD-Q4_K_M",
+            "q38@gpu=1,context=65536,slots=3,quant=UD-Q4_K_M",
+            "--json", gpus=selector.workers.synthetic_v100(2))
+        obj = json.loads(out)
+        self.assertEqual(code, 0, obj)
+        self.assertEqual([i["capacity"]["context"] for i in obj["instances"]], [8192, 65536])
+        self.assertEqual([i["capacity"]["slots"] for i in obj["instances"]], [2, 3])
+        selected = [next(r for r in i["rows"] if r["backend"] == "llama.cpp" and
+                         r["artifact"] == "UD-Q4_K_M") for i in obj["instances"]]
+        self.assertNotEqual(selected[0]["req"], selected[1]["req"])
+        self.assertEqual([r["req"] for r in selected],
+                         [w["required_mib"] for w in obj["plan"]["workers"]])
 
     def test_claude_and_hermes_share_roles_not_replicas(self):
         for frontend in ('claude-local', 'hermes-local'):
@@ -212,7 +309,7 @@ class SelectorTests(unittest.TestCase):
             'qwen3.8:27b', '--context', '8192', '--client-context', '200000',
             gpus=selector.workers.synthetic_3090(1))
         self.assertEqual(code, 2)
-        self.assertIn('no larger', err)
+        self.assertIn('exceed', err)
         launch.assert_not_called()
 
     def test_confirmation_preserves_frontend_cwd_and_argv_without_shell(self):
@@ -305,7 +402,7 @@ class SelectorTests(unittest.TestCase):
         self.assertEqual(selector.evidence_label(obs, summary), 'UPSTREAM REFERENCE')
 
     def test_telemetry_only_no_model_is_explicit_and_nonblocking(self):
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory(dir=FIXTURE_DIR) as td:
             with mock.patch.object(selector.metrics, 'CONFIG', pathlib.Path(td)):
                 code, _, _, launch, inventory = self.run_sel('--telemetry-opt-in', '--json')
             self.assertTrue(json.loads((pathlib.Path(td) / 'telemetry.json').read_text())['enabled'])

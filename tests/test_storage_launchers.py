@@ -1,3 +1,4 @@
+import json
 import os
 import pathlib
 import shlex
@@ -10,7 +11,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 class StorageLauncherTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(dir=ROOT)
         self.addCleanup(self.tmp.cleanup)
         self.root = pathlib.Path(self.tmp.name)
         (self.root / "lib").mkdir()
@@ -69,6 +70,11 @@ validate_download_space() { echo 'Error: Model requires 89 GiB but only 0 GiB fr
                        "q4_0", "q4_0", "512", "256", "on", "embedded", "", ""]
                 if rows == "worker_rows":
                     row = ["1"] + row + [""]
+                capacity = dict(context=262144, slots=1, output_tokens=8192,
+                                client_context=200000, compact_trigger=150000,
+                                input_tokens=190784, safety_tokens=1024,
+                                admission_limit=1)
+                row += [str(capacity["context"]), str(capacity["slots"]), json.dumps(capacity)]
                 shell = self.root / f"test-{name}"
                 shell.write_text(definitions + f"""
 source "$ROOT/lib/pushbutton_folders.sh"
@@ -92,6 +98,7 @@ start_backends
 validate_download_space() { return 0; }
 download_model_fast() { printf -v "$3" '%s' '/mock/model.gguf'; }
 curl() { return 0; }
+verify_capacity() { return 0; }
 start_backends
 wait "${PIDS[@]}"
 """))

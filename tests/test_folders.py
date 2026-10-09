@@ -667,6 +667,8 @@ printf "%s\\n" "$STATE_DIR" "$CACHE_DIR"
             "lib/pushbutton_download.sh",
             "lib/pushbutton_folders.sh", "lib/claude_local_entry.sh", "lib/claude_local_plan.py",
             "lib/claude_local_gateway.py", "lib/coder_local_plan.py",
+            "lib/claude_local_budget.py", "lib/pushbutton_capacity.py",
+            "lib/pushbutton_request_budget.py", "lib/pushbutton_capacity_proxy.py",
             "configs/qwen-local-defaults.json",
             "configs/backend-registry.json", "lib/pushbutton_metrics.py",
         )

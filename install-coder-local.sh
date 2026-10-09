@@ -34,6 +34,9 @@ if [[ -d "$DEST/.git" ]]; then
 else
   git clone --depth=1 --branch "$REF" "$REPO_URL" "$DEST"
 fi
+for asset in lib/pushbutton_capacity.py lib/pushbutton_request_budget.py lib/pushbutton_capacity_proxy.py; do
+  [[ -f "$DEST/$asset" ]] || { echo "missing capacity runtime asset: $asset" >&2; exit 1; }
+done
 source "$DEST/lib/pushbutton_folders.sh"
 PUSHBUTTON_CODE_DIR="$DEST"
 configure_folders

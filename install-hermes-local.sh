@@ -70,8 +70,8 @@ else
 fi
 
 chmod +x "$DEST/hermes-local" "$DEST/pushbutton-select"
-for asset in lib/pushbutton_metrics.py lib/coder_local_plan.py lib/claude_local_plan.py configs/backend-registry.json; do
-    [[ -f "$DEST/$asset" ]] || die "missing selector asset: $asset"
+for asset in lib/pushbutton_metrics.py lib/coder_local_plan.py lib/claude_local_plan.py lib/pushbutton_capacity.py lib/pushbutton_request_budget.py lib/pushbutton_capacity_proxy.py configs/backend-registry.json; do
+    [[ -f "$DEST/$asset" ]] || die "missing launcher asset: $asset"
 done
 install_commands
 

@@ -148,12 +148,12 @@ The earlier `CLIENT_CTX <= CTX` check was **not sufficient**: it compared config
 
 The launcher now:
 
-- Reads each live backend's `/props.default_generation_settings.n_ctx` with `total_slots=1`, after loading. In current official llama.cpp this is the **effective slot capacity**, including slot/native caps, not total KV allocation; do not divide it again. The complete server command uses `-c REQUESTED -np 1 --jinja --no-context-shift`. Current upstream fitting leaves explicit `-c` unchanged, but caps/alignment and different cached builds still require verification.
+- Reads each live backend's `/props.default_generation_settings.n_ctx` and verifies the requested slot count after loading. In current official llama.cpp this is the **effective slot capacity**, including slot/native caps, not total KV allocation; do not divide it again. The server command uses `-c (CONTEXT_PER_SLOT * SLOTS) -np SLOTS --jinja --no-context-shift`. Slots default to one and may be specified globally with `--slots` or per model with `MODEL@slots=N,context=N`. Current upstream fitting leaves explicit `-c` unchanged, but caps/alignment and different cached builds still require verification.
 - Reports requested/effective mismatches before launching Claude and derives a global policy from the **smallest Haiku/Sonnet/Opus/Fable route**, including subagents and compaction traffic. Unsafe explicit budgets are rejected rather than silently lowered. Missing runtime metadata or native token-count support stops launch with update/rebuild guidance.
 - Sets `CLAUDE_CODE_MAX_CONTEXT_TOKENS` for unresolved custom IDs, `CLAUDE_CODE_AUTO_COMPACT_WINDOW` explicitly, and `CLAUDE_CODE_MAX_OUTPUT_TOKENS` (default **8,192**, avoiding an unknown-model output default of 32K).
-- Reserves **8,192** tokens for prompt/formatting/token-accounting margin and another **8,192** of proactive compaction headroom. If capacity is `C` and configured output is `O`, the default custom-model assumed window is `min(200000, C-O-8192)`; the compaction window is `min(client window, C-O-16384, 1000000)`. The window is not the exact trigger: Claude applies its own output/compaction reserves within it.
+- Reserves **8,192** tokens for prompt/formatting/token-accounting margin and another **8,192** of proactive compaction headroom. If capacity is `C` and configured output is `O`, the default custom-model assumed window is `min(200000, C-O-8192)`, further bounded by per-model client limits; the compaction window is `min(client window, C-O-16384, 1000000, per-model compact limits)`. The window is not the exact trigger: Claude applies its own output/compaction reserves within it.
 
-For an effective capacity of **131,072**, without an explicit client override, the defaults are:
+For an effective capacity of **131,072**, with an explicit model output cap of **8,192** and compact limit of **106,496**, but no client override:
 
 | Setting | Tokens |
 |---|---:|
@@ -164,15 +164,21 @@ For an effective capacity of **131,072**, without an explicit client override, t
 | Prompt safety reserve / extra compaction headroom | 8,192 / 8,192 |
 
 ```bash
-claude-local qwen3.8:27b --local-context 131072
+claude-local 'qwen3.8:27b@context=131072,output=8192,compact=106496'
 
 # Safe lower overrides are retained:
 CLAUDE_CODE_AUTO_COMPACT_WINDOW=100000 \
 CLAUDE_CODE_MAX_OUTPUT_TOKENS=4096 \
-  claude-local qwen3.8:27b --local-context 131072 --local-client-context 105000
+  claude-local 'qwen3.8:27b@context=131072,output=8192,compact=100000' --local-client-context 110000
 ```
 
 `CLAUDE_LOCAL_CLIENT_CONTEXT`, `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, and the supported `--autocompact` integer can also lower the policy. Use **plain integers**, not `100k`, percentages, or `off`. Conflicting safe lower values select the smaller window. Values that cannot fit output and reserves fail with the allowable range.
+The generic planner's default compact trigger is 80% of its input budget. For
+smaller Claude contexts that may be below the documented 100,000-token minimum;
+specify fitting `output` and `compact` values as above rather than expecting an
+unsafe upward adjustment. Per-model specs retain their token-suffix/fraction
+syntax; the plain-integer restriction here applies to Claude environment/CLI
+window overrides.
 
 ### Compatibility and isolated settings
 
@@ -209,7 +215,7 @@ Lowering the threshold does **not** retroactively compact a saved transcript. Re
 1. Save a concise handoff outside the conversation: goal, completed changes, decisions, relevant paths, remaining work and verification. Recover it from your notes/transcript without sending the oversized history back to the model.
 2. Start an explicit **new session**, without `--resume` or `--continue`, and give it only the handoff:
    ```bash
-   claude-local qwen3.8:27b --local-context 131072
+   claude-local 'qwen3.8:27b@context=131072,output=8192,compact=106496'
    ```
 3. Only if a larger context is **proven to fit both the model and available hardware**, temporarily use that backend to resume and produce a handoff/compact. Verify its actual slot capacity first; increasing `-c` blindly is not the fix.
 
