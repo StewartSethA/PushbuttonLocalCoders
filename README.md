@@ -57,8 +57,8 @@ hermes-local --folders
 Normal startup prints storage paths (`--quiet` suppresses that banner) and each
 backend prints a safely quoted `tail -n 50 -F -- ...` log-follow command.
 Before model downloads, exact Hugging Face file metadata is checked against
-remaining disk space plus at least a 10 GiB reserve (the downloader also reserves
-5% of the filesystem if larger). Unknown sizes or insufficient space
+remaining disk space plus a fixed 10 GiB reserve, consistently applied by plan
+preflight and both download modes. Unknown sizes or insufficient space
 stop startup with status 2 rather than retrying a doomed download. VRAM planning
 is separate from this disk-space check.
 

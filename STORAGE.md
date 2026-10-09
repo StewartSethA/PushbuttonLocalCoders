@@ -69,9 +69,9 @@ The shared `lib/pushbutton_folders.sh` helper resolves exact GGUF quant files
 from Hugging Face metadata, including split weights. It subtracts complete
 cached files, not incomplete temporary downloads, and requires remaining bytes
 plus **10 GiB** free on the cache filesystem. Multi-model plans are checked
-before provisioning, with a fresh check before each download. The resumable
-downloader additionally reserves 5% of the filesystem when that exceeds 10 GiB.
-Both checks must pass before weights are downloaded and llama.cpp loads them.
+before provisioning, with a fresh check before each download. Plan preflight,
+parallel downloads, and sequential fallback all use the same fixed 10 GiB
+reserve, independent of total filesystem size.
 
 For offline checks, store the Hugging Face model API response at
 `<cache>/models--OWNER--REPO/metadata.json` (online checks also cache this response).
@@ -153,7 +153,7 @@ and pinning all GGUF shards to the same revision. llama.cpp loads the first shar
 with `-m` and discovers its peers locally.
 
 Downloads refuse to start when the remaining weights plus a reserve of
-**max(10 GiB, 5% of the filesystem)** exceed free space. Completed files are
+**10 GiB** exceed free space. Completed files are
 excluded; allocated aria2 partial-file blocks are credited only for parallel
 resume. Unknown sizes, missing quants, or incomplete/ambiguous shard sets are
 rejected before downloading. If a folder-management `validate_download_space`

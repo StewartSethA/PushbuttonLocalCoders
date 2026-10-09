@@ -82,7 +82,7 @@ def validate_space(manifest, reuse_partial=False):
     if not remaining:
         return
     disk = shutil.disk_usage(directory)
-    reserve = max(10 * 1024**3, int(disk.total * 0.05))
+    reserve = 10 * 1024**3
     if remaining + reserve > disk.free:
         raise ValueError(
             f"Insufficient disk space in {directory}: need {remaining / 1024**3:.1f} GiB "
