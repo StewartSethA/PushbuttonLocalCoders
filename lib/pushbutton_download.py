@@ -36,6 +36,10 @@ def select_files(metadata, quant):
             continue
         # Token boundaries prevent Q4_K matching Q4_K_M or IQ3 matching UD-IQ3.
         base = path.name
+        # Optional MTP builds require an explicit variant or filename selector.
+        if (re.search(r"-mtp(?:-\d{5}-of-\d{5})?\.gguf$", base, re.IGNORECASE)
+                and not re.search(r"(?:^|-)mtp(?:[.-]|$)", quant, re.IGNORECASE)):
+            continue
         pattern = r"(?:^|[-.])" + re.escape(quant) + r"(?:[.-]|$)"
         shard = re.fullmatch(r"(.*)-\d{5}-of-\d{5}\.gguf", name)
         if exact_shard and shard and exact_shard[1] == shard[1]:

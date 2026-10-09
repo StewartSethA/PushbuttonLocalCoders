@@ -14,6 +14,10 @@ resume. Unknown sizes, missing quants, or incomplete/ambiguous shard sets are
 rejected before downloading. If a folder-management `validate_download_space`
 function is loaded, its policy is checked too.
 
+Quant-only selectors such as `IQ3_XXS` select the standard model, not optional
+`-mtp` builds. To request an MTP build, use `IQ3_XXS-mtp` or its exact GGUF
+filename; exact shard filenames still select the complete shard set.
+
 ## Parallel downloads and resume
 
 aria2c downloads up to four files concurrently, using up to three connections
