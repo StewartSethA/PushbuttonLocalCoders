@@ -293,11 +293,14 @@ def joint_preview(models,frontend,agents,gpus,context,cap=None,gpu_indices=None,
    spec+=f",quant={w['profile']['quant']}"
    launch_models.append(spec)
  else:
-  if agents is not None:raise ValueError('Claude/Hermes use shared roles, not independent --agents replicas')
+  if agents is not None and frontend!='claude-local':
+   raise ValueError('Hermes does not support independent --agents replicas')
   if cap is not None or gpu_indices is not None:
    raise ValueError('GPU pins/leases are supported by coder frontends only; Claude/Hermes use their role planner')
   launch_models=[canon(m.split('@',1)[0])+('@'+m.split('@',1)[1] if '@' in m else '') for m in models]
-  result=plan.plan(launch_models,gpus,context,slots,client_context=client_context)
+  result=plan.plan(launch_models,gpus,context,slots,client_context=client_context,agents=agents)
+  if agents is not None:
+   launch_models=[launch_models[min(i,len(launch_models)-1)] for i in range(len(result['servers']))]
  result['unused_gpus'] += [asdict(g) for g in unsupported]
  return result,launch_models
 
@@ -340,7 +343,7 @@ def main():
  ap.add_argument('--gpu',type=int)
  ap.add_argument('--gpus',help='exact GPU set for each coder worker; prefer per-model pins for multiple workers')
  ap.add_argument('--frontend',choices=FRONTENDS,default='qwen-local')
- ap.add_argument('--agents',type=int,help='independent coder workers (1–8); Claude/Hermes instead share model roles')
+ ap.add_argument('--agents',type=int,help='independent coder workers (1–8) or Claude instances (1–4)')
  ap.add_argument('--placement-config',default=workers.DEFAULT_PLACEMENT_CONFIG)
  ap.add_argument('--client-context',type=int)
  ap.add_argument('--launch-arg',action='append',default=[],help='frontend argument to preserve; use --launch-arg=VALUE')

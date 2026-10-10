@@ -71,15 +71,53 @@ class SchedulerPolicyTests(unittest.TestCase):
         self.assertEqual(p["servers"][0]["capacity"]["slots"], 2)
         self.assertEqual(p["servers"][1]["profile"]["quant"], "UD-IQ3_XXS")
 
-    def test_shared_role_conflicting_capacity_rejected(self):
-        gpus = [planmod.GPU(0, "RTX 3090", 24576, 24576)]
-        with self.assertRaisesRegex(ValueError, "conflicting shared-role"):
-            planmod.plan(["q38@slots=1", "q38@slots=2"], gpus, 262144)
-        p = planmod.plan(["q38@slots=1", "q38"], gpus, 262144)
-        self.assertEqual(len(p["servers"]), 1)
-        p = planmod.plan(["q38@context=32K,output=4K,kv_k=q4_0",
-                          "q38@context=32K"], gpus, 262144)
-        self.assertEqual(len(p["servers"]), 1)
+    def test_repeated_models_are_independent_instances(self):
+        gpus = [planmod.GPU(i, "RTX 3090", 24576, 24576) for i in range(2)]
+        for specs in (["q38", "q38"], ["q38@slots=1", "q38@slots=2"],
+                      ["q36@gpu=0,slots=2", "q36@gpu=1,slots=2"],
+                      ["q38", "q38@gpu=0"],
+                      ["q38@context=32K,output=4K,kv_k=q4_0",
+                       "q38@context=64K,output=8K"]):
+            with self.subTest(specs=specs):
+                p = planmod.plan(specs, gpus, 262144)
+                servers = p["servers"]
+                self.assertEqual(len(servers), 2)
+                self.assertNotEqual(servers[0]["id"], servers[1]["id"])
+                self.assertNotEqual(servers[0]["cuda_visible_devices"],
+                                    servers[1]["cuda_visible_devices"])
+                self.assertEqual(p["role_ids"]["haiku"], servers[0]["id"])
+                for role in ("sonnet", "opus", "fable"):
+                    self.assertEqual(p["role_ids"][role], servers[1]["id"])
+        self.assertEqual([s["capacity"]["context"] for s in servers], [32768, 65536])
+        self.assertEqual([s["capacity"]["output_tokens"] for s in servers], [4096, 8192])
+
+    def test_agents_replicates_same_config(self):
+        gpus = [planmod.GPU(i, "RTX 3090", 24576, 24576) for i in range(2)]
+        spec = "q38@context=32K,slots=2"
+        self.assertEqual(planmod.plan([spec], gpus, 262144, agents=2),
+                         planmod.plan([spec, spec], gpus, 262144))
+
+    def test_repeated_models_on_large_inventory_remain_disjoint(self):
+        gpus = [planmod.GPU(i, "RTX 3090", 24576, 24576) for i in range(17)]
+        p = planmod.plan(["q38@gpu=0", "q38@gpu=1"], gpus, 262144)
+        self.assertEqual([s["cuda_visible_devices"] for s in p["servers"]], ["0", "1"])
+
+    def test_four_instances_keep_role_order(self):
+        gpus = [planmod.GPU(i, "RTX 3090", 24576, 24576) for i in range(4)]
+        p = planmod.plan([f"q38@gpu={i}" for i in range(4)], gpus, 262144)
+        self.assertEqual(list(p["role_ids"].values()), [s["id"] for s in p["servers"]])
+
+    def test_smart_defaults_use_two_instances_on_two_gpus(self):
+        gpus = [planmod.GPU(i, "RTX 3090", 24576, 24576) for i in range(2)]
+        models = planmod.smart_defaults(gpus)
+        self.assertEqual(len(models), 2)
+        p = planmod.plan(models, gpus, 262144)
+        self.assertEqual(len(p["servers"]), 2)
+
+    def test_repeated_model_pins_still_cannot_overcommit(self):
+        gpus = [planmod.GPU(i, "RTX 3090", 24576, 24576) for i in range(2)]
+        with self.assertRaisesRegex(ValueError, "cannot place"):
+            planmod.plan(["q38@gpu=0", "q38@gpu=0"], gpus, 262144)
 
     def test_shared_role_config_defaults_and_cli_override(self):
         gpus = [planmod.GPU(0, "RTX 3090", 24576, 24576)]

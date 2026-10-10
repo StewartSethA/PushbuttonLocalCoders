@@ -86,7 +86,7 @@ CAPTURE="$STATE_DIR/capture"
             with self.subTest(frontend=frontend):
                 row_function = "worker_rows" if frontend == "coder-local" else "server_rows"
                 body = """
-say(){ :; }; die(){ echo "$*" >&2; exit 1; }
+say(){ :; }; good(){ :; }; die(){ echo "$*" >&2; exit 1; }
 validate_download_space(){ :; }
 download_model_fast(){ printf -v "$3" '%s' model.gguf; }
 free_port(){ echo 18001; }; curl(){ return 0; }
@@ -208,11 +208,34 @@ wait
         result = self.run_functions("claude-local", ["run_claude"],
             f'GATEWAY_CONFIG={shlex.quote(str(config))}\n'
             'GATEWAY_PORT=19000\nENABLE_TEAMS=0\nCLAUDE_ARGS=()\n'
-            'say(){ :; }; contains_claude_flag(){ return 0; }\n'
+            'say(){ :; }; good(){ :; }; contains_claude_flag(){ return 0; }\n'
             'role_rows(){ printf "sonnet\\tmodel-a\\n"; }\n'
             'claude(){ printf "BUDGET:%s/%s/%s\\n" "$CLAUDE_CODE_MAX_CONTEXT_TOKENS" "$CLAUDE_CODE_MAX_OUTPUT_TOKENS" "$CLAUDE_CODE_AUTO_COMPACT_WINDOW"; }\n'
             'run_claude')
         self.assertIn("BUDGET:131072/512/100000", result.stdout)
+
+    def test_startup_lock_release_preserves_stderr(self):
+        result = self.run_functions("claude-local", ["release_startup_lock"],
+            'exec {STARTUP_LOCK_FD}>"$STATE_DIR/startup.lock"\n'
+            'release_startup_lock\nprintf "visible launch error\\n" >&2')
+        self.assertIn("visible launch error", result.stderr)
+
+    def test_silent_claude_failure_reports_status_in_red(self):
+        config = self.root / "gateway.json"
+        config.write_text(json.dumps({"budget":{"client_context":7000,
+                                               "compact_window":4500,
+                                               "max_output_tokens":1024}}))
+        result = self.run_functions("claude-local",
+            ["say", "good", "debug", "warn", "show_runtime_errors", "run_claude"],
+            f'GATEWAY_CONFIG={shlex.quote(str(config))}\n'
+            'GATEWAY_PORT=19000\nENABLE_TEAMS=0\nVERBOSE=1\n'
+            'contains_claude_flag(){ return 0; }\nrole_rows(){ :; }\n'
+            'claude(){ return 42; }\n'
+            'if run_claude; then exit 1; else rc=$?; [[ "$rc" == 42 ]]; fi')
+        self.assertIn("\033[1;31m[claude-local] Claude Code exited with status 42", result.stderr)
+        self.assertIn("\033[1;32m[claude-local] All local services ready.", result.stdout)
+        self.assertIn("\033[1;33m[claude-local] Claude Code ->", result.stdout)
+        self.assertIn("\033[0;37m[claude-local] Runtime logs:", result.stderr)
 
     def test_readiness_refuses_reduced_or_unproven_per_slot_context(self):
         props = {}
@@ -435,6 +458,13 @@ class StartupTests(unittest.TestCase):
                 argv = self.recorded(frontend, ["--select", model, "--slots", "2"])["argv"]
                 self.assertIn(model, argv)
                 self.assertEqual(argv[argv.index("--slots") + 1], "2")
+
+    def test_claude_numeric_agents_survives_selection(self):
+        self.selector_recorder()
+        for frontend in ("claude-local", "claude-local-safe"):
+            argv = self.recorded(frontend, ["--select", "q38", "--agents", "2"])["argv"]
+            self.assertEqual(argv[argv.index("--agents") + 1], "2")
+            self.assertNotIn("--launch-arg=--agents", argv)
 
     def test_qwen_alias_preserves_frontend(self):
         self.selector_recorder()
