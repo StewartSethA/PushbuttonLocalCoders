@@ -152,6 +152,12 @@ additional headroom for the next turn. Frontend adapters advertise resolved
 budgets per model where supported; a shared session uses the smallest compatible
 budget. Current upstream framework mappings are:
 
+For every resolved worker, the enforced ordering is
+`compact_trigger < input_tokens <= client_context <= context` (where `context`
+is the hard per-slot limit). Adding slots does not silently lower per-slot
+context; it increases the estimated memory requirement. Invalid/out-of-order
+budgets fail before framework configuration is written.
+
 | Frontend | Budget/compaction mapping |
 | --- | --- |
 | Qwen Code | Per-model `contextWindowSize` and `samplingParams.max_tokens`; session `context.autoCompactThreshold` uses the earliest safe model ratio. Its built-in reserves may compact earlier. |

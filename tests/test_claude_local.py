@@ -192,6 +192,8 @@ class ContextPolicyTests(unittest.TestCase):
         self.assertEqual(p["client_context"], 114688)
         self.assertEqual(p["compact_window"], 106496)
         self.assertEqual(p["max_output_tokens"], 8192)
+        self.assertLessEqual(p["compact_window"], p["client_context"])
+        self.assertLess(p["client_context"], p["capacity"])
         self.assertEqual(sum(p[x] for x in ("compact_window", "max_output_tokens", "prompt_reserve", "compact_reserve")), 131072)
         self.assertEqual(budgetmod.context_policy(262144, env={})["client_context"], 200000)
 
@@ -213,6 +215,8 @@ class ContextPolicyTests(unittest.TestCase):
         self.assertEqual(policy["capacity"], 131072)
         self.assertEqual((policy["max_output_tokens"], policy["client_context"], policy["compact_window"]),
                          (4096, 110000, 105000))
+        self.assertLessEqual(policy["compact_window"], policy["client_context"])
+        self.assertLess(policy["client_context"], policy["capacity"])
         for client, env in [
             ("115000", {}), ("", {"CLAUDE_CODE_MAX_CONTEXT_TOKENS": "115000"}),
             ("", {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": "8192"}),

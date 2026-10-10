@@ -136,8 +136,11 @@ def resolve_budget(context, output=None, client_context=None, compact=None, safe
     trigger = max(1, int(input_tokens * threshold)) if isinstance(threshold, float) else threshold
     if trigger >= input_tokens:
         raise ValueError("compact trigger must be strictly below the input budget")
-    return {"context": context, "output_tokens": output, "client_context": client,
-            "compact_trigger": trigger, "input_tokens": input_tokens, "safety_tokens": safety}
+    result = {"context": context, "output_tokens": output, "client_context": client,
+              "compact_trigger": trigger, "input_tokens": input_tokens, "safety_tokens": safety}
+    if not 0 < result["compact_trigger"] < result["input_tokens"] <= result["client_context"] <= result["context"]:
+        raise ValueError("compaction trigger must be below the input, client, and hard context limits")
+    return result
 
 
 def resolve_options(options: dict, context: int, slots: int = 1) -> dict:

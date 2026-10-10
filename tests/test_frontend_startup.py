@@ -167,7 +167,7 @@ wait
 
     def test_qwen_model_context_and_output_are_per_model_and_guarded(self):
         backends = self.root / "backends"
-        second = {**self.capacity, "client_context":12000, "output_tokens":2048}
+        second = {**self.capacity, "context":16384, "client_context":12000, "output_tokens":2048}
         backends.write_text("1\tmodel-a\t18001\trepo:a\t" + json.dumps(self.capacity) + "\n" +
                             "2\tmodel-b\t18002\trepo:b\t" + json.dumps(second) + "\n")
         self.run_functions("coder-local", ["configure_qwen"],
@@ -176,6 +176,9 @@ wait
         models = config["modelProviders"]["openai"]
         self.assertEqual([m["generationConfig"]["contextWindowSize"] for m in models], [7000, 12000])
         self.assertEqual([m["generationConfig"]["samplingParams"]["max_tokens"] for m in models], [1024, 2048])
+        for model, capacity in zip(models, (self.capacity, second)):
+            self.assertLess(capacity["compact_trigger"], model["generationConfig"]["contextWindowSize"])
+            self.assertLess(model["generationConfig"]["contextWindowSize"], capacity["context"])
         self.assertTrue(all(m["baseUrl"] == "http://127.0.0.1:19000/v1" for m in models))
         self.assertEqual(config["context"]["autoCompactThreshold"],
                          min(self.capacity["compact_trigger"]/7000, second["compact_trigger"]/12000))
@@ -186,6 +189,8 @@ wait
                                     'configure_profile fast model-a http://127.0.0.1:19000/v1 low')
         self.assertEqual(result.returncode, 0)
         self.assertIn("config set model.context_length 7000", (self.root / "capture").read_text())
+        self.assertLess(self.capacity["compact_trigger"], self.capacity["client_context"])
+        self.assertLess(self.capacity["client_context"], self.capacity["context"])
         self.assertIn("config set compression.enabled true", (self.root / "capture").read_text())
         self.assertIn("config set compression.threshold_tokens 4500", (self.root / "capture").read_text())
         self.assertIn("config set model.provider custom:pushbutton", (self.root / "capture").read_text())
