@@ -26,6 +26,7 @@ KEEP_SERVERS=0
 ENABLE_TEAMS=1
 DRY_RUN=0
 VERBOSE=0
+ALLOW_SINGLE_SLOT_AUTO=0
 QUIET=0
 FOLDERS_ONLY=0
 SELECT=0
@@ -79,6 +80,8 @@ Harness options (put before ordinary Claude Code flags):
   --local-client-context N   assumed client window (default derived, <=200000)
   --local-port-base N        starting port for gateway/backends
   --local-no-teams           disable experimental Claude agent teams
+  --local-allow-single-slot-auto
+                             allow non-interactive Auto mode on a single-slot backend
   --local-keep-servers       leave model servers running after Claude exits
   --local-allow-offload      allow CUDA unified-memory spill (slow; default off)
   --local-dry-run            show hardware/model plan only
@@ -471,6 +474,50 @@ start_gateway() {
 
 contains_claude_flag() { local w="$1" x; for x in "${CLAUDE_ARGS[@]:-}"; do [[ "$x" == "$w" || "$x" == "$w="* ]] && return 0; done; return 1; }
 
+confirm_single_slot_auto_mode() {
+    claude_local_auto_mode_requested "${CLAUDE_ARGS[@]}" || return 0
+    claude_local_plan_has_single_slot "$PLAN_FILE" || return 0
+
+    warn "One or more planned local model routes has a single request slot. Auto mode's client-side classifier shares that capacity, so requests may queue behind other inference and hit the configured stream-idle/request timeout."
+    if (( ALLOW_SINGLE_SLOT_AUTO )); then
+        warn "Continuing in Auto mode because --local-allow-single-slot-auto was supplied."
+        return 0
+    fi
+    if [[ ! -t 0 || ! -r /dev/tty || ! -w /dev/tty ]]; then
+        warn "Cannot ask for a choice without a terminal. Select --permission-mode default or acceptEdits, or explicitly acknowledge the risk with --local-allow-single-slot-auto."
+        return 2
+    fi
+
+    printf '\nAuto mode keeps its classifier checks, but may be slow when any route has one slot.\n' >/dev/tty
+    printf '  [c] Continue in auto mode (default)\n  [t] Continue in auto mode without local agent teams\n  [d] Use default mode (ask before protected actions)\n  [e] Use acceptEdits (auto-approve edits; other permissions still apply)\n  [q] Cancel before starting local services\nChoice [c/t/d/e/q]: ' >/dev/tty
+    local choice
+    IFS= read -r choice </dev/tty || choice=c
+    case "${choice,,}" in
+        ""|c|continue)
+            warn "Continuing in auto mode; classifier requests may queue or time out."
+            ;;
+        t|no-teams)
+            ENABLE_TEAMS=0
+            warn "Continuing in auto mode with local agent teams disabled to reduce competing inference work."
+            ;;
+        d|default)
+            claude_local_set_permission_mode default
+            say "Using default permission mode for this launch."
+            ;;
+        e|edits|acceptedits)
+            claude_local_set_permission_mode acceptEdits
+            say "Using acceptEdits permission mode for this launch."
+            ;;
+        q|quit|cancel)
+            say "Cancelled before starting local services."
+            return 130
+            ;;
+        *)
+            warn "Unrecognized choice; continuing in auto mode."
+            ;;
+    esac
+}
+
 agents_json() {
 python3 - "$PLAN_FILE" <<'PY'
 import json,sys
@@ -538,6 +585,17 @@ PY
     python3 "$BUDGET_PY" --requested "$verified_capacity" --client "$CLIENT_CTX" \
         --user-settings "$CLAUDE_CONFIG_DIR/settings.json" -- "${CLAUDE_ARGS[@]}" || return $?
     say "Claude settings/sessions: $CLAUDE_CONFIG_DIR (persistent user settings; project/local sources disabled)"
+    if [[ -z "${CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY:-}" ]]; then
+        export CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY="$(python3 - "$PLAN_FILE" <<'PY'
+import json,sys
+p=json.load(open(sys.argv[1]))
+servers={s["id"]:s for s in p["servers"]}
+slots=[int(servers[mid].get("capacity",{}).get("slots",1)) for mid in set(p["role_ids"].values()) if mid in servers]
+print(max(1,min(slots, default=1)))
+PY
+)"
+    fi
+    export CLAUDE_CODE_AUTO_MODE_SERVER="${CLAUDE_CODE_AUTO_MODE_SERVER:-0}"
     unset CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY ANTHROPIC_BEDROCK_BASE_URL ANTHROPIC_VERTEX_BASE_URL || true
     while IFS=$'\t' read -r role id; do
         case "$role" in
@@ -628,6 +686,7 @@ while (($#)); do
       --local-allow-offload) ALLOW_OFFLOAD=1; SELECT_ARGS+=("$1"); shift;;
       --local-dry-run) DRY_RUN=1; SELECT_ARGS+=("$1"); shift;;
       --local-verbose) VERBOSE=1; SELECT_ARGS+=("$1"); shift;;
+      --local-allow-single-slot-auto) ALLOW_SINGLE_SLOT_AUTO=1; SELECT_ARGS+=("$1"); shift;;
       -*) CLAUDE_ARGS+=("$@"); break;;
       *) MODELS+=("$1"); shift;;
     esac
@@ -665,6 +724,7 @@ if ((SELECT)) || ((${#MODELS[@]} == 0)); then
 fi
 [[ "${CLAUDE_LOCAL_STARTUP_ONLY:-0}" != 1 ]] || exit 125
 source "$LIB/pushbutton_download.sh"
+source "$LIB/claude_local_policy.sh"
 require_files
 if ! have_cmd python3; then
     [[ $DRY_RUN -eq 0 ]] || die "python3 required for dry run"
@@ -690,6 +750,10 @@ if ((${#MODELS[@]})); then plan_args+=("${MODELS[@]}"); else plan_args+=(--smart
 python3 "$PLAN_PY" "${plan_args[@]}" > "$PLAN_FILE" || exit $?
 python3 "$BUDGET_PY" --requested "$CTX" --client "$CLIENT_CTX" --plan "$PLAN_FILE" -- "${CLAUDE_ARGS[@]}" || exit $?
 print_plan; [[ $DRY_RUN -eq 1 ]] && exit 0
+confirm_single_slot_auto_mode || {
+    policy_status=$?
+    exit "$policy_status"
+}
 validate_plan_download_space "$PLAN_FILE" "$CACHE_DIR" || exit 2
 install_claude_code
 python3 "$BUDGET_PY" --requested "$CTX" --client "$CLIENT_CTX" --plan "$PLAN_FILE" --check-claude -- "${CLAUDE_ARGS[@]}" || exit $?

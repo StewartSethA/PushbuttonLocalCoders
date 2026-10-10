@@ -142,6 +142,29 @@ Unless `--local-no-teams` is supplied, the harness enables Claude Code's agent-t
 
 Claude Code remains the orchestrator. When it fans out, all agent API traffic returns to the same local gateway and therefore to the planned local GPUs.
 
+The local gateway and model backends cannot run Anthropic's server-side auto-mode
+classifier. `claude-local` therefore sets `CLAUDE_CODE_AUTO_MODE_SERVER=0` for
+the launched Claude Code process by default. Auto mode remains available and uses
+Claude Code's own classifier requests; this avoids the eligibility warning but
+does not provide the new no-charge server-side checks. To override the default,
+set `CLAUDE_CODE_AUTO_MODE_SERVER=1` before launching. This setting is scoped to
+`claude-local` and is not written to persistent Claude Code configuration.
+
+Client-side tool-use concurrency defaults to the minimum configured slot count
+across the routed local models; explicit `CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY`
+is respected. This is a pressure limit, not a strict backend admission control.
+When Auto mode is selected and any routed model has one slot, the launcher warns
+that classifier requests may queue and time out, then offers to continue,
+continue without local agent teams, use `default` (interactive permission
+prompts), use `acceptEdits` (edits auto-approved; other permission checks
+remain), or cancel before setup. Neither alternative disables permission checks.
+Non-interactive Auto launches stop before setup when any routed model has one
+slot unless `--local-allow-single-slot-auto` explicitly acknowledges the risk.
+Explicit `default` or `acceptEdits` modes avoid Auto's classifier request.
+Auto-mode detection uses the isolated settings file at
+`$CLAUDE_LOCAL_STATE/claude-config/settings.json` and managed settings; project
+settings are intentionally excluded.
+
 ## Context budgeting and auto-compaction
 
 With the default policy, claude-local does **not** select an auto-compaction

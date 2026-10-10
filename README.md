@@ -556,17 +556,39 @@ The installed `claude-local` wrapper therefore defaults to:
 - a 15-minute stream-idle budget
 - only two API retries instead of repeatedly replaying an expensive local request
 - local subagent stall budget of 30 minutes
-- read-only/tool/subagent concurrency capped to the number of visible GPUs (max 4)
+- Claude tool-use concurrency defaults to the minimum configured slot count across routed models
 - one safe gateway retry only before an SSE response is committed downstream
 
 These can all be overridden with the corresponding Claude Code environment
 variables (`API_TIMEOUT_MS`, `CLAUDE_STREAM_IDLE_TIMEOUT_MS`,
 `CLAUDE_CODE_MAX_RETRIES`, `CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY`, etc.).
+`CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY` limits client-side tool use; it does not
+increase backend capacity or strictly serialize every API request. Local agent
+teams can also compete for the same backend.
+
+When `claude-local` detects Auto permission mode from the command line or settings,
+it warns before downloading/building models and offers to continue in Auto mode,
+continue without local agent teams, switch this launch to `default` or
+`acceptEdits`, or cancel. Auto mode keeps its classifier checks, but when any
+routed model has one slot, classifier requests may queue and hit a timeout.
+`default` retains interactive permission prompts; `acceptEdits` auto-approves
+edits while other permission checks still apply. Neither choice bypasses
+permissions. In a non-interactive Auto launch, setup stops when any routed
+model has one slot unless you pass `--local-allow-single-slot-auto` to
+acknowledge the risk. Explicit `--permission-mode default` and
+`--permission-mode acceptEdits` avoid Auto's classifier request.
 
 If you use Claude Code's `auto` permission mode on a slow single-GPU local model,
 remember that auto mode itself uses model-classified background safety checks.
 `default` or `acceptEdits` avoids adding that classifier traffic when you do not
 need it.
+
+`claude-local` sets `CLAUDE_CODE_AUTO_MODE_SERVER=0` by default because its local
+gateway cannot run Anthropic's server-side classifier. Auto mode still works
+using Claude Code's own classifier requests, but does not get the no-charge
+server-side checks. Set `CLAUDE_CODE_AUTO_MODE_SERVER=1` to override this for a
+gateway that implements those checks; the setting is scoped to the `claude-local`
+launch and is not saved in Claude Code configuration.
 
 For a single RTX 3090, a smaller context is often a better responsiveness/reliability
 tradeoff than allocating 262K merely because it fits:
