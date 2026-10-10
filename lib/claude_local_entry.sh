@@ -30,9 +30,14 @@ while (($#)); do
       WEB_CONFIG="$2"; shift 2;;
     --folders|--system-info)
       INFO_ONLY=1; ARGS+=("$1"); shift;;
-    --local-context|--local-client-context|--local-port-base)
+    --local-context|--local-client-context|--local-port-base|--slots)
       [[ $# -ge 2 ]] || { echo "$1 needs a value" >&2; exit 2; }
       ARGS+=("$1" "$2"); shift 2;;
+    --slots=*|--agents=[0-9]*)
+      ARGS+=("$1"); shift;;
+    --agents)
+      # Numeric values are harness replica counts; JSON belongs to Claude Code.
+      if [[ "${2:-}" =~ ^[0-9]+$ ]]; then ARGS+=("$1" "$2"); shift 2; else ARGS+=("$@"); break; fi;;
     --select|--quiet|--no-parallel|--local-no-teams|--local-keep-servers|--local-allow-offload|--local-dry-run|--local-verbose)
       ARGS+=("$1"); shift;;
     -*)
