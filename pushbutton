@@ -7,7 +7,7 @@ Normal flow:
 Expert tools remain available, but ordinary users should not need to invoke them.
 """
 from __future__ import annotations
-import argparse, json, os, pathlib, shutil, socket, subprocess, sys, time, urllib.request
+import argparse, json, os, pathlib, platform, shutil, socket, subprocess, sys, time, urllib.request
 
 ROOT=pathlib.Path(__file__).resolve().parent
 sys.path.insert(0,str(ROOT/'lib'))
@@ -122,15 +122,36 @@ def configure(cfg,args):
     if args.telemetry_on:metrics.set_telemetry(True,args.telemetry_url)
     elif args.telemetry_off:metrics.set_telemetry(False)
     elif first and sys.stdin.isatty() and not metrics.telemetry_consent_recorded():
-        raw=input('Contribute anonymous compact performance measurements? [y/N]: ').strip().lower()
-        metrics.set_telemetry(raw in {'y','yes'},args.telemetry_url)
+        print('Pushbutton can contribute compact performance telemetry: model load time and prompt/decode\n'
+              'tok/s at each context depth, with model/quant and hardware type. No prompts, outputs,\n'
+              'usernames, hostnames or paths are sent. The collector records the receive timestamp and\n'
+              'your IP address. Uploads happen at most once every 5 minutes. Change later with\n'
+              '--telemetry-off / --telemetry-on.',file=sys.stderr)
+        raw=input('Enable telemetry? [Y/n]: ').strip().lower()
+        metrics.set_telemetry(raw not in {'n','no'},args.telemetry_url)
     if not getattr(args,'plan_only',False):write_json(CONFIG,cfg)
     return cfg
+
+def cpu_view(model,context,settings=None):
+    """CPU row used automatically when no NVIDIA GPU is visible."""
+    if model not in plan.PROFILES or not plan.cpu_fallback_enabled():return []
+    try:
+        import cpu_platform
+        info=cpu_platform.detect()
+        choice=cpu_platform.place_requests([(model,settings or capacity.resolve_options({},context))],info)[0]
+    except Exception as exc:
+        warn(f'CPU placement for {model} failed: {exc}');return []
+    perf=choice.as_row()
+    return [{'status':'FIT','backend':'llama.cpp','artifact':choice.profile.quant,'req':choice.required_mib,
+             'quality':choice.profile.quality,'tg':perf['tg'],'pp':perf['pp'],'evidence':perf['evidence'],
+             'gpu':None,'device':'cpu','cpu_strategy':choice.strategy.to_dict(),'cpu_host':info.summary(),
+             'cpu_estimate':choice.estimate}]
 
 def selector_views(model,context):
     gpus=[]
     try:gpus=plan.inventory()
     except Exception:pass
+    if not gpus and platform.system()!='Darwin':return cpu_view(model,context)
     indices=[g.index for g in gpus] or [None];out=[]
     for idx in indices:
         cmd=[sys.executable,str(ROOT/'pushbutton-select'),model,'--context',str(context),'--no-interactive','--json']
@@ -221,12 +242,26 @@ def start_detached(cmd,log,name):
     log.parent.mkdir(parents=True,exist_ok=True);f=log.open('ab',buffering=0)
     say(f'commissioning {name}; log={log}')
     return subprocess.Popen([str(x) for x in cmd],stdout=f,stderr=subprocess.STDOUT,start_new_session=True,env=os.environ.copy())
-def wait_endpoint(proc,endpoint,timeout=3600):
-    deadline=time.monotonic()+timeout
+LOAD_MARKERS=('load_model: loading model','llama_model_loader: loaded meta data')
+def wait_endpoint(proc,endpoint,timeout=3600,log=None,timing=None):
+    """Wait for readiness; with ``log``/``timing``, record weight load time.
+
+    Load time runs from llama.cpp's first model-loading log line to endpoint
+    readiness, so engine builds and GGUF downloads are excluded.
+    """
+    deadline=time.monotonic()+timeout;offset=0;started=None
     while time.monotonic()<deadline:
         if proc.poll() is not None:return False
-        if endpoint_ok(endpoint):return True
-        time.sleep(1)
+        if log is not None and started is None:
+            try:
+                with open(log,'rb') as f:
+                    f.seek(offset);chunk=f.read();offset+=len(chunk)
+                if any(m.encode() in chunk for m in LOAD_MARKERS):started=time.monotonic()
+            except OSError:pass
+        if endpoint_ok(endpoint):
+            if timing is not None and started is not None:timing['load_time_s']=round(time.monotonic()-started,2)
+            return True
+        time.sleep(.5 if log is not None else 1)
     return False
 
 def ensure_broker(cfg):
@@ -248,7 +283,7 @@ def served_model(endpoint,fallback):
     try:return str((obj.get('data') or [{}])[0].get('id') or fallback)
     except Exception:return fallback
 def check_vram_lease(pid,gpus,cap):
-    if cap is None:return True
+    if cap is None or gpus in (None,''):return True
     try:
         devices=subprocess.check_output(['nvidia-smi','--query-gpu=index,uuid','--format=csv,noheader,nounits'],text=True,stderr=subprocess.DEVNULL)
         apps=subprocess.check_output(['nvidia-smi','--query-compute-apps=pid,gpu_uuid,used_memory','--format=csv,noheader,nounits'],text=True,stderr=subprocess.DEVNULL)
@@ -274,14 +309,19 @@ def commission(model,context,row):
         cmd=[sys.executable,ROOT/'pushbutton-instance','--hf-spec',spec,'--alias',model,'--port',port,'--context',context,'--parallel',slots]
         if row.get('capacity'):
             cmd += ['--kv-k',row['kv_k'],'--kv-v',row['kv_v']]
-        if gpu is not None:cmd += ['--gpus',str(gpu)]
+        if gpu not in (None,''):cmd += ['--gpus',str(gpu)]
+        if row.get('device')=='cpu' and row.get('cpu_strategy'):
+            cmd += ['--cpu-strategy',json.dumps(row['cpu_strategy'],separators=(',',':'))]
     elif backend in {'llamampere','vllm-qwen38-3090','ninfer-3090','volta-llama','sglang-v100','vllm-flashnext-3090'}:
         cmd=[sys.executable,ROOT/'pushbutton-backend','serve',backend,model,'--port',port,'--context',context]
         if gpu is not None:cmd += ['--gpus',str(gpu)]
     else:raise SystemExit(f'backend {backend!r} is catalogued but does not yet have an automatic local launcher')
     if slots>1:say(f'pre-provisioning {slots} native llama.cpp slots; broker admission remains C1 until calibrated')
-    proc=start_detached(cmd,logs/f'{model.replace(":","-")}-{backend}-{port}.log',f'{model} / {backend}')
-    if not wait_endpoint(proc,endpoint):
+    log=logs/f'{model.replace(":","-")}-{backend}-{port}.log';timing={}
+    try:log_offset=log.stat().st_size
+    except OSError:log_offset=0
+    proc=start_detached(cmd,log,f'{model} / {backend}')
+    if not wait_endpoint(proc,endpoint,log=log if not log_offset else None,timing=timing):
         if backend=='llama.cpp' and slots>1 and (not row.get('capacity') or row.get('slots_automatic')):
             try:proc.terminate();proc.wait(timeout=5)
             except Exception:
@@ -295,7 +335,9 @@ def commission(model,context,row):
                 row['capacity']['memory_estimate']=capacity.memory_estimate(profile,row['capacity'])
                 row['req']=row['capacity']['memory_estimate']['required_mib']
                 cmd += ['--kv-k',row['kv_k'],'--kv-v',row['kv_v']]
-            if gpu is not None:cmd += ['--gpus',str(gpu)]
+            if gpu not in (None,''):cmd += ['--gpus',str(gpu)]
+            if row.get('device')=='cpu' and row.get('cpu_strategy'):
+                cmd += ['--cpu-strategy',json.dumps(row['cpu_strategy'],separators=(',',':'))]
             proc=start_detached(cmd,logs/f'{model.replace(":","-")}-{backend}-{port}-c1.log',f'{model} / {backend} C1 fallback')
             if not wait_endpoint(proc,endpoint):raise SystemExit(f'backend failed to become ready even at C1; inspect {logs}')
         else:raise SystemExit(f'backend failed to become ready; inspect {logs}')
@@ -311,6 +353,16 @@ def commission(model,context,row):
                 raise SystemExit(f'backend capacity verification failed: {exc}') from exc
         inst['capacity']={**row['capacity'],'no_context_shift':backend=='llama.cpp'}
     if row.get('vram_limit_mib_per_gpu') is not None:inst['vram_limit_mib_per_gpu']=row['vram_limit_mib_per_gpu']
+    if row.get('device')=='cpu':
+        inst['device']='cpu';inst['cpu_strategy']=row.get('cpu_strategy')
+        inst['telemetry_device']=metrics.device_descriptor(row.get('cpu_host'),row.get('cpu_strategy'))
+    if timing.get('load_time_s') is not None:
+        inst['load_time_s']=timing['load_time_s'];say(f"model weights loaded in {timing['load_time_s']:.1f}s")
+        try:
+            metrics.queue_performance(model,backend,artifact,load_time_s=timing['load_time_s'],context=context,
+                                      device=inst.get('telemetry_device'),source='pushbutton-commission')
+            metrics.maybe_upload()
+        except Exception as exc:warn(f'telemetry skipped: {exc}')
     registry_store.append_instance(inst,REGISTRY);return inst
 
 def capacity_candidate(req,context):
@@ -319,6 +371,10 @@ def capacity_candidate(req,context):
     row={'backend':'llama.cpp','artifact':worker['profile']['quant'],'gpu':worker['cuda_visible_devices'],
          'req':worker['required_mib'],'capacity':worker['capacity'],'kv_k':worker['profile']['kv_k'],
          'kv_v':worker['profile']['kv_v'],'vram_limit_mib_per_gpu':worker.get('vram_limit_mib_per_gpu'),'evidence':'ESTIMATED'}
+    if worker.get('device')=='cpu':
+        first=worker['cpu']['estimate']['depths'][0]
+        row.update(gpu=None,device='cpu',cpu_strategy=worker['cpu']['strategy'],cpu_host=worker['cpu']['host'],
+                   tg=first['tg_tps'],pp=first['pp_tps'],vram_limit_mib_per_gpu=None)
     return proposed,row
 
 def automatic_capacity_row(model,req,context,row):
@@ -328,7 +384,7 @@ def automatic_capacity_row(model,req,context,row):
     slots=provisioned_parallel(model,context,row)
     resolved=worker_plan.request_capacity(req,profile,context,slots)
     return {**row,'capacity':resolved,'kv_k':profile.kv_k,'kv_v':profile.kv_v,
-            'slots_automatic':True,'req':resolved['memory_estimate']['required_mib']}
+            'slots_automatic':True,'req':row['req'] if row.get('device')=='cpu' else resolved['memory_estimate']['required_mib']}
 
 def ensure_qwen():
     q=shutil.which('qwen')
@@ -435,7 +491,8 @@ def main():
                 say(f"{model}: slots={resolved['slots']}, context/slot={ctx:,}, input={resolved['input_tokens']:,}, output={resolved['output_tokens']:,}, compact={resolved['compact_trigger']:,}; estimated {row.get('req') or '?'} MiB")
             label,msg=policy.speed_label(row.get('tg'),measured=row.get('evidence')=='LOCAL MEASURED')
             if label in {'SLOW','VERY_SLOW'}:warn(msg or f'{model} is expected to decode below {policy.MIN_DECODE_TOK_S:.0f} tok/s')
-            say(f"selected {model} / {row['backend']} / {row['artifact']} on GPU {row.get('gpu')} — TG {row.get('tg') or '?'} tok/s ({row.get('evidence')})")
+            where=f"CPU ({row['cpu_strategy']['name']}, {row['cpu_strategy']['threads']} threads)" if row.get('device')=='cpu' else f"GPU {row.get('gpu')}"
+            say(f"selected {model} / {row['backend']} / {row['artifact']} on {where} — TG {row.get('tg') or '?'} tok/s ({row.get('evidence')})")
             resident=commission(model,ctx,row)
     broker_port=ensure_broker(cfg);say(f'broker ready: http://127.0.0.1:{broker_port}/v1')
     frontend=cfg.get('frontend','qwen')

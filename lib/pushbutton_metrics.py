@@ -3,11 +3,18 @@
 
 The important distinction is between *measurement* and *upload*:
 - local measurements are always saved so future launches can make better choices;
-- network contribution is opt-in and only sends compact performance metadata;
+- network contribution is asked for on first run (default yes) and only sends
+  compact performance metadata: model weight load time and PP/TG per context depth;
+- the collector stamps each record with its receive time and the sender's IP;
+- uploads happen at most once every MIN_UPLOAD_INTERVAL_S (5 minutes);
 - prompts, generated text, usernames, hostnames and local paths are never queued.
 """
 from __future__ import annotations
-import gzip, json, os, pathlib, statistics, time, urllib.request
+import contextlib, gzip, json, os, pathlib, statistics, time, urllib.request
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX
+    fcntl = None
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 LOCAL_RESULTS = ROOT / "benchmarks/results"
@@ -22,6 +29,8 @@ RUNTIME = pathlib.Path(os.environ.get("PUSHBUTTON_RUNTIME_DIR", pathlib.Path.hom
 LIVE_RESULTS = RUNTIME / "observations"
 QUEUE = CACHE / "telemetry-queue"
 CONSENT_VERSION = 1
+MIN_UPLOAD_INTERVAL_S = 300
+TELEMETRY_SCHEMA = 2
 
 
 def _read_json(path: pathlib.Path, default):
@@ -62,23 +71,82 @@ def save_observation(obs: dict) -> pathlib.Path:
     return p
 
 
+def _num(x):
+    return x if isinstance(x,(int,float)) and not isinstance(x,bool) else None
+
+
+def _sanitize_depths(rows) -> list[dict]:
+    out=[]
+    for r in rows if isinstance(rows,list) else []:
+        if not isinstance(r,dict):continue
+        row={k:_num(r.get(k)) for k in ("depth","pp_tps","tg_tps","pp_tps_estimate","tg_tps_estimate")}
+        row={k:v for k,v in row.items() if v is not None}
+        if "depth" in row:out.append(row)
+    return out[:32]
+
+
 def _sanitize_observation(obs: dict) -> dict:
     allowed=(
         "schema_version","timestamp_utc","model","backend","artifact","backend_commit",
         "context","gpu_models","gpu_memory_mib","ram_gib","prompt_tokens","completion_tokens",
         "prompt_tokens_estimated","completion_tokens_estimated","pp","tg","ttft","elapsed_s",
         "concurrency","source","method","status_code",
+        "event","device","cpu_model","cpu_family","cpu_tier","cpu_sockets","cpu_cores",
+        "fast_mem_kind","fast_mem_mode","strategy","threads","threads_batch","memory_tier",
+        "load_time_s",
     )
-    return {k:obs.get(k) for k in allowed if obs.get(k) is not None}
+    out={k:obs.get(k) for k in allowed if obs.get(k) is not None}
+    for k in ("model","backend","artifact","device","cpu_model","cpu_family","cpu_tier","strategy",
+              "memory_tier","event","source","method","fast_mem_kind","fast_mem_mode","backend_commit"):
+        if k in out:out[k]=str(out[k])[:160]
+    if obs.get("depths") is not None:out["depths"]=_sanitize_depths(obs.get("depths"))
+    return out
 
 
-def queue_observation(obs: dict) -> pathlib.Path | None:
-    """Queue one compact datapoint if contribution was explicitly enabled."""
+def _queue_line(obs: dict) -> pathlib.Path | None:
     if not telemetry_config().get("enabled"): return None
     QUEUE.mkdir(parents=True,exist_ok=True)
     p=QUEUE/"live.ndjson"
     with p.open("a") as f: f.write(json.dumps(_sanitize_observation(obs),separators=(",",":"))+"\n")
     return p
+
+
+def queue_observation(obs: dict) -> pathlib.Path | None:
+    """Queue one compact datapoint if contribution is enabled."""
+    return _queue_line(obs)
+
+
+def queue_performance(model: str, backend: str, artifact: str | None, *, load_time_s: float | None = None,
+                      depths: list[dict] | None = None, context: int | None = None,
+                      device: dict | None = None, source: str = "pushbutton") -> pathlib.Path | None:
+    """Queue a load-time and/or PP/TG-by-context-depth record.
+
+    ``device`` carries hardware descriptors only (e.g. cpu_platform summary or GPU
+    names); it never contains hostnames, paths or prompt text.
+    """
+    obs={"schema_version":TELEMETRY_SCHEMA,"event":"performance",
+         "timestamp_utc":time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime()),
+         "model":model,"backend":backend,"artifact":artifact,"context":context,"source":source,
+         "load_time_s":round(float(load_time_s),3) if load_time_s is not None else None,"depths":depths}
+    obs.update(device or {})
+    return _queue_line(obs)
+
+
+def device_descriptor(cpu_summary: dict | None = None, strategy: dict | None = None,
+                      gpu_models: list[str] | None = None) -> dict:
+    d: dict = {}
+    if gpu_models:d.update(device="gpu",gpu_models=list(gpu_models))
+    if cpu_summary:
+        d.setdefault("device","cpu")
+        d.update(cpu_model=cpu_summary.get("model_name"),cpu_family=cpu_summary.get("family"),
+                 cpu_tier=cpu_summary.get("tier"),cpu_sockets=cpu_summary.get("sockets"),
+                 cpu_cores=cpu_summary.get("physical_cores"),fast_mem_kind=cpu_summary.get("fast_mem_kind") or None,
+                 fast_mem_mode=cpu_summary.get("fast_mem_mode") or None,
+                 ram_gib=round(cpu_summary["ram_total_mib"]/1024,1) if cpu_summary.get("ram_total_mib") else None)
+    if strategy:
+        d.update(strategy=strategy.get("name"),threads=strategy.get("threads"),
+                 threads_batch=strategy.get("threads_batch"),memory_tier=strategy.get("memory_tier"))
+    return d
 
 
 def queue_report(report: dict) -> pathlib.Path | None:
@@ -108,35 +176,71 @@ def queued_bytes() -> int:
     return sum(p.stat().st_size for p in _queued_files() if p.exists())
 
 
+def upload_url() -> str | None:
+    return telemetry_config().get("upload_url") or os.environ.get("PUSHBUTTON_TELEMETRY_UPLOAD_URL")
+
+
+@contextlib.contextmanager
+def _upload_lock():
+    CONFIG.mkdir(parents=True,exist_ok=True)
+    with (CONFIG/"telemetry.lock").open("a") as fh:
+        if fcntl:fcntl.flock(fh,fcntl.LOCK_EX)
+        try:yield
+        finally:
+            if fcntl:fcntl.flock(fh,fcntl.LOCK_UN)
+
+
+def seconds_until_upload_allowed(cfg: dict | None = None) -> float:
+    cfg=telemetry_config() if cfg is None else cfg
+    last=max(float(cfg.get("last_upload_epoch",0) or 0),float(cfg.get("last_attempt_epoch",0) or 0))
+    return max(0.0,MIN_UPLOAD_INTERVAL_S-(time.time()-last))
+
+
 def upload_pending() -> tuple[int,str]:
-    cfg=telemetry_config(); url=cfg.get("upload_url") or os.environ.get("PUSHBUTTON_TELEMETRY_UPLOAD_URL")
+    """Send the queue to the collector, never more than once per 5 minutes.
+
+    The interval is enforced across processes (broker, proxy, CLIs) with a file
+    lock, and the attempt is recorded *before* sending so failures back off too.
+    """
+    cfg=telemetry_config(); url=upload_url()
     if not cfg.get("enabled"):return 0,"telemetry disabled"
     if not url:return 0,"telemetry enabled; measurements are queued locally because no collector URL is configured"
-    files=_queued_files()
-    if not files:return 0,"nothing queued"
-    lines=[]
-    for p in files:
-        lines.extend(x for x in p.read_text().splitlines() if x.strip())
-    body=gzip.compress(("\n".join(lines)+"\n").encode(),compresslevel=6)
-    req=urllib.request.Request(url,data=body,method="POST",headers={
-        "Content-Type":"application/x-ndjson","Content-Encoding":"gzip",
-        "User-Agent":"PushbuttonLocalCoders-telemetry/2",
-    })
-    with urllib.request.urlopen(req,timeout=15) as r:
-        if not (200<=r.status<300):raise RuntimeError(f"telemetry HTTP {r.status}")
-    for p in files:p.unlink(missing_ok=True)
-    cfg["last_upload_epoch"]=int(time.time()); _write_json(CONFIG/"telemetry.json",cfg)
+    with _upload_lock():
+        cfg=telemetry_config()
+        wait=seconds_until_upload_allowed(cfg)
+        if wait>0:return 0,f"queued locally; next upload allowed in {int(wait)+1}s"
+        files=_queued_files()
+        if not files:return 0,"nothing queued"
+        lines=[]
+        for p in files:
+            lines.extend(x for x in p.read_text().splitlines() if x.strip())
+        cfg["last_attempt_epoch"]=int(time.time()); _write_json(CONFIG/"telemetry.json",cfg)
+        body=gzip.compress(("\n".join(lines)+"\n").encode(),compresslevel=6)
+        req=urllib.request.Request(url,data=body,method="POST",headers={
+            "Content-Type":"application/x-ndjson","Content-Encoding":"gzip",
+            "User-Agent":"PushbuttonLocalCoders-telemetry/2",
+        })
+        with urllib.request.urlopen(req,timeout=15) as r:
+            if not (200<=r.status<300):raise RuntimeError(f"telemetry HTTP {r.status}")
+        for p in files:p.unlink(missing_ok=True)
+        cfg["last_upload_epoch"]=int(time.time()); _write_json(CONFIG/"telemetry.json",cfg)
     return len(lines),f"uploaded {len(lines)} compact datapoint(s) in {len(body)} compressed bytes"
 
 
-def maybe_upload(min_bytes: int = 32768, min_interval_s: int = 900, force: bool = False) -> tuple[int,str]:
-    """Upload gently: at most every 15 minutes unless the queue gets useful-sized."""
+def maybe_upload(min_bytes: int = 0, min_interval_s: int = MIN_UPLOAD_INTERVAL_S, force: bool = False) -> tuple[int,str]:
+    """Upload queued data when due: never more often than every 5 minutes.
+
+    ``force`` (used at shutdown) skips only the optional batching thresholds; the
+    5-minute floor always applies. ``min_bytes`` is kept for API compatibility.
+    """
     cfg=telemetry_config()
     if not cfg.get("enabled"): return 0,"telemetry disabled"
-    age=time.time()-float(cfg.get("last_upload_epoch",0) or 0)
+    last=max(float(cfg.get("last_upload_epoch",0) or 0),float(cfg.get("last_attempt_epoch",0) or 0))
+    age=time.time()-last
     size=queued_bytes()
-    if not force and size<min_bytes and age<min_interval_s:
-        return 0,f"queued locally ({size} bytes); batching before upload"
+    if size==0:return 0,"nothing queued"
+    if age<MIN_UPLOAD_INTERVAL_S or (not force and size<min_bytes and age<max(MIN_UPLOAD_INTERVAL_S,min_interval_s)):
+        return 0,f"queued locally ({size} bytes); next upload allowed in {int(max(0,MIN_UPLOAD_INTERVAL_S-age))+1}s"
     try:return upload_pending()
     except Exception as exc:return 0,f"upload deferred: {exc}"
 

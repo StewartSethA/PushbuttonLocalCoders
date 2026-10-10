@@ -1,0 +1,327 @@
+#!/usr/bin/env python3
+"""Benchmark every applicable CPU launch strategy for a model on this host.
+
+For each strategy from ``lib/cpu_platform.py`` (NUMA binding, MCDRAM/HBM binding,
+thread layout, mmap/mlock) this measures:
+
+* model weight load time (llama-server start to /health ready, GGUF already cached);
+* prompt processing (PP) and token generation (TG) tok/s at each context depth
+  via ``llama-bench -d``.
+
+Results are written to ``benchmarks/cpu/results/*.json`` (schema
+``pushbutton.cpu-bench.v1``) next to the roofline estimate for the same strategy,
+and ``benchmarks/cpu/RESULTS.md`` is regenerated. The planner automatically
+prefers the fastest measured strategy for an identical host layout. When
+telemetry is enabled, each run is queued as a compact performance record.
+"""
+from __future__ import annotations
+import argparse, json, os, pathlib, re, signal, socket, subprocess, sys, time, urllib.request
+
+ROOT = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT / "lib"))
+import cpu_platform  # noqa: E402
+
+RESULTS = cpu_platform.CPU_RESULTS
+SUMMARY = ROOT / "benchmarks/cpu/RESULTS.md"
+GGUF_FROM_LOG = re.compile(r"loaded meta data with .* from (\S+\.gguf)")
+
+
+def say(s: str) -> None:
+    print("[pushbutton-cpu-bench] " + s, file=sys.stderr, flush=True)
+
+
+def free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def healthy(port: int) -> bool:
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=1) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def prefix_for(strategy: cpu_platform.Strategy) -> list[str]:
+    import shutil
+    pre = list(strategy.numactl)
+    if pre and not shutil.which(pre[0]):
+        say(f"{pre[0]} not installed; running {strategy.name} without memory binding")
+        return []
+    return pre
+
+
+def ensure_binaries() -> tuple[pathlib.Path, pathlib.Path]:
+    out = subprocess.run([sys.executable, str(ROOT / "pushbutton-instance"), "--prepare-only", "--cpu", "--with-bench"],
+                         check=True, text=True, stdout=subprocess.PIPE).stdout.strip().splitlines()[-1]
+    server = pathlib.Path(out)
+    return server, server.parent / "llama-bench"
+
+
+def start_server(server: pathlib.Path, model_args: list[str], strategy: cpu_platform.Strategy,
+                 context: int, log: pathlib.Path) -> tuple[subprocess.Popen, int]:
+    port = free_port()
+    cmd = prefix_for(strategy) + [str(server), *model_args, "--host", "127.0.0.1", "--port", str(port),
+                                  "-c", str(context), "--parallel", "1", *strategy.llama_args()]
+    env = os.environ.copy()
+    env.setdefault("LLAMA_CACHE", str(pathlib.Path.home() / ".cache/pushbutton/llama"))
+    log.parent.mkdir(parents=True, exist_ok=True)
+    fh = log.open("wb")
+    proc = subprocess.Popen(cmd, stdout=fh, stderr=subprocess.STDOUT, env=env, start_new_session=True)
+    return proc, port
+
+
+def stop(proc: subprocess.Popen) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+        proc.wait(timeout=20)
+    except Exception:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except Exception:
+            pass
+
+
+def wait_ready(proc: subprocess.Popen, port: int, timeout: float) -> float | None:
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout:
+        if proc.poll() is not None:
+            return None
+        if healthy(port):
+            return time.monotonic() - t0
+        time.sleep(0.2)
+    return None
+
+
+def resolve_gguf(server: pathlib.Path, hf_spec: str, context: int, logdir: pathlib.Path) -> pathlib.Path:
+    """Download (via llama-server -hf) and return the cached GGUF path."""
+    strat = cpu_platform.Strategy("download", 1, 1)
+    log = logdir / "download.log"
+    proc, port = start_server(server, ["-hf", hf_spec], strat, min(context, 4096), log)
+    try:
+        if wait_ready(proc, port, 6 * 3600) is None:
+            raise SystemExit(f"could not download/load {hf_spec}; see {log}")
+    finally:
+        stop(proc)
+    m = GGUF_FROM_LOG.search(log.read_text(errors="replace"))
+    if not m:
+        raise SystemExit(f"could not find GGUF path in {log}")
+    return pathlib.Path(m.group(1))
+
+
+def run_bench(bench: pathlib.Path, gguf: pathlib.Path, strategy: cpu_platform.Strategy, depths: list[int],
+              pp: int, tg: int, reps: int, kv: str) -> dict[int, dict]:
+    """PP uses threads_batch and TG uses threads, matching llama-server's split."""
+    rows: dict[int, dict] = {d: {"depth": d} for d in depths}
+    dstr = ",".join(map(str, depths))
+    common = ["-m", str(gguf), "-d", dstr, "-r", str(reps), "-o", "json", "-fa", "1", "-ctk", kv, "-ctv", kv]
+    for kind, n_args, threads in (("pp", ["-p", str(pp), "-n", "0"], strategy.threads_batch),
+                                  ("tg", ["-p", "0", "-n", str(tg)], strategy.threads)):
+        cmd = prefix_for(strategy) + [str(bench), *common, *n_args, *strategy.bench_args(threads)]
+        say(" ".join(cmd))
+        cp = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if cp.returncode != 0:
+            say(f"llama-bench {kind} failed for {strategy.name}: {cp.stderr.strip()[-400:]}")
+            continue
+        for x in parse_bench_json(cp.stdout):
+            d = int(x.get("n_depth") or 0)
+            if d in rows and x.get("avg_ts") is not None:
+                rows[d][f"{kind}_tps"] = round(float(x["avg_ts"]), 2)
+    return rows
+
+
+def parse_bench_json(text: str) -> list[dict]:
+    try:
+        obj = json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("[")
+        obj = json.loads(text[start:]) if start >= 0 else []
+    return obj if isinstance(obj, list) else []
+
+
+def result_name(r: dict) -> str:
+    stamp = r["timestamp_utc"].replace(":", "").replace("-", "")
+    safe = lambda s: re.sub(r"[^A-Za-z0-9._-]+", "-", str(s))
+    return f"{stamp}-{r['cpu']['signature']}-{safe(r['model'])}-{safe(r['quant'])}-{safe(r['strategy']['name'])}.json"
+
+
+def write_summary(results_dir: pathlib.Path = RESULTS, out: pathlib.Path = SUMMARY) -> str:
+    rows = cpu_platform.load_results(results_dir)
+    lines = [
+        "# CPU strategy benchmarks",
+        "",
+        "Generated by `pushbutton-cpu-bench --summarize` from `benchmarks/cpu/results/*.json`.",
+        "Each row is one measured launch strategy; **bold** marks the strategy the planner will",
+        "pick for that host layout (`signature`), model and quant. Values are measured tok/s with",
+        "the roofline estimate in parentheses. Reference estimates for CPUs without measurements",
+        "are in [ESTIMATES.md](ESTIMATES.md).",
+        "",
+    ]
+    if not rows:
+        lines.append("_No measurements recorded yet. Run `./pushbutton-cpu-bench MODEL` on a CPU host._")
+        text = "\n".join(lines) + "\n"
+        out.write_text(text)
+        return text
+    best: dict[tuple, tuple[float, str]] = {}
+    for r in rows:
+        tgs = [x for x in r.get("depths", []) if x.get("tg_tps")]
+        if tgs:
+            key = (r["cpu"]["signature"], r["model"], r["quant"])
+            tg = min(tgs, key=lambda x: x["depth"])["tg_tps"]
+            if key not in best or tg > best[key][0]:
+                best[key] = (tg, r["strategy"]["name"])
+    rows.sort(key=lambda r: (r["cpu"].get("model_name", ""), r["model"], r["quant"], r["strategy"]["name"]))
+    lines += ["| date | CPU | signature | model | quant | strategy | threads | load s | PP / TG per depth |",
+              "|---|---|---|---|---|---|---:|---:|---|"]
+    for r in rows:
+        key = (r["cpu"]["signature"], r["model"], r["quant"])
+        name = r["strategy"]["name"]
+        if best.get(key, (0, None))[1] == name:
+            name = f"**{name}**"
+
+        def cell(x):
+            pp = x.get("pp_tps")
+            tg = x.get("tg_tps")
+            est = f" ({x['pp_tps_estimate']:.0f} / {x['tg_tps_estimate']:.1f})" if x.get("tg_tps_estimate") is not None else ""
+            return f"@{x['depth']}: {pp if pp is not None else '-'} / {tg if tg is not None else '-'}{est}"
+        depths = "<br>".join(cell(x) for x in r.get("depths", []))
+        load = f"{r['load_time_s']:.1f}" if r.get("load_time_s") is not None else "-"
+        threads = f"{r['strategy'].get('threads')}/{r['strategy'].get('threads_batch')}"
+        lines.append(f"| {r['timestamp_utc'][:10]} | {r['cpu'].get('model_name', '?')} | {r['cpu']['signature']} | "
+                     f"{r['model']} | {r['quant']} | {name} | {threads} | {load} | {depths} |")
+    text = "\n".join(lines) + "\n"
+    out.write_text(text)
+    return text
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="pushbutton-cpu-bench", description=__doc__.split("\n\n")[0])
+    ap.add_argument("models", nargs="*", help="planner model ids (e.g. qwen3.6:35b ornith-1.5:9b)")
+    ap.add_argument("--quant", help="force a quant instead of the automatic CPU/MCDRAM choice")
+    ap.add_argument("--gguf", help="benchmark a local GGUF file instead of downloading the planner profile")
+    ap.add_argument("--label", help="model label for --gguf results")
+    ap.add_argument("--strategies", default="all", help="comma-separated strategy names or 'all'")
+    ap.add_argument("--depths", default=",".join(map(str, cpu_platform.DEFAULT_DEPTHS)))
+    ap.add_argument("--context", type=int, default=32768)
+    ap.add_argument("--pp", type=int, default=512)
+    ap.add_argument("--tg", type=int, default=64)
+    ap.add_argument("--reps", type=int, default=2)
+    ap.add_argument("--kv", default="q8_0")
+    ap.add_argument("--load-timeout", type=float, default=1800)
+    ap.add_argument("--results-dir", default=str(RESULTS))
+    ap.add_argument("--dry-run", action="store_true", help="print the strategies and estimates; run nothing")
+    ap.add_argument("--summarize", action="store_true", help="only regenerate benchmarks/cpu/RESULTS.md")
+    ap.add_argument("--estimates", action="store_true", help="regenerate benchmarks/cpu/ESTIMATES.md")
+    ap.add_argument("--no-telemetry", action="store_true")
+    a = ap.parse_args(argv)
+    results_dir = pathlib.Path(a.results_dir)
+    if a.estimates:
+        (ROOT / "benchmarks/cpu/ESTIMATES.md").write_text(cpu_platform.estimates_markdown())
+        say("wrote benchmarks/cpu/ESTIMATES.md")
+    if a.summarize:
+        write_summary(results_dir, results_dir.parent / "RESULTS.md")
+        say(f"wrote {results_dir.parent / 'RESULTS.md'}")
+    if a.summarize or a.estimates:
+        return 0
+    if not a.models and not a.gguf:
+        ap.error("give at least one MODEL or --gguf PATH")
+    depths = sorted({int(x) for x in a.depths.split(",") if x.strip()})
+    info = cpu_platform.detect()
+    say(f"host: {info.model_name} ({info.tier}, {info.sockets} socket(s), {info.physical_cores} cores, "
+        f"{len(info.numa)} NUMA node(s), fast memory: {info.fast_mem_kind or 'none'} {info.fast_mem_mode})")
+    import claude_local_plan as base
+    import pushbutton_capacity as capacity
+    jobs = []
+    if a.gguf:
+        gguf = pathlib.Path(a.gguf)
+        size_mib = int(gguf.stat().st_size / 2**20)
+        jobs.append((a.label or gguf.stem, a.quant or "local", None, gguf, int(size_mib * 1.2) + 1024, None))
+    for m in a.models:
+        model = base.canonical_model(m)
+        settings = capacity.resolve_options({"quant": a.quant} if a.quant else {}, a.context)
+        choice = cpu_platform.choose_profile(model, settings, info)
+        if choice is None:
+            raise SystemExit(f"no CPU quant of {model} fits this host at context {a.context:,}")
+        jobs.append((model, choice.profile.quant, choice.profile.hf_spec, None, choice.required_mib, choice))
+    spec = cpu_platform.detected_spec(info)
+    server = bench = None
+    for model, quant, hf_spec, gguf, required, choice in jobs:
+        strategies = cpu_platform.candidate_strategies(info, required)
+        if a.strategies != "all":
+            wanted = {x.strip() for x in a.strategies.split(",")}
+            strategies = [s for s in strategies if s.name in wanted]
+        say(f"{model} / {quant}: {len(strategies)} strategies, ~{required:,} MiB")
+        for s in strategies:
+            est = None
+            if model in cpu_platform.MODEL_ARCH:
+                est = cpu_platform.estimate(spec, model, quant, depths, a.kv,
+                                            memory_tier=s.memory_tier if s.memory_tier != "dram" else None,
+                                            required_mib=required)
+            if a.dry_run:
+                print(json.dumps({"model": model, "quant": quant, "strategy": s.to_dict(), "estimate": est}, indent=2))
+        if a.dry_run:
+            continue
+        if server is None:
+            server, bench = ensure_binaries()
+        logdir = pathlib.Path(os.environ.get("PUSHBUTTON_CACHE_DIR", pathlib.Path.home() / ".cache/pushbutton")) / "cpu-bench"
+        if gguf is None:
+            gguf = resolve_gguf(server, hf_spec, a.context, logdir)
+        for s in strategies:
+            say(f"strategy {s.name}: {s.note}")
+            log = logdir / f"{model.replace(':', '-')}-{quant}-{s.name}.log"
+            proc, port = start_server(server, ["-m", str(gguf)], s, a.context, log)
+            try:
+                load = wait_ready(proc, port, a.load_timeout)
+            finally:
+                stop(proc)
+            if load is None:
+                say(f"{s.name}: server failed to load (see {log}); skipping")
+                continue
+            measured = run_bench(bench, gguf, s, depths, a.pp, a.tg, a.reps, a.kv)
+            est = None
+            if model in cpu_platform.MODEL_ARCH:
+                est = cpu_platform.estimate(spec, model, quant, depths, a.kv,
+                                            memory_tier=s.memory_tier if s.memory_tier != "dram" else None,
+                                            required_mib=required)
+                for e in est["depths"]:
+                    measured[e["depth"]]["pp_tps_estimate"] = e["pp_tps"]
+                    measured[e["depth"]]["tg_tps_estimate"] = e["tg_tps"]
+            result = {
+                "schema": "pushbutton.cpu-bench.v1",
+                "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "cpu": info.summary(),
+                "build_tag": cpu_platform.build_tag(info, cpu_platform.cmake_flags(info)),
+                "model": model, "quant": quant, "context": a.context, "kv": a.kv,
+                "strategy": s.to_dict(), "load_time_s": round(load, 2),
+                "load_time_estimate_s": est["load_time_s"] if est else None,
+                "bench": {"pp_tokens": a.pp, "tg_tokens": a.tg, "reps": a.reps},
+                "depths": [measured[d] for d in depths],
+            }
+            results_dir.mkdir(parents=True, exist_ok=True)
+            out = results_dir / result_name(result)
+            out.write_text(json.dumps(result, indent=2) + "\n")
+            say(f"{s.name}: load {load:.1f}s; " + ", ".join(
+                f"@{r['depth']} PP {r.get('pp_tps', '-')} TG {r.get('tg_tps', '-')}" for r in result["depths"]) + f" -> {out}")
+            if not a.no_telemetry:
+                try:
+                    import pushbutton_metrics as metrics
+                    metrics.queue_performance(model, "llama.cpp", quant, load_time_s=load, depths=result["depths"],
+                                              context=a.context, source="pushbutton-cpu-bench",
+                                              device=metrics.device_descriptor(info.summary(), s.to_dict()))
+                except Exception as exc:
+                    say(f"telemetry skipped: {exc}")
+    if not a.dry_run:
+        write_summary(results_dir, results_dir.parent / "RESULTS.md")
+        if not a.no_telemetry:
+            try:
+                import pushbutton_metrics as metrics
+                say("telemetry: " + metrics.maybe_upload()[1])
+            except Exception as exc:
+                say(f"telemetry skipped: {exc}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

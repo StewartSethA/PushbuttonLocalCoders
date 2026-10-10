@@ -282,6 +282,9 @@ class Handler(BaseHTTPRequestHandler):
         estimated_pt=measured_pt is None and not token_source.startswith('backend-tokenizer')
         ttft=(first-start) if first else None
         obs={'schema_version':1,'timestamp_utc':now_iso(),'model':inst.model,'backend':inst.backend,'artifact':inst.artifact,'context':inst.context_limit(),'prompt_tokens':pt,'completion_tokens':ct,'prompt_tokens_estimated':estimated_pt,'completion_tokens_estimated':measured_ct is None,'pp':(pt/ttft if ttft and not estimated_pt else None),'tg':((ct-1)/(end-first) if ct is not None and first and end>first and ct>1 else None),'ttft':ttft,'elapsed_s':end-start,'concurrency':max(1,int(admitted_concurrency)),'source':'normal-use','method':'broker','status_code':status}
+        obs.update(getattr(inst,'telemetry_device',None) or {})
+        if obs['pp'] is not None or obs['tg'] is not None:
+            obs['depths']=[{'depth':pt,'pp_tps':obs['pp'],'tg_tps':obs['tg']}] if isinstance(pt,(int,float)) else None
         metrics.save_observation(obs); metrics.queue_observation(obs); metrics.maybe_upload()
 
 

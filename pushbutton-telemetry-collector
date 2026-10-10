@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""Public telemetry ingest API that appends records to this repository.
+
+POST /v1/telemetry with gzip or plain NDJSON (one compact record per line, as
+sent by ``lib/pushbutton_metrics.upload_pending``). Each accepted record is
+whitelisted, stamped with the server receive time (``received_utc``) and the
+sender's IP address (``sender_ip``), and appended to
+``telemetry/records/YYYY-MM-DD.ndjson``.
+
+Protections: one accepted upload per sender IP per 5 minutes (HTTP 429 with
+Retry-After otherwise), compressed/decompressed size limits, a per-upload record
+cap and field whitelisting. ``X-Forwarded-For`` is only honoured with
+``--trust-forwarded-for`` (use behind a reverse proxy you control).
+
+With ``--git-commit`` the collector commits new records every ``--commit-interval``
+seconds, and ``--git-push`` also pushes using the operator's own git credentials.
+No credentials are ever shipped to clients.
+"""
+from __future__ import annotations
+import argparse, gzip, io, ipaddress, json, pathlib, subprocess, sys, threading, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+ROOT = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT / "lib"))
+import pushbutton_metrics as metrics  # noqa: E402
+
+RECORDS = ROOT / "telemetry/records"
+MAX_BODY = 256 * 1024
+MAX_DECOMPRESSED = 4 * 1024 * 1024
+MAX_RECORDS = 2000
+RATE_LIMIT_S = metrics.MIN_UPLOAD_INTERVAL_S
+
+
+def client_ip(handler: BaseHTTPRequestHandler, trust_forwarded: bool) -> str:
+    ip = handler.client_address[0]
+    if trust_forwarded:
+        fwd = handler.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+        try:
+            ip = str(ipaddress.ip_address(fwd))
+        except ValueError:
+            pass
+    return ip
+
+
+def decode_body(raw: bytes, encoding: str) -> list[dict]:
+    if encoding.lower() == "gzip":
+        with gzip.GzipFile(fileobj=io.BytesIO(raw)) as g:
+            raw = g.read(MAX_DECOMPRESSED + 1)
+        if len(raw) > MAX_DECOMPRESSED:
+            raise ValueError("decompressed body too large")
+    out = []
+    for line in raw.decode("utf-8").splitlines():
+        if not line.strip():
+            continue
+        obj = json.loads(line)
+        if isinstance(obj, dict):
+            out.append(obj)
+        if len(out) > MAX_RECORDS:
+            raise ValueError("too many records")
+    return out
+
+
+class Collector:
+    def __init__(self, records: pathlib.Path, rate_limit_s: float = RATE_LIMIT_S, clock=time.time):
+        self.records = records
+        self.rate_limit_s = rate_limit_s
+        self.clock = clock
+        self.last_by_ip: dict[str, float] = {}
+        self.lock = threading.Lock()
+        self.dirty = False
+
+    def reserve(self, ip: str) -> int:
+        """Atomically claim this IP's upload slot; return seconds to wait if taken."""
+        with self.lock:
+            now = self.clock()
+            last = self.last_by_ip.get(ip)
+            if last is not None and now - last < self.rate_limit_s:
+                return int(self.rate_limit_s - (now - last)) + 1
+            self.last_by_ip[ip] = now
+            if len(self.last_by_ip) > 100_000:
+                cutoff = now - self.rate_limit_s
+                self.last_by_ip = {k: v for k, v in self.last_by_ip.items() if v >= cutoff}
+            return 0
+
+    def ingest(self, ip: str, rows: list[dict]) -> int:
+        now = self.clock()
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+        lines = []
+        for row in rows:
+            clean = metrics._sanitize_observation(row)
+            if not clean:
+                continue
+            lines.append(json.dumps({"received_utc": stamp, "sender_ip": ip, **clean},
+                                    separators=(",", ":"), sort_keys=True))
+        with self.lock:
+            if lines:
+                self.records.mkdir(parents=True, exist_ok=True)
+                with (self.records / f"{stamp[:10]}.ndjson").open("a") as f:
+                    f.write("\n".join(lines) + "\n")
+                self.dirty = True
+        return len(lines)
+
+
+def make_handler(collector: Collector, trust_forwarded: bool):
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "PushbuttonTelemetry/1"
+
+        def _json(self, code: int, obj: dict, headers: dict | None = None) -> None:
+            data = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            for k, v in (headers or {}).items():
+                self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            if self.path in {"/health", "/v1/health"}:
+                return self._json(200, {"ok": True, "min_interval_s": collector.rate_limit_s})
+            return self._json(404, {"error": "not found"})
+
+        def do_POST(self):
+            if self.path not in {"/", "/v1/telemetry"}:
+                return self._json(404, {"error": "not found"})
+            ip = client_ip(self, trust_forwarded)
+            wait = collector.reserve(ip)
+            if wait:
+                return self._json(429, {"error": "at most one upload per 5 minutes", "retry_after_s": wait},
+                                  {"Retry-After": str(wait)})
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                return self._json(400, {"error": "bad Content-Length"})
+            if length <= 0 or length > MAX_BODY:
+                return self._json(413, {"error": "body too large or empty"})
+            try:
+                rows = decode_body(self.rfile.read(length), self.headers.get("Content-Encoding", ""))
+            except Exception as exc:
+                return self._json(400, {"error": f"invalid NDJSON payload: {type(exc).__name__}"})
+            n = collector.ingest(ip, rows)
+            return self._json(200, {"accepted": n})
+
+        def log_message(self, fmt, *args):
+            sys.stderr.write("[telemetry-collector] " + (fmt % args) + "\n")
+    return Handler
+
+
+def git_committer(collector: Collector, interval: float, push: bool, stop: threading.Event) -> None:
+    while not stop.wait(interval):
+        with collector.lock:
+            dirty, collector.dirty = collector.dirty, False
+        if not dirty:
+            continue
+        try:
+            subprocess.run(["git", "-C", str(ROOT), "add", str(collector.records)], check=True)
+            subprocess.run(["git", "-C", str(ROOT), "commit", "-q", "-m", "telemetry: append records"], check=False)
+            if push:
+                subprocess.run(["git", "-C", str(ROOT), "push", "-q"], check=False)
+        except Exception as exc:
+            sys.stderr.write(f"[telemetry-collector] git commit failed: {exc}\n")
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="pushbutton-telemetry-collector", description=__doc__.split("\n\n")[0])
+    ap.add_argument("--host", default="0.0.0.0")
+    ap.add_argument("--port", type=int, default=8787)
+    ap.add_argument("--records", default=str(RECORDS))
+    ap.add_argument("--trust-forwarded-for", action="store_true")
+    ap.add_argument("--git-commit", action="store_true")
+    ap.add_argument("--git-push", action="store_true")
+    ap.add_argument("--commit-interval", type=float, default=300)
+    a = ap.parse_args(argv)
+    collector = Collector(pathlib.Path(a.records))
+    server = ThreadingHTTPServer((a.host, a.port), make_handler(collector, a.trust_forwarded_for))
+    stop = threading.Event()
+    if a.git_commit or a.git_push:
+        threading.Thread(target=git_committer, args=(collector, a.commit_interval, a.git_push, stop), daemon=True).start()
+    sys.stderr.write(f"[telemetry-collector] listening on {a.host}:{a.port}, appending to {a.records}\n")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop.set()
+        server.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

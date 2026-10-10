@@ -482,14 +482,14 @@ class ContextPolicyTests(unittest.TestCase):
         functions = launcher.split('\ncase "${1:-}" in\n', 1)[0]
         functions = functions.replace('ROOT="$(cd "$(dirname "$SELF")" && pwd)"', f"ROOT={shlex.quote(str(ROOT))}")
         startup = launcher[launcher.index("\nif ! have_cmd python3; then"):launcher.index('\nsource "$LIB/pushbutton_folders.sh"\ninitialize_folders')]
-        startup += launcher[launcher.index("\nif [[ $DRY_RUN -eq 0 ]]; then install_base_deps; ensure_nvidia_driver;"):launcher.index('\nmkdir -p "$STATE_DIR" "$CACHE_DIR"; PLAN_FILE=')]
+        startup += launcher[launcher.index("\nif [[ $DRY_RUN -eq 0 ]]; then install_base_deps; select_accelerator;"):launcher.index('\nmkdir -p "$STATE_DIR" "$CACHE_DIR"; PLAN_FILE=')]
         with tempfile.TemporaryDirectory() as tmp:
             script = pathlib.Path(tmp) / "bootstrap.sh"
             script.write_text(functions + """
 have_cmd() { [[ "$1" != python3 ]]; }
 install_base_deps() { printf 'deps\\n'; }
 python3() { printf 'policy\\n'; }
-ensure_nvidia_driver() { printf 'driver\\n'; }
+select_accelerator() { printf 'driver\\n'; }
 """ + startup)
             result = subprocess.run(["bash", str(script)], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
