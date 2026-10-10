@@ -730,8 +730,10 @@ an unhealthy backend.
 
 Requests through `pushbutton-broker` record the backend's actual
 `timings.prompt_per_second` and `timings.predicted_per_second` when supplied,
-including the final event of streaming responses. Rates can also be derived from
-backend token counts and phase durations. This performs no extra inference or depth sweep.
+including the final event of streaming responses. PP can also be derived from
+backend processed-token counts and prefill duration. TG uses the reported rate,
+since decode-step counting differs between backend versions.
+This performs no extra inference or depth sweep.
 
 Each request produces a `performance` line in the broker log and a sanitized record in
 `~/.local/share/pushbutton/runtime/observations/YYYY-MM-DD.jsonl`

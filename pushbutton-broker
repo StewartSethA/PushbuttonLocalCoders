@@ -40,7 +40,7 @@ def backend_phase(timings, prefix):
         return value if isinstance(value,(int,float)) and not isinstance(value,bool) and math.isfinite(value) and value>=0 else None
     count=number(prefix+'_n');duration=number(prefix+'_ms');rate=number(prefix+'_per_second')
     if count == 0 or duration == 0:return None,count,duration
-    if rate is None and count is not None and duration is not None:
+    if prefix=='prompt' and rate is None and count is not None and duration is not None:
         rate=1000*count/duration
     return rate if rate is not None and rate>0 else None,count,duration
 

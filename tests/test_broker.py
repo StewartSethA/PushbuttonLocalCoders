@@ -115,9 +115,14 @@ class BrokerTests(unittest.TestCase):
         self.assertEqual((obs['pp_method'],obs['tg_method']),('broker-ttft','broker-stream'))
         self.assertGreater(obs['pp'],0);self.assertGreater(obs['tg'],0)
     def test_backend_duration_rate_derivation(self):
-        FakeState.timings={'prompt_n':2,'prompt_ms':20,'predicted_n':4,'predicted_ms':200}
+        FakeState.timings={'prompt_n':2,'prompt_ms':20,'predicted_n':4,'predicted_ms':200,'predicted_per_second':15}
         self.request();obs=self.observation()
-        self.assertEqual((obs['pp'],obs['tg']),(100,20))
+        self.assertEqual((obs['pp'],obs['tg']),(100,15))
+    def test_missing_decode_rate_is_not_derived_with_backend_dependent_token_semantics(self):
+        FakeState.timings={'predicted_n':4,'predicted_ms':200}
+        self.request();obs=self.observation()
+        self.assertNotIn('tg',obs)
+        self.assertEqual(obs['tg_method'],'unavailable')
     def test_nonstream_without_timings_does_not_invent_rates(self):
         self.request();obs=self.observation()
         self.assertNotIn('pp',obs);self.assertNotIn('tg',obs)
