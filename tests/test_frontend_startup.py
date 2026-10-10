@@ -368,6 +368,10 @@ class StartupTests(unittest.TestCase):
             "'preflight':os.environ.get('CODER_LOCAL_STARTUP_ONLY'), "
             "'claude_preflight':os.environ.get('CLAUDE_LOCAL_STARTUP_ONLY'), "
             "'web_mcp':os.environ.get('CLAUDE_LOCAL_WEB_MCP'), "
+            "'disable_telemetry':os.environ.get('DISABLE_TELEMETRY'), "
+            "'disable_error_reporting':os.environ.get('DISABLE_ERROR_REPORTING'), "
+            "'do_not_track':os.environ.get('DO_NOT_TRACK'), "
+            "'otel_disabled':os.environ.get('OTEL_SDK_DISABLED'), "
             "'swarm':os.environ.get('MINI_SWE_SWARM_TASK')}))\n")
 
     def recorded(self, name, args=()):
@@ -408,6 +412,17 @@ class StartupTests(unittest.TestCase):
                 self.assertEqual(record["argv"][:3], ["--frontend", name, "--menu"])
                 self.assertIsNone(record["preflight"])
                 self.assertFalse((self.root / "state").exists())
+
+    def test_no_telemetry_flag_reaches_every_frontend_without_disabling_it(self):
+        self.selector_recorder()
+        for name in FRONTENDS + WRAPPERS:
+            with self.subTest(frontend=name):
+                record = self.recorded(name, ["--no-telemetry"])
+                self.assertEqual(record["disable_telemetry"], "1")
+                self.assertEqual(record["disable_error_reporting"], "1")
+                self.assertEqual(record["do_not_track"], "1")
+                self.assertEqual(record["otel_disabled"], "true")
+                self.assertIn("--launch-arg=--no-telemetry", record["argv"])
 
     def test_default_client_context_is_left_to_selector_clamping(self):
         self.selector_recorder()

@@ -160,6 +160,13 @@ budget. Current upstream framework mappings are:
 | Claude Code | Shared-role budgets are bounded by verified per-slot capacity; `CLAUDE_CODE_AUTO_COMPACT_WINDOW` and `CLAUDE_CODE_MAX_OUTPUT_TOKENS` are configured explicitly in isolated settings. The supported compact window must be at least 100,000 tokens; smaller configurations fail with guidance rather than clamping upward. |
 | mini-SWE / DeepSeek Harness | Requests use guarded endpoints; mini-SWE receives per-worker output limits. No verified framework autocompact override is assumed for these adapters. |
 
+Pass `--no-telemetry` to any local frontend (or `pushbutton-select`) to set
+framework opt-out switches for telemetry, error reporting, OpenTelemetry, and
+tracking before the client starts. Pushbutton's own opt-in measurement queue is
+also disabled persistently. This does not disable local inference, MCP, or
+explicit web/search integrations. The flag must precede `--` when the frontend
+uses `--` to separate its own options.
+
 These mappings follow current upstream
 [Qwen compression](https://github.com/QwenLM/qwen-code/blob/main/packages/core/src/services/chatCompressionService.ts),
 [Hermes compression](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/developer-guide/context-compression-and-caching.md),
@@ -172,6 +179,10 @@ that bound up to the allocated slots, without proving a throughput SLA.
 The broker may promote default admission after calibration, while an explicit
 admission cap remains binding. `min_tps` is checked against broker calibration
 evidence; direct frontend launches warn when its throughput is unproven.
+The former `route admission limit reached; retry later` HTTP 429 was generated
+locally when the frontend's admission semaphore stayed busy for 60 seconds; it
+was not a telemetry or external-provider request. Local gateway requests now
+wait in the route queue for their admission slot instead of expiring as a 429.
 Large tool results can cross a threshold in one turn: summarize or limit them
 before retrying an oversized request. History is never silently discarded by
 the request guard.

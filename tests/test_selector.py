@@ -125,6 +125,17 @@ class SelectorTests(unittest.TestCase):
             self.assertTrue(cfg['enabled'])
             self.assertIn('Opt-in telemetry enabled', err)
 
+    def test_no_telemetry_alias_persists_opt_out(self):
+        with tempfile.TemporaryDirectory(dir=FIXTURE_DIR) as td:
+            with mock.patch.object(selector.metrics, 'CONFIG', pathlib.Path(td)):
+                code, _, err, _, _ = self.run_sel(
+                    'qwen3.8:27b', '--vram-limit', '16G', '--no-interactive',
+                    '--no-telemetry', gpus=selector.workers.synthetic_3090(1))
+            cfg = json.loads((pathlib.Path(td) / 'telemetry.json').read_text())
+            self.assertEqual(code, 0)
+            self.assertFalse(cfg['enabled'])
+            self.assertIn('Telemetry disabled', err)
+
     def test_help_before_inventory(self):
         with self.assertRaises(SystemExit) as cm:
             with mock.patch.object(selector, 'gpu_inventory', side_effect=AssertionError('hardware accessed')):
