@@ -1,0 +1,17 @@
+# Deploy: see telemetry/README.md ("Hosted destination").
+name = "pushbutton-telemetry"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+
+[vars]
+# Private repository that receives the raw (hashed-IP) records.
+DATA_REPO = "StewartSethA/pushbutton-telemetry-data"
+DATA_BRANCH = "main"
+
+# Optional per-sender 5-minute limit. Create with `npx wrangler kv namespace create RATE_KV`
+# and paste the id here, then uncomment.
+# [[kv_namespaces]]
+# binding = "RATE_KV"
+# id = "<kv namespace id>"
+
+# Secrets (never committed): npx wrangler secret put GITHUB_TOKEN ; npx wrangler secret put IP_SALT

@@ -193,7 +193,11 @@ for w in p['workers']:
  x=w['profile']; gs=','.join(str(g['index']) for g in w['gpus'])
  cap=w.get('vram_limit_mib_per_gpu')
  lease=f"  lease={cap/1024:.1f} GiB/GPU" if cap else ""
- print(f"  agent {w['worker']}: {w['model']} / {x['quant']} -> GPU[{gs}] ({len(w['gpus'])} GPU{'s' if len(w['gpus'])!=1 else ''}){lease}")
+ if w.get('device')=='cpu':
+  st=w['cpu']['strategy']; h=w['cpu']['host']; e=w['cpu']['estimate']['depths'][0]
+  print(f"  agent {w['worker']}: {w['model']} / {x['quant']} -> CPU {h['model_name']} [{h['tier']}] strategy={st['name']} threads={st['threads']}/{st['threads_batch']} memory={st['memory_tier']} est. TG~{e['tg_tps']} PP~{e['pp_tps']} tok/s")
+ else:
+  print(f"  agent {w['worker']}: {w['model']} / {x['quant']} -> GPU[{gs}] ({len(w['gpus'])} GPU{'s' if len(w['gpus'])!=1 else ''}){lease}")
  c=w['capacity']
  print(f"    slots={c['slots']} hard={c['context']} input={c['input_tokens']} output={c['output_tokens']} client={c['client_context']} compact={c['compact_trigger']} estimated-memory={w['required_mib']/1024:.2f} GiB")
  if c.get('min_tps') is not None:
@@ -259,11 +263,19 @@ start_backends(){
    local -a cmd=("$LLAMA_SERVER" -m "$model_path" --alias "$id" --no-mmproj -ngl 999 -c "$((context * slots))" -np "$slots" --cache-type-k "$kvk" --cache-type-v "$kvv" -b "$batch" -ub "$ubatch" -fa "$fa" --jinja --no-context-shift --host 127.0.0.1 --port "$port")
    [[ "$multi" == 1 ]] && cmd+=(--split-mode layer)
    [[ "$template" == qwen-fixed ]] && cmd+=(--chat-template-file "$QWEN_TEMPLATE")
+   local -a cpu_prefix=() cpu_args=()
+   if [[ -z "$gpus" ]]; then
+     mapfile -d '' -t cpu_prefix < <(python3 "$ROOT/lib/cpu_platform.py" launch-args --plan "$PLAN_FILE" --id "$id" prefix)
+     mapfile -d '' -t cpu_args < <(python3 "$ROOT/lib/cpu_platform.py" launch-args --plan "$PLAN_FILE" --id "$id" --server "$LLAMA_SERVER" args)
+     if ((${#cpu_prefix[@]})) && ! have "${cpu_prefix[0]}"; then say "${cpu_prefix[0]} not installed; starting agent $worker without NUMA/MCDRAM binding"; cpu_prefix=(); fi
+     cmd+=("${cpu_args[@]}"); vramcap=""
+   fi
    local -a envcmd=(env "CUDA_VISIBLE_DEVICES=$gpus" "LLAMA_CACHE=$CACHE_DIR" "GGML_CUDA_ENABLE_UNIFIED_MEMORY=0")
    if [[ -n "$envpairs" ]]; then local -a pairs; IFS=';' read -ra pairs<<<"$envpairs"; local pair; for pair in "${pairs[@]}";do envcmd+=("$pair");done;fi
-   say "Starting agent $worker: $hf on GPU(s) [$gpus]${vramcap:+ with ${vramcap} MiB/GPU lease}${note:+ — $note}"
+   if [[ -z "$gpus" ]]; then say "Starting agent $worker: $hf on CPU (${cpu_args[*]}${cpu_prefix:+ via ${cpu_prefix[*]}})"
+   else say "Starting agent $worker: $hf on GPU(s) [$gpus]${vramcap:+ with ${vramcap} MiB/GPU lease}${note:+ — $note}"; fi
    printf '[coder-local] Follow agent %s logs in another terminal:\n  tail -n 50 -F -- %q\n' "$worker" "$log" >&2
-   "${envcmd[@]}" "${cmd[@]}" > >(tee -a "$log" >&2) 2>&1 & pid=$!; PIDS+=("$pid")
+   "${envcmd[@]}" "${cpu_prefix[@]}" "${cmd[@]}" > >(tee -a "$log" >&2) 2>&1 & pid=$!; PIDS+=("$pid")
    until curl -fsS "http://127.0.0.1:$port/health" >/dev/null 2>&1; do
      kill -0 "$pid" 2>/dev/null || { failed=1;break;}; sleep 1; waited=$((waited+1)); ((waited%30==0))&&say "Still loading agent $worker (${waited}s)..."
    done
@@ -418,7 +430,11 @@ fi
 [[ "${CODER_LOCAL_STARTUP_ONLY:-0}" != 1 || $PLAN_ONLY -eq 1 ]] || exit 125
 [[ -z "$AGENTS" ]]||[[ "$AGENTS" =~ ^[1-8]$ ]]||die "--agents must be 1..8"
 [[ "$CTX" =~ ^[0-9]+$ && "$CLIENT_CTX" =~ ^[0-9]+$ ]]||die "context values must be integers"
-for c in git cmake ninja python3 curl tar flock nvidia-smi;do have "$c"||die "$c is required";done
+for c in git cmake python3 curl tar flock;do have "$c"||die "$c is required";done
+# Without a working NVIDIA GPU every agent is deployed on the CPU automatically.
+if have nvidia-smi && nvidia-smi >/dev/null 2>&1; then have ninja || die "ninja is required"
+elif [[ "${PUSHBUTTON_DISABLE_CPU_FALLBACK:-0}" == 1 ]]; then die "nvidia-smi is required"
+else ((QUIET)) || say "No NVIDIA GPU detected; deploying agents on the CPU with host-specific llama.cpp optimizations."; fi
 source "$ROOT/lib/pushbutton_folders.sh"
 initialize_folders "$QUIET"
 LOCK_FILE="${CLAUDE_LOCAL_LOCK_FILE:-$STATE_DIR/startup.lock}"
@@ -436,7 +452,11 @@ if ((PLAN_ONLY)); then
 fi
 validate_plan_download_space "$PLAN_FILE" "$CACHE_DIR" || exit 2
 source "$ROOT/lib/pushbutton_download.sh"
-source "$HOSTCC_SH"; claude_local_prepare_hostcc; activate_cuda; ensure_llamacpp; grep -q '"template": "qwen-fixed"' "$PLAN_FILE" && fetch_qwen_template || true; start_backends
+if python3 "$ROOT/lib/cpu_platform.py" plan-is-cpu "$PLAN_FILE"; then
+  LLAMA_SERVER="$(PUSHBUTTON_RUNTIME_STATE="$STATE_DIR/runtime" python3 "$ROOT/pushbutton-instance" --prepare-only --cpu | tail -1)"
+  [[ -x "$LLAMA_SERVER" ]] || die "CPU llama.cpp build failed"
+else source "$HOSTCC_SH"; claude_local_prepare_hostcc; activate_cuda; ensure_llamacpp; fi
+grep -q '"template": "qwen-fixed"' "$PLAN_FILE" && fetch_qwen_template || true; start_backends
 start_capacity_proxy
 say "Qwen uses per-model client/output budgets and the earliest configured global auto-compaction threshold."
 flock -u "$STARTUP_LOCK_FD"; eval "exec ${STARTUP_LOCK_FD}>&-"; STARTUP_LOCK_FD=""

@@ -164,6 +164,24 @@ ensure_nvidia_driver() {
     die "NVIDIA hardware exists but nvidia-smi is unavailable; install/load the NVIDIA driver and rerun"
 }
 
+# CPU_MODE=1 deploys every model on the CPU (automatic when no NVIDIA GPU exists).
+CPU_MODE=0
+select_accelerator() {
+    if have_cmd nvidia-smi && nvidia-smi >/dev/null 2>&1; then return 0; fi
+    if [[ "${PUSHBUTTON_DISABLE_CPU_FALLBACK:-0}" == 1 ]] || { have_cmd lspci && lspci -nn 2>/dev/null | grep -qi NVIDIA; }; then
+        [[ "${1:-}" == dry ]] && die "nvidia-smi required for dry run"
+        ensure_nvidia_driver; return 0
+    fi
+    CPU_MODE=1
+    ((QUIET)) || say "No NVIDIA GPU detected; deploying all models on the CPU with host-specific llama.cpp optimizations."
+}
+
+ensure_llamacpp_cpu() {
+    # ISA-specific CPU build (AVX2/AVX-512/VNNI/BF16/AMX, KNL tuning) via the shared instance builder.
+    LLAMA_SERVER="$(PUSHBUTTON_RUNTIME_STATE="$STATE_DIR/runtime" python3 "$ROOT/pushbutton-instance" --prepare-only --cpu | tail -1)"
+    [[ -x "$LLAMA_SERVER" ]] || die "CPU llama.cpp build failed"
+}
+
 install_claude_code() {
     have_cmd claude && return 0
     say "Claude Code not found; installing it..."
@@ -391,11 +409,19 @@ start_backends() {
         local -a cmd=("$LLAMA_SERVER" -m "$model_path" --alias "$id" --no-mmproj -ngl 999 -c "$((context * slots))" -np "$slots" --cache-type-k "$kvk" --cache-type-v "$kvv" -b "$batch" -ub "$ubatch" -fa "$fa" --jinja --no-context-shift --host 127.0.0.1 --port "$port")
         [[ "$multi" == 1 ]] && cmd+=(--split-mode layer)
         [[ "$template" == qwen-fixed ]] && cmd+=(--chat-template-file "$QWEN_TEMPLATE")
+        local -a cpu_prefix=() cpu_args=()
+        if [[ -z "$gpus" ]]; then
+            mapfile -d '' -t cpu_prefix < <(python3 "$LIB/cpu_platform.py" launch-args --plan "$PLAN_FILE" --id "$id" prefix)
+            mapfile -d '' -t cpu_args < <(python3 "$LIB/cpu_platform.py" launch-args --plan "$PLAN_FILE" --id "$id" --server "$LLAMA_SERVER" args)
+            if ((${#cpu_prefix[@]})) && ! have_cmd "${cpu_prefix[0]}"; then warn "${cpu_prefix[0]} not installed; starting $id without NUMA/MCDRAM binding"; cpu_prefix=(); fi
+            cmd+=("${cpu_args[@]}")
+        fi
         local -a envcmd=(env "CUDA_VISIBLE_DEVICES=$gpus" "LLAMA_CACHE=$CACHE_DIR" "GGML_CUDA_ENABLE_UNIFIED_MEMORY=$ALLOW_OFFLOAD" "CUDA_SCALE_LAUNCH_QUEUES=4x")
         if [[ -n "$envpairs" ]]; then local -a pairs; IFS=';' read -ra pairs <<< "$envpairs"; local pair; for pair in "${pairs[@]}"; do envcmd+=("$pair"); done; fi
-        say "Starting $id on GPU(s) [$gpus], $hf, hard=$context slots=$slots${note:+ — $note}"
+        if [[ -z "$gpus" ]]; then say "Starting $id on CPU (${cpu_args[*]}${cpu_prefix:+ via ${cpu_prefix[*]}}), $hf, hard=$context slots=$slots"
+        else say "Starting $id on GPU(s) [$gpus], $hf, hard=$context slots=$slots${note:+ — $note}"; fi
         printf '[claude-local] Follow %s logs in another terminal:\n  tail -n 50 -F -- %q\n' "$id" "$log" >&2
-        "${envcmd[@]}" "${cmd[@]}" >"$log" 2>&1 & pid=$!; PIDS+=("$pid")
+        "${envcmd[@]}" "${cpu_prefix[@]}" "${cmd[@]}" >"$log" 2>&1 & pid=$!; PIDS+=("$pid")
         follower="$(start_log_follower "$log")"
         while ! curl -fsS "http://127.0.0.1:$port/health" >/dev/null 2>&1; do
             kill -0 "$pid" 2>/dev/null || { failed=1; break; }
@@ -466,6 +492,9 @@ for r in ('haiku','sonnet','opus','fable'): print(f"  {r:6} -> {p['roles'][r]} (
 print('Servers:')
 for s in p['servers']:
  x=s['profile']; gs=', '.join(f"GPU{g['index']} {g['name']} ({g['free_mib']/1024:.1f} GiB free, PCIe Gen{g['pcie_gen']} x{g['pcie_width']})" for g in s['gpus'])
+ if s.get('device')=='cpu':
+  st=s['cpu']['strategy']; h=s['cpu']['host']; e=s['cpu']['estimate']['depths'][0]
+  gs=f"CPU {h['model_name']} [{h['tier']}] strategy={st['name']} threads={st['threads']}/{st['threads_batch']} memory={st['memory_tier']} est. TG~{e['tg_tps']} PP~{e['pp_tps']} tok/s"
  print(f"  {s['id']}: {x['hf_spec']}\n    {gs}\n    KV={x['kv_k']}/{x['kv_v']} batch={x['batch']}/{x['ubatch']} FA={x['flash_attn']} quality-tier={x['quality']}")
  c=s['capacity']
  print(f"    slots={c['slots']} hard={c['context']} input={c['input_tokens']} output={c['output_tokens']} client={c['client_context']} compact={c['compact_trigger']} estimated-memory={s['required_mib']/1024:.2f} GiB")
@@ -644,7 +673,7 @@ source "$LIB/pushbutton_folders.sh"
 initialize_folders "$QUIET"
 ((QUIET)) || say "Claude Code user data: $STATE_DIR/claude-config (isolated local settings/sessions)"
 LOCK_FILE="${CLAUDE_LOCAL_LOCK_FILE:-$STATE_DIR/startup.lock}"
-if [[ $DRY_RUN -eq 0 ]]; then install_base_deps; ensure_nvidia_driver; else have_cmd nvidia-smi || die "nvidia-smi required for dry run"; fi
+if [[ $DRY_RUN -eq 0 ]]; then install_base_deps; select_accelerator; else select_accelerator dry; fi
 mkdir -p "$STATE_DIR" "$CACHE_DIR"; PLAN_FILE="$STATE_DIR/plan.$$.json"
 
 # Serialize only startup/allocation. Existing sessions remain concurrent, but a
@@ -660,7 +689,8 @@ print_plan; [[ $DRY_RUN -eq 1 ]] && exit 0
 validate_plan_download_space "$PLAN_FILE" "$CACHE_DIR" || exit 2
 install_claude_code
 python3 "$BUDGET_PY" --requested "$CTX" --client "$CLIENT_CTX" --plan "$PLAN_FILE" --check-claude -- "${CLAUDE_ARGS[@]}" || exit $?
-prepare_host_compiler; activate_cuda; ensure_llamacpp
+if python3 "$LIB/cpu_platform.py" plan-is-cpu "$PLAN_FILE"; then CPU_MODE=1; ensure_llamacpp_cpu
+else prepare_host_compiler; activate_cuda; ensure_llamacpp; fi
 grep -q '"template": "qwen-fixed"' "$PLAN_FILE" && fetch_qwen_template || true
 start_backends; write_gateway_config; start_gateway
 release_startup_lock

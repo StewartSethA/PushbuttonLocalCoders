@@ -291,6 +291,8 @@ def build_plan(requests: list[WorkerRequest], agents: int | None, gpus: list[bas
                context: int, slots: int = 1, client_context: int | None = None) -> dict:
     capacity.resolve_options({}, context, slots)
     workers = apply_client_context(expand_workers(requests, agents), context, client_context)
+    if not gpus and base.cpu_fallback_enabled():
+        return build_cpu_plan(workers, context, slots)
     choices = choose_workers(workers, gpus, context, slots)
     out = []
     used = 0
@@ -321,6 +323,32 @@ def build_plan(requests: list[WorkerRequest], agents: int | None, gpus: list[bas
         "workers": out,
         "unused_gpus": [asdict(g) for p, g in enumerate(gpus) if not (used & (1 << p))],
     }
+
+
+def build_cpu_plan(workers: list[WorkerRequest], context: int, slots: int = 1) -> dict:
+    """CPU-only worker plan used automatically when no GPU is visible."""
+    import cpu_platform
+    for req in workers:
+        if req.gpu_indices is not None:
+            raise ValueError(f"{req.model} requests GPU(s) {list(req.gpu_indices)}, which are not visible")
+    info = cpu_platform.detect()
+    items = [(r.model, capacity.resolve_options(r.capacity, context, slots)) for r in workers]
+    choices = cpu_platform.place_requests(items, info, [r.vram_limit_mib for r in workers])
+    out = []
+    for i, (req, c) in enumerate(zip(workers, choices), 1):
+        alias = f"local-coder-{i}-{req.model.replace(':','-').replace('.','').replace('_','-')}"
+        out.append({
+            "worker": i, "id": alias, "model": req.model,
+            "profile": {**asdict(c.profile), "extra_env": dict(c.profile.extra_env), "hf_spec": c.profile.hf_spec},
+            "gpus": [], "cuda_visible_devices": "", "multi_gpu": False,
+            "required_mib": c.required_mib, "allocated_mib": c.memory_cap_mib,
+            "headroom_mib": c.memory_cap_mib - c.required_mib,
+            "requested_gpus": None, "vram_limit_mib_per_gpu": req.vram_limit_mib,
+            "placement_source": req.source,
+            "capacity": request_capacity(req, c.profile, context, slots),
+            **cpu_platform.server_fields(c, info),
+        })
+    return {"context": context, "agents": len(workers), "workers": out, "unused_gpus": [], "device": "cpu"}
 
 
 def synthetic_v100(n: int) -> list[base.GPU]:

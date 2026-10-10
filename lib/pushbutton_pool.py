@@ -25,6 +25,7 @@ class Instance:
     queued: int = 0
     healthy: bool = True
     request_capacity: dict[str, Any] = field(default_factory=dict)
+    telemetry_device: dict[str, Any] = field(default_factory=dict)
 
     def accepts_model(self, requested: str) -> bool:
         q=requested.lower()
@@ -68,6 +69,7 @@ def instance_from_dict(x: dict) -> Instance:
         tg_measured=bool(x.get('tg_measured')),active=int(x.get('active') or 0),
         queued=int(x.get('queued') or 0),healthy=bool(x.get('healthy',True)),
         request_capacity=dict(x.get('capacity') or {}),
+        telemetry_device=dict(x.get('telemetry_device') or {}),
     )
 
 
