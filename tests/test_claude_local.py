@@ -406,6 +406,12 @@ class ContextPolicyTests(unittest.TestCase):
             self.assertEqual(captured["args"][i + 1], "WebSearch,WebFetch")
             i = captured["args"].index("--append-system-prompt")
             self.assertIn("exact advertised names", captured["args"][i + 1])
+            for guidance in ("small line ranges", "constrain search results", "dependency directories",
+                             "short handoff", "/clear", "Do not clear history automatically",
+                             "verified backend capacity"):
+                self.assertIn(guidance, captured["args"][i + 1])
+            self.assertEqual(captured["args"].count("--append-system-prompt"), 1)
+            self.assertIn("save a short handoff, then /clear", result.stdout)
             self.assertEqual(user_config.read_text(), '{"autoCompactEnabled":false}')
 
     def test_entry_web_config_is_sticky_and_customizable(self):
