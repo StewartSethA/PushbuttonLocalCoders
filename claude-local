@@ -519,11 +519,11 @@ show_runtime_errors() {
 
 run_claude() {
     local key="claude-local-$RANDOM-$$" role id sonnet_id rc
-    local compact output
-    read -r CLIENT_CTX compact output < <(python3 - "$GATEWAY_CONFIG" <<'PY'
+    local compact output verified_capacity
+    read -r CLIENT_CTX compact output verified_capacity < <(python3 - "$GATEWAY_CONFIG" <<'PY'
 import json,sys
 p=json.load(open(sys.argv[1]))['budget']
-print(p['client_context'],p['compact_window'],p['max_output_tokens'])
+print(p['client_context'],p['compact_window'],p['max_output_tokens'],p['capacity'])
 PY
 )
     export ANTHROPIC_BASE_URL="http://127.0.0.1:$GATEWAY_PORT" ANTHROPIC_AUTH_TOKEN="$key" ANTHROPIC_API_KEY="$key"
@@ -535,7 +535,9 @@ PY
     [[ -z "${CLAUDE_CONFIG_DIR:-}" || "$CLAUDE_CONFIG_DIR" == "$STATE_DIR/claude-config" ]] || warn "Ignoring inherited CLAUDE_CONFIG_DIR; using isolated local settings/session storage."
     export CLAUDE_CONFIG_DIR="$STATE_DIR/claude-config"
     mkdir -p "$CLAUDE_CONFIG_DIR"
-    say "Claude settings/sessions: $CLAUDE_CONFIG_DIR (user/project settings sources disabled for context-policy isolation)"
+    python3 "$BUDGET_PY" --requested "$verified_capacity" --client "$CLIENT_CTX" \
+        --user-settings "$CLAUDE_CONFIG_DIR/settings.json" -- "${CLAUDE_ARGS[@]}" || return $?
+    say "Claude settings/sessions: $CLAUDE_CONFIG_DIR (persistent user settings; project/local sources disabled)"
     unset CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY ANTHROPIC_BEDROCK_BASE_URL ANTHROPIC_VERTEX_BASE_URL || true
     while IFS=$'\t' read -r role id; do
         case "$role" in
@@ -551,7 +553,7 @@ import json,sys
 print(json.load(open(sys.argv[1]))['role_ids']['sonnet'])
 PY
 )"
-    local -a args=(--setting-sources "" --settings '{"autoCompactEnabled":true,"permissions":{"deny":["WebSearch","WebFetch"]}}'
+    local -a args=(--setting-sources user --settings '{"autoCompactEnabled":true,"permissions":{"deny":["WebSearch","WebFetch"]}}'
         --disallowedTools "WebSearch,WebFetch"
         --append-system-prompt "Local web policy: built-in WebSearch/WebFetch are unavailable on this local endpoint. Use the connected MCP search/fetch tools (pushbutton-web by default), using their exact advertised names. If no MCP web tool is connected, explain that web access is unavailable rather than calling web_search or web_fetch.
 Local context policy: keep incoming tool content bounded. Read files in small line ranges and constrain search results to relevant paths and limited matches. Avoid dumping full logs, generated files, or dependency directories; inspect targeted excerpts instead. If more content is needed, retrieve additional small chunks rather than repeating large outputs. Keep handoffs concise: goal, completed changes, decisions, relevant paths, remaining work, and verification. If auto-compaction repeatedly refills within a few turns, suggest preserving a short handoff and using /clear or starting a new session without --continue or --resume. Do not clear history automatically, disable compaction, or increase context without verified backend capacity."

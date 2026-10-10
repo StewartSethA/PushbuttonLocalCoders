@@ -366,6 +366,25 @@ class ContextPolicyTests(unittest.TestCase):
                 with self.assertRaisesRegex(budgetmod.BudgetError, "2.1.221"):
                     budgetmod.claude_capabilities()
 
+    def test_saved_user_settings_preserve_customizations_and_reject_policy_env(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "settings.json"
+            budgetmod.validate_user_settings(path)
+            custom = '{"theme":"dark","permissions":{"allow":["Read"]},"env":{"EDITOR":"vim"}}'
+            path.write_text(custom)
+            budgetmod.validate_user_settings(path)
+            self.assertEqual(path.read_text(), custom)
+            for name in sorted(budgetmod.PROTECTED_SETTINGS_ENV | {
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_API_KEY"}):
+                with self.subTest(name=name):
+                    path.write_text(json.dumps({"env": {name: "override"}}))
+                    with self.assertRaisesRegex(budgetmod.BudgetError, "saved env overrides"):
+                        budgetmod.validate_user_settings(path)
+            for invalid in ("{", "[]", '{"env":[]}'):
+                path.write_text(invalid)
+                with self.assertRaisesRegex(budgetmod.BudgetError, "Claude user settings"):
+                    budgetmod.validate_user_settings(path)
+
     def test_mock_claude_launch_exports_policy_and_isolates_settings(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp = pathlib.Path(tmp)
@@ -380,12 +399,16 @@ class ContextPolicyTests(unittest.TestCase):
             config.write_text(json.dumps({"budget": budgetmod.context_policy(131072, env={})}))
             user_config = tmp / ".claude.json"
             user_config.write_text('{"autoCompactEnabled":false}')
+            saved_settings = tmp / "state" / "claude-config" / "settings.json"
+            saved_settings.parent.mkdir(parents=True)
+            custom = '{"theme":"dark","permissions":{"allow":["Read"]},"autoCompactEnabled":false}'
+            saved_settings.write_text(custom)
             script = tmp / "launch.sh"
             functions = (ROOT / "claude-local").read_text().split('\ncase "${1:-}" in\n', 1)[0]
             functions = functions.replace('ROOT="$(cd "$(dirname "$SELF")" && pwd)"', f"ROOT={shlex.quote(str(ROOT))}")
             script.write_text(functions + f"\nPLAN_FILE={shlex.quote(str(plan))}\n"
                               f"GATEWAY_CONFIG={shlex.quote(str(config))}\nSTATE_DIR={shlex.quote(str(tmp / 'state'))}\n"
-                              "GATEWAY_PORT=18180\nCLAUDE_ARGS=(--resume SESSION)\nrun_claude\n")
+                              "CTX=65536\nGATEWAY_PORT=18180\nCLAUDE_ARGS=(--resume SESSION)\nrun_claude\n")
             env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "DISABLE_"))}
             env.update(HOME=str(tmp), PATH=str(tmp) + ":" + os.environ["PATH"], CAPTURE=str(capture))
             result = subprocess.run(["bash", str(script)], env=env, capture_output=True, text=True)
@@ -397,7 +420,7 @@ class ContextPolicyTests(unittest.TestCase):
             self.assertEqual(captured["env"]["CLAUDE_CONFIG_DIR"], str(tmp / "state" / "claude-config"))
             self.assertIn("--resume", captured["args"])
             i = captured["args"].index("--setting-sources")
-            self.assertEqual(captured["args"][i + 1], "")
+            self.assertEqual(captured["args"][i + 1], "user")
             i = captured["args"].index("--settings")
             settings = json.loads(captured["args"][i + 1])
             self.assertTrue(settings["autoCompactEnabled"])
@@ -413,6 +436,19 @@ class ContextPolicyTests(unittest.TestCase):
             self.assertEqual(captured["args"].count("--append-system-prompt"), 1)
             self.assertIn("save a short handoff, then /clear", result.stdout)
             self.assertEqual(user_config.read_text(), '{"autoCompactEnabled":false}')
+            self.assertEqual(saved_settings.read_text(), custom)
+            result = subprocess.run(["bash", str(script)], env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(saved_settings.read_text(), custom)
+            captured = json.loads(capture.read_text())
+            i = captured["args"].index("--setting-sources")
+            self.assertEqual(captured["args"][i + 1], "user")
+            capture.unlink()
+            saved_settings.write_text('{"env":{"ANTHROPIC_BASE_URL":"https://example.invalid"}}')
+            result = subprocess.run(["bash", str(script)], env=env, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("saved env overrides", result.stderr)
+            self.assertFalse(capture.exists())
 
     def test_entry_web_config_is_sticky_and_customizable(self):
         with tempfile.TemporaryDirectory() as tmp:

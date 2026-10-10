@@ -18,6 +18,13 @@ MAX_COMPACT_WINDOW = 1000000
 PROMPT_RESERVE = 8192
 COMPACT_RESERVE = 8192
 DEFAULT_OUTPUT = 8192
+PROTECTED_SETTINGS_ENV = {
+    "DISABLE_COMPACT", "DISABLE_AUTO_COMPACT", "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE",
+    "CLAUDE_CONFIG_DIR", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS", "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+}
 
 
 class BudgetError(ValueError):
@@ -150,6 +157,21 @@ def frontend_policy_env(args: list[str], env: dict) -> dict:
     return result
 
 
+def validate_user_settings(path: Path) -> None:
+    try:
+        if not path.exists():
+            return
+        settings = json.loads(path.read_text())
+        if not isinstance(settings, dict) or not isinstance(settings.get("env", {}), dict):
+            raise BudgetError("expected a settings object with an env object")
+        if any(name in PROTECTED_SETTINGS_ENV or name.startswith("ANTHROPIC_")
+               for name in settings.get("env", {})):
+            raise BudgetError("saved env overrides local context/gateway enforcement")
+    except (ValueError, OSError) as exc:
+        raise BudgetError(f"Cannot safely load Claude user settings {path}: {exc}; "
+                          "remove protected env overrides from that file") from exc
+
+
 def validate_managed_settings(path: Path = Path("/etc/claude-code/managed-settings.json")) -> None:
     try:
         files = [path] if path.exists() else []
@@ -168,12 +190,7 @@ def validate_managed_settings(path: Path = Path("/etc/claude-code/managed-settin
             raise BudgetError("managed autoCompactEnabled=false disables compaction")
         if settings.get("policyHelper"):
             raise BudgetError("dynamic managed policyHelper cannot be verified before launch")
-        protected = {"DISABLE_COMPACT", "DISABLE_AUTO_COMPACT", "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE",
-                     "CLAUDE_CONFIG_DIR", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_USE_BEDROCK",
-                     "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
-                     "CLAUDE_CODE_MAX_CONTEXT_TOKENS", "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
-                     "CLAUDE_CODE_MAX_OUTPUT_TOKENS"}
-        if any(name in managed_env for name in protected):
+        if any(name in managed_env for name in PROTECTED_SETTINGS_ENV):
             raise BudgetError("managed env overrides local context/gateway enforcement")
     except (ValueError, AttributeError, OSError) as exc:
         raise BudgetError(f"Cannot safely apply local policy with {path}: {exc}; ask your administrator to resolve the conflict") from exc
@@ -312,6 +329,7 @@ def main() -> int:
     ap.add_argument("--model-spec", action="append", default=[])
     ap.add_argument("--slots", default="1")
     ap.add_argument("--check-claude", action="store_true")
+    ap.add_argument("--user-settings", type=Path)
     ap.add_argument("claude_args", nargs=argparse.REMAINDER)
     args = ap.parse_args()
     try:
@@ -319,6 +337,8 @@ def main() -> int:
         validate_claude_args(args.claude_args, dict(os.environ))
         env = frontend_policy_env(args.claude_args, dict(os.environ))
         validate_managed_settings()
+        if args.user_settings:
+            validate_user_settings(args.user_settings)
         plan = None
         if args.plan:
             with open(args.plan) as f:
