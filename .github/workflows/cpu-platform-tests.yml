@@ -1,0 +1,42 @@
+name: cpu platform and telemetry tests
+on:
+  pull_request:
+    paths:
+      - "lib/cpu_platform.py"
+      - "lib/claude_local_plan.py"
+      - "lib/coder_local_plan.py"
+      - "lib/pushbutton_metrics.py"
+      - "pushbutton"
+      - "pushbutton-instance"
+      - "pushbutton-cpu-bench"
+      - "pushbutton-telemetry-collector"
+      - "claude-local"
+      - "coder-local"
+      - "benchmarks/cpu/**"
+      - "configs/model-catalog.json"
+      - "tests/test_cpu_platform.py"
+      - "tests/test_telemetry.py"
+      - ".github/workflows/cpu-platform-tests.yml"
+permissions:
+  contents: read
+jobs:
+  cpu-platform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax
+        run: |
+          python3 -m py_compile lib/cpu_platform.py pushbutton-cpu-bench pushbutton-telemetry-collector
+          bash -n claude-local coder-local
+      - name: Unit tests
+        run: python3 -m unittest -v tests/test_cpu_platform.py tests/test_telemetry.py tests/test_metrics.py
+      - name: Estimates are in sync
+        run: |
+          python3 lib/cpu_platform.py estimates --markdown > "$RUNNER_TEMP/ESTIMATES.md"
+          diff -u benchmarks/cpu/ESTIMATES.md "$RUNNER_TEMP/ESTIMATES.md"
+      - name: Host detection and CPU plan smoke (GitHub runners have no GPU)
+        run: |
+          python3 lib/cpu_platform.py detect
+          python3 lib/cpu_platform.py cmake-flags
+          ./pushbutton-cpu-bench ornith-1.5:9b --context 8192 --dry-run >/dev/null
+          python3 lib/coder_local_plan.py ornith-1.5:9b --context 8192 >/dev/null

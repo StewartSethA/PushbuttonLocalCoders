@@ -670,7 +670,7 @@ printf "%s\\n" "$STATE_DIR" "$CACHE_DIR"
             "lib/claude_local_budget.py", "lib/pushbutton_capacity.py",
             "lib/pushbutton_request_budget.py", "lib/pushbutton_capacity_proxy.py",
             "configs/qwen-local-defaults.json",
-            "configs/backend-registry.json", "lib/pushbutton_metrics.py",
+            "configs/backend-registry.json", "lib/pushbutton_metrics.py", "lib/cpu_platform.py",
         )
         for name in files:
             shutil.copy2(ROOT / name, fixture / name)

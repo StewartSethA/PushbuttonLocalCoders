@@ -20,6 +20,7 @@ strategy benchmarks in ``benchmarks/cpu/results`` override them automatically.
 from __future__ import annotations
 
 import argparse
+import functools
 import glob
 import hashlib
 import json
@@ -565,6 +566,47 @@ class Strategy:
         return d
 
 
+@functools.lru_cache(maxsize=8)
+def _help_text(binary: str) -> str:
+    try:
+        cp = subprocess.run([binary, "--help"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, timeout=30)
+        return cp.stdout
+    except Exception:
+        return ""
+
+
+def adapt_load_args(args: list[str], binary: str | None) -> list[str]:
+    """Translate mmap/mlock flags to what this llama.cpp build accepts.
+
+    Newer llama.cpp replaced ``--no-mmap``/``--mlock`` (server) and ``-mmp 0``
+    (bench) with ``--load-mode``/``-lm``. Unknown or missing binaries keep the
+    classic flags.
+    """
+    if not binary:
+        return list(args)
+    text = _help_text(str(binary))
+    if "--load-mode" not in text:
+        return list(args)
+    out, no_mmap, mlock, i = [], False, False, 0
+    while i < len(args):
+        a = args[i]
+        if a == "--no-mmap":
+            no_mmap = True
+        elif a == "--mlock":
+            mlock = True
+        elif a == "-mmp" and i + 1 < len(args):
+            no_mmap = args[i + 1] == "0"
+            i += 1
+        else:
+            out.append(a)
+        i += 1
+    if no_mmap or mlock:
+        mode = "mlock" if (mlock and no_mmap) else ("mmap+mlock" if mlock else "none")
+        out += ["--load-mode", mode]
+    return out
+
+
 def strategy_from_dict(d: dict) -> Strategy:
     allowed = {k: d[k] for k in Strategy.__dataclass_fields__ if k in d}
     allowed["numactl"] = tuple(str(x) for x in allowed.get("numactl", ()))
@@ -1046,7 +1088,7 @@ def estimates_markdown(context: int = 32768, depths=DEFAULT_DEPTHS) -> str:
     return "\n".join(lines) + "\n"
 
 
-def launch_args(plan_path: str, server_id: str, part: str) -> list[str]:
+def launch_args(plan_path: str, server_id: str, part: str, server: str | None = None) -> list[str]:
     obj = json.loads(pathlib.Path(plan_path).read_text())
     for s in obj.get("servers", []) + obj.get("workers", []):
         if s.get("id") != server_id:
@@ -1054,7 +1096,9 @@ def launch_args(plan_path: str, server_id: str, part: str) -> list[str]:
         if s.get("device") != "cpu":
             return []
         strat = s["cpu"]["strategy"]
-        return list(strat.get("numactl", [])) if part == "prefix" else list(strat.get("llama_args", []))
+        if part == "prefix":
+            return list(strat.get("numactl", []))
+        return adapt_load_args(list(strat.get("llama_args", [])), server)
     raise ValueError(f"server {server_id} not found in plan")
 
 
@@ -1081,6 +1125,7 @@ def main(argv=None) -> int:
     la.add_argument("--plan", required=True)
     la.add_argument("--id", required=True)
     la.add_argument("part", choices=["prefix", "args"])
+    la.add_argument("--server", help="llama-server binary, used to adapt mmap/mlock flags to its version")
     ic = sub.add_parser("plan-is-cpu")
     ic.add_argument("plan")
     a = ap.parse_args(argv)
@@ -1106,7 +1151,7 @@ def main(argv=None) -> int:
             else:
                 print(json.dumps(reference_estimates(a.context), indent=2))
         elif a.cmd == "launch-args":
-            sys.stdout.write("".join(x + "\0" for x in launch_args(a.plan, a.id, a.part)))
+            sys.stdout.write("".join(x + "\0" for x in launch_args(a.plan, a.id, a.part, a.server)))
         elif a.cmd == "plan-is-cpu":
             return 0 if plan_is_cpu(a.plan) else 1
         return 0

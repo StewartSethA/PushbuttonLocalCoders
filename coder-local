@@ -264,7 +264,7 @@ start_backends(){
    local -a cpu_prefix=() cpu_args=()
    if [[ -z "$gpus" ]]; then
      mapfile -d '' -t cpu_prefix < <(python3 "$ROOT/lib/cpu_platform.py" launch-args --plan "$PLAN_FILE" --id "$id" prefix)
-     mapfile -d '' -t cpu_args < <(python3 "$ROOT/lib/cpu_platform.py" launch-args --plan "$PLAN_FILE" --id "$id" args)
+     mapfile -d '' -t cpu_args < <(python3 "$ROOT/lib/cpu_platform.py" launch-args --plan "$PLAN_FILE" --id "$id" --server "$LLAMA_SERVER" args)
      if ((${#cpu_prefix[@]})) && ! have "${cpu_prefix[0]}"; then say "${cpu_prefix[0]} not installed; starting agent $worker without NUMA/MCDRAM binding"; cpu_prefix=(); fi
      cmd+=("${cpu_args[@]}"); vramcap=""
    fi

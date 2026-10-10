@@ -599,6 +599,74 @@ very slow CPU/RAM fallback.
 
 ---
 
+## CPU-only and multi-CPU hosts (Xeon Phi, AVX-512, VNNI, AMX, EPYC, ARM)
+
+When no working NVIDIA GPU is found, `pushbutton`, `claude-local` and `coder-local`
+automatically deploy every model on the CPU (set `PUSHBUTTON_DISABLE_CPU_FALLBACK=1`
+to fail instead). `lib/cpu_platform.py` handles the CPU-specific work:
+
+- **Detection**: `/proc/cpuinfo` and sysfs NUMA nodes. It identifies the CPU family
+  (KNL/KNM, Haswell, Skylake-SP, Cascade Lake, Cooper Lake, Ice Lake, Sapphire/Emerald/Granite
+  Rapids, Zen 2–5, Neoverse, Apple), sockets, physical cores, NUMA layout, and
+  MCDRAM/HBM in flat mode (CPU-less NUMA nodes) or cache mode.
+- **Build**: a llama.cpp CPU build per ISA (`build-cpu-<tier>-<hash>`) that enables exactly
+  the extensions the host reports: AVX2/FMA/F16C, AVX-512, AVX-512 VNNI (Cascade Lake+),
+  AVX-512 BF16, AVX-VNNI, and AMX (Sapphire Rapids+). KNL/KNM lack AVX-512 BW/VL/DQ, so
+  they use the AVX2 kernels with `-mtune=knl`. For binaries shared across different hosts,
+  `PUSHBUTTON_CPU_BUILD=portable` builds every variant with runtime dispatch.
+- **Quant choice**:
+  - With MCDRAM/HBM, the best-quality quant whose weights and KV fit the on-package
+    memory (flat mode), or whose weights fit the MCDRAM cache (cache mode).
+  - Otherwise, the best-quality quant estimated to reach the decode target (`min_tps`,
+    default 25 tok/s), falling back to the fastest high-quality quant.
+- **Launch strategy**:
+  - On a Phi in flat mode: `numactl --membind=<MCDRAM node>` with `--no-mmap`.
+  - On multi-socket hosts: `--numa distribute`/`isolate`.
+  - With several instances: one NUMA node group each.
+  - Physical-core thread counts (with SMT batch threads on KNL), and optional
+    `--no-mmap`/`--mlock`.
+- **Measured over estimated**: once `pushbutton-cpu-bench` has measured a model on an
+  identical host layout, the planner uses the fastest measured strategy.
+
+```bash
+python3 lib/cpu_platform.py detect                 # what was detected, build flags, capacities
+python3 lib/cpu_platform.py plan qwen3.6:35b       # quant, strategy and tok/s estimate on this host
+./pushbutton-cpu-bench qwen3.6:35b                 # benchmark every applicable strategy
+./pushbutton-cpu-bench --summarize                 # regenerate benchmarks/cpu/RESULTS.md
+```
+
+Estimated load time and PP/TG at 0/4K/16K/32K context depth for 21 reference CPUs and every
+CPU-planned model are in [benchmarks/cpu/ESTIMATES.md](benchmarks/cpu/ESTIMATES.md).
+Measured strategy benchmarks are in [benchmarks/cpu/RESULTS.md](benchmarks/cpu/RESULTS.md).
+Install `numactl` for NUMA/MCDRAM binding. Without it, the launchers start unbound and
+print a warning.
+
+---
+
+## Telemetry
+
+On first interactive run, `pushbutton` asks `Enable telemetry? [Y/n]`. Pressing Enter enables it.
+Non-interactive first runs never enable telemetry silently. Change your choice at any time
+with `--telemetry-on` / `--telemetry-off`.
+
+When enabled, compact records are queued locally and uploaded **at most once every 5
+minutes**. This limit is enforced across processes with a file lock, and failed attempts
+also back off. Records contain:
+- model weight load time;
+- PP and TG tok/s at each context depth;
+- model, quant and backend;
+- hardware type: GPU names, or CPU model/family/ISA tier, MCDRAM mode and launch strategy.
+
+Records never contain prompts, outputs, usernames, hostnames or paths.
+
+Records go to the URL in `~/.config/pushbutton-local/telemetry.json` (`upload_url`, set with
+`--telemetry-url`) or `PUSHBUTTON_TELEMETRY_UPLOAD_URL`. With no URL configured, they stay queued.
+The public ingest API is `pushbutton-telemetry-collector`. It stamps every record with the
+receive time and the **sender's IP address** and appends it to
+`telemetry/records/YYYY-MM-DD.ndjson` in this repository; see [telemetry/README.md](telemetry/README.md).
+
+---
+
 ## Diagnostics
 
 ```bash
@@ -639,7 +707,8 @@ ROCm, CPU, Docker, benchmarking and network-node workflows:
 curl -fsSL https://raw.githubusercontent.com/StewartSethA/PushbuttonLocalCoders/main/install.sh | bash
 ```
 
-The new replica-aware coder path is currently NVIDIA/Linux-first.
+The new replica-aware coder path is NVIDIA/Linux-first. On Linux hosts without an NVIDIA GPU,
+it deploys on the CPU automatically (see above).
 
 ---
 
@@ -648,7 +717,8 @@ The new replica-aware coder path is currently NVIDIA/Linux-first.
 For the new local coder path:
 
 - Linux
-- working NVIDIA driver / `nvidia-smi`
+- working NVIDIA driver / `nvidia-smi`, or CPU-only (automatic fallback; `numactl`
+  recommended on NUMA and Xeon Phi hosts)
 - `bash`, `curl`, `git`, Python 3
 - CUDA toolkit/nvcc do **not** have to be preinstalled; Pushbutton can provision
   a compatible private toolchain

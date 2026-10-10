@@ -747,7 +747,7 @@ class StartupTests(unittest.TestCase):
         (template / "lib").mkdir(exist_ok=True)
         shutil.copy2(ROOT / "lib/pushbutton_folders.sh",
                      template / "lib/pushbutton_folders.sh")
-        for asset in ("pushbutton_metrics.py", "coder_local_plan.py", "claude_local_plan.py",
+        for asset in ("pushbutton_metrics.py", "cpu_platform.py", "coder_local_plan.py", "claude_local_plan.py",
                       "pushbutton_capacity.py", "pushbutton_request_budget.py", "pushbutton_capacity_proxy.py"):
             (template / "lib" / asset).touch()
         entry = template / "lib" / "claude_local_entry.sh"

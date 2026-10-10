@@ -97,7 +97,7 @@ def main():
         if prefix and not shutil.which(prefix[0]):
             say(f'{prefix[0]} not found; launching without memory binding');prefix=[]
         # A later -ngl wins in llama.cpp's parser, so the CPU args override -ngl 999.
-        cmd=prefix+cmd+strat.llama_args()
+        cmd=prefix+cmd+cpu_platform.adapt_load_args(strat.llama_args(),str(server))
         say(f'CPU strategy {strat.name}: {strat.threads} threads ({strat.threads_batch} batch), memory {strat.memory_tier}')
     say(f'serving {a.alias} with C{a.parallel}, {a.context:,} context/slot on {a.host}:{a.port}')
     os.execvpe(cmd[0],cmd,env)
