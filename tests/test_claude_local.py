@@ -408,7 +408,7 @@ class ContextPolicyTests(unittest.TestCase):
             functions = functions.replace('ROOT="$(cd "$(dirname "$SELF")" && pwd)"', f"ROOT={shlex.quote(str(ROOT))}")
             script.write_text(functions + f"\nPLAN_FILE={shlex.quote(str(plan))}\n"
                               f"GATEWAY_CONFIG={shlex.quote(str(config))}\nSTATE_DIR={shlex.quote(str(tmp / 'state'))}\n"
-                              "GATEWAY_PORT=18180\nCLAUDE_ARGS=(--resume SESSION)\nrun_claude\n")
+                              "CTX=65536\nGATEWAY_PORT=18180\nCLAUDE_ARGS=(--resume SESSION)\nrun_claude\n")
             env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "DISABLE_"))}
             env.update(HOME=str(tmp), PATH=str(tmp) + ":" + os.environ["PATH"], CAPTURE=str(capture))
             result = subprocess.run(["bash", str(script)], env=env, capture_output=True, text=True)
