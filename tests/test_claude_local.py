@@ -731,5 +731,88 @@ class GatewayBudgetHTTPTests(unittest.TestCase):
             self.assertEqual(self.requests[0][0], "/v1/messages/count_tokens")
 
 
+DUAL_3090_SMI = """#!/usr/bin/env bash
+case "$*" in
+  *index,name,memory.total,memory.free,compute_cap,pci.bus_id*)
+    printf '0, NVIDIA GeForce RTX 3090, 24576, 24000, 8.6, 00000000:01:00.0\\n1, NVIDIA GeForce RTX 3090, 24576, 24000, 8.6, 00000000:02:00.0\\n';;
+  *pcie.link*) printf '4, 16\\n4, 16\\n';;
+  *name,memory.free*) printf 'NVIDIA GeForce RTX 3090, 24000\\nNVIDIA GeForce RTX 3090, 24000\\n';;
+  *index*) printf '0\\n1\\n';;
+esac
+"""
+
+
+class ReplicaLaunchArgumentTests(unittest.TestCase):
+    """--agents/--slots must reach the core launcher intact through every wrapper."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = pathlib.Path(self.tmp.name)
+        (self.root / "lib").mkdir()
+        (self.root / "bin").mkdir()
+        for name in ("lib/claude_local_entry.sh", "lib/pushbutton_folders.sh", "claude-local-safe"):
+            (self.root / name).write_text((ROOT / name).read_text())
+            (self.root / name).chmod(0o755)
+        self.record = self.root / "record.jsonl"
+        core = self.root / "claude-local"
+        core.write_text("#!/usr/bin/env python3\nimport json,os,sys\n"
+                        "startup=os.environ.get('CLAUDE_LOCAL_STARTUP_ONLY')=='1'\n"
+                        f"open({str(self.record)!r},'a').write(json.dumps({{'startup':startup,'argv':sys.argv[1:]}})+'\\n')\n"
+                        "sys.exit(125 if startup else 0)\n")
+        core.chmod(0o755)
+        smi = self.root / "bin" / "nvidia-smi"
+        smi.write_text(DUAL_3090_SMI)
+        smi.chmod(0o755)
+        self.env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "DISABLE_"))}
+        self.env.update(HOME=str(self.root / "home"), PATH=str(self.root / "bin") + ":" + os.environ["PATH"],
+                        CLAUDE_LOCAL_STATE=str(self.root / "state"), CLAUDE_LOCAL_CACHE=str(self.root / "cache"),
+                        PUSHBUTTON_CONFIG_DIR=str(self.root / "config"))
+
+    def launched(self, *args):
+        result = subprocess.run(["bash", str(self.root / "lib/claude_local_entry.sh"), *args],
+                                env=self.env, input="", capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = [json.loads(line) for line in self.record.read_text().splitlines()]
+        self.record.unlink()
+        self.assertTrue(calls[-1]["startup"] is False, calls)
+        return calls[-1]["argv"]
+
+    def test_replica_flags_do_not_leak_wrapper_options_or_inject_models(self):
+        cases = {
+            ("q38@slots=2", "--agents", "2", "--local-no-web"): ["q38@slots=2", "--agents", "2"],
+            ("--agents", "2", "q38@slots=2", "--local-no-web"): ["--agents", "2", "q38@slots=2"],
+            ("--slots", "2", "--agents", "2", "q38", "--local-no-web"): ["--slots", "2", "--agents", "2", "q38"],
+            ("--slots=2", "--agents=2", "q38", "--local-no-web"): ["--slots=2", "--agents=2", "q38"],
+            ("--local-context", "131072", "q38@slots=2", "--agents", "2", "--local-no-web"):
+                ["--local-context", "131072", "q38@slots=2", "--agents", "2"],
+        }
+        for args, expected in cases.items():
+            with self.subTest(args=args):
+                self.assertEqual(self.launched(*args), expected)
+
+    def test_dual_3090_defaults_still_apply_without_model_selector(self):
+        self.assertEqual(self.launched("--agents", "2", "--local-no-web"),
+                         ["qwen3.8:27b", "qwen3.6:35b", "--agents", "2"])
+
+    def test_json_agents_still_pass_through_to_claude(self):
+        argv = self.launched("q38", "--local-no-web", "--agents", '{"a":{}}', "--verbose")
+        self.assertEqual(argv, ["q38", "--agents", '{"a":{}}', "--verbose"])
+
+    def test_core_accepts_equals_forms_for_replicas_and_slots(self):
+        env = dict(self.env, PATH=str(self.root / "bin") + ":" + os.environ["PATH"])
+        result = subprocess.run(["bash", str(ROOT / "claude-local"), "q38", "--slots=2", "--agents=2",
+                                 "--local-dry-run", "--quiet"],
+                                env=env, input="", capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("local-qwen38-27b-1", result.stdout)
+        self.assertIn("local-qwen38-27b-2", result.stdout)
+        self.assertEqual(result.stdout.count("slots=2 "), 2)
+        result = subprocess.run(["bash", str(ROOT / "claude-local"), "q38", "--agents=9", "--local-dry-run"],
+                                env=env, input="", capture_output=True, text=True, timeout=60)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--agents must be between 1 and 4", result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
