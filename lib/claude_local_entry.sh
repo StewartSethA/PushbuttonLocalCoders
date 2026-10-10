@@ -31,8 +31,8 @@ export CLAUDE_CODE_MAX_RETRIES="${CLAUDE_CODE_MAX_RETRIES:-2}"
 export CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS="${CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS:-1800000}"
 export MCP_TIMEOUT="${MCP_TIMEOUT:-60000}"
 
-# Each local llama-server currently runs with -np 1. Match client-side request
-# concurrency to that single slot unless the user explicitly chooses otherwise.
+# Each local llama-server currently runs with -np 1. Keep client-side tool-use
+# concurrency conservative unless the user explicitly chooses otherwise.
 export CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY="${CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY:-1}"
 
 # Provider-neutral web search/fetch for local models. Exa's hosted MCP supports

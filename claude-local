@@ -23,6 +23,7 @@ KEEP_SERVERS=0
 ENABLE_TEAMS=1
 DRY_RUN=0
 VERBOSE=0
+ALLOW_SINGLE_SLOT_AUTO=0
 MODELS=()
 CLAUDE_ARGS=()
 PIDS=()
@@ -56,6 +57,8 @@ Harness options (put before ordinary Claude Code flags):
   --local-client-context N   Claude Code budget (default 200000)
   --local-port-base N        starting port for gateway/backends
   --local-no-teams           disable experimental Claude agent teams
+  --local-allow-single-slot-auto
+                             allow non-interactive Auto mode on a single-slot backend
   --local-keep-servers       leave model servers running after Claude exits
   --local-allow-offload      allow CUDA unified-memory spill (slow; default off)
   --local-dry-run            show hardware/model plan only
@@ -414,18 +417,26 @@ confirm_single_slot_auto_mode() {
     claude_local_auto_mode_requested "${CLAUDE_ARGS[@]}" || return 0
 
     warn "This launcher uses one request slot per local model server (-np 1). Auto mode's client-side classifier shares those slots, so it may queue behind other inference and hit the configured stream-idle/request timeout."
-    if [[ ! -r /dev/tty || ! -w /dev/tty ]]; then
-        warn "Non-interactive session: keeping auto mode. To avoid classifier requests, choose --permission-mode default or acceptEdits; do not use a permission-bypass mode as a timeout workaround."
+    if (( ALLOW_SINGLE_SLOT_AUTO )); then
+        warn "Continuing in Auto mode because --local-allow-single-slot-auto was supplied."
         return 0
+    fi
+    if [[ ! -t 0 || ! -r /dev/tty || ! -w /dev/tty ]]; then
+        warn "Cannot ask for a choice without a terminal. Select --permission-mode default or acceptEdits, or explicitly acknowledge the risk with --local-allow-single-slot-auto."
+        return 2
     fi
 
     printf '\nAuto mode will keep its classifier checks, but may be slow on this single-slot backend.\n' >/dev/tty
-    printf '  [c] Continue in auto mode (default)\n  [d] Use default mode (ask before protected actions)\n  [e] Use acceptEdits (auto-approve edits; other permissions still apply)\n  [q] Cancel before starting local services\nChoice [c/d/e/q]: ' >/dev/tty
+    printf '  [c] Continue in auto mode (default)\n  [t] Continue in auto mode without local agent teams\n  [d] Use default mode (ask before protected actions)\n  [e] Use acceptEdits (auto-approve edits; other permissions still apply)\n  [q] Cancel before starting local services\nChoice [c/t/d/e/q]: ' >/dev/tty
     local choice
     IFS= read -r choice </dev/tty || choice=c
     case "${choice,,}" in
         ""|c|continue)
             warn "Continuing in auto mode; classifier requests may queue or time out."
+            ;;
+        t|no-teams)
+            ENABLE_TEAMS=0
+            warn "Continuing in auto mode with local agent teams disabled to reduce competing inference work."
             ;;
         d|default)
             claude_local_set_permission_mode default
@@ -437,7 +448,7 @@ confirm_single_slot_auto_mode() {
             ;;
         q|quit|cancel)
             say "Cancelled before starting local services."
-            return 1
+            return 130
             ;;
         *)
             warn "Unrecognized choice; continuing in auto mode."
@@ -545,6 +556,7 @@ while (($#)); do
       --local-client-context) CLIENT_CTX="$2"; shift 2;;
       --local-port-base) PORT_BASE="$2"; shift 2;;
       --local-no-teams) ENABLE_TEAMS=0; shift;;
+      --local-allow-single-slot-auto) ALLOW_SINGLE_SLOT_AUTO=1; shift;;
       --local-keep-servers) KEEP_SERVERS=1; shift;;
       --local-allow-offload) ALLOW_OFFLOAD=1; shift;;
       --local-dry-run) DRY_RUN=1; shift;;
@@ -565,7 +577,10 @@ mkdir -p "$STATE_DIR" "$CACHE_DIR"; PLAN_FILE="$STATE_DIR/plan.$$.json"
 plan_args=(plan --context "$CTX"); if ((${#MODELS[@]})); then plan_args+=("${MODELS[@]}"); else plan_args+=(--smart); fi
 python3 "$PLAN_PY" "${plan_args[@]}" > "$PLAN_FILE" || exit $?
 print_plan; [[ $DRY_RUN -eq 1 ]] && exit 0
-confirm_single_slot_auto_mode || exit 130
+confirm_single_slot_auto_mode || {
+    policy_status=$?
+    exit "$policy_status"
+}
 install_claude_code; prepare_host_compiler; activate_cuda; ensure_llamacpp
 grep -q '"template": "qwen-fixed"' "$PLAN_FILE" && fetch_qwen_template || true
 start_backends; write_gateway_config; start_gateway
