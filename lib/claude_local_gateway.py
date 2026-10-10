@@ -38,6 +38,42 @@ RAW_TOOL_MARKERS = (
     "<tool_call", "</tool_call", "<function=", "</function>",
     "<parameter=", "</parameter>", "</prompt>", "</tool>", "</tool_calls>",
 )
+WEB_TOOL_NAMES = {"WebSearch", "WebFetch", "web_search", "web_fetch"}
+WEB_TOOL_GUIDANCE = (
+    "Built-in WebSearch/WebFetch require a supported Anthropic API deployment, not this local gateway. "
+    "Use the exact connected MCP search/fetch tool name; check /mcp for pushbutton-web. "
+    "Edit the disclosed web-mcp.json or launch with --local-web-config FILE and restart to change providers. "
+    "If an old session repeats web_search, start a fresh session with a handoff summary. "
+    "This is a tool configuration mismatch, not a temporary outage."
+)
+
+
+def hosted_web_tool(tool: object) -> bool:
+    if not isinstance(tool, dict):
+        return False
+    kind = tool.get("type", "")
+    return (
+        isinstance(kind, str) and kind.startswith(("web_search_", "web_fetch_"))
+        or tool.get("name") in ("WebSearch", "WebFetch")
+        or tool.get("name") in ("web_search", "web_fetch") and "input_schema" not in tool
+    )
+
+
+def filter_hosted_web_tools(body: dict) -> bool:
+    tools = body.get("tools")
+    if not isinstance(tools, list):
+        return False
+    removed = [t for t in tools if hosted_web_tool(t)]
+    if not removed:
+        return False
+    choice = body.get("tool_choice")
+    if isinstance(choice, dict) and choice.get("type") == "tool":
+        if any(t.get("name") == choice.get("name") for t in removed):
+            raise ValueError(WEB_TOOL_GUIDANCE)
+    body["tools"] = [t for t in tools if not hosted_web_tool(t)]
+    if not body["tools"]:
+        body.pop("tool_choice", None)
+    return True
 
 
 def family_for(model: str) -> str | None:
@@ -226,7 +262,10 @@ def validate_tool_uses(uses: list[dict], tools: object) -> list[str]:
             continue
         schema = schemas.get(name)
         if schema is None:
-            errors.append(f"unknown tool {name!r}")
+            if name in WEB_TOOL_NAMES:
+                errors.append(f"unsupported hosted web tool {name!r}: {WEB_TOOL_GUIDANCE}")
+            else:
+                errors.append(f"unknown tool {name!r}")
             continue
         errors.extend(f"{name}: {e}" for e in validate_schema(inp, schema))
     return errors
@@ -240,7 +279,7 @@ def parse_nonstream_tool_uses(payload: bytes) -> tuple[list[dict], list[str]]:
     serialized = json.dumps(obj, ensure_ascii=False)
     leaks = [m for m in RAW_TOOL_MARKERS if m in serialized]
     blocks = obj.get("content") if isinstance(obj, dict) else None
-    uses = [b for b in blocks or [] if isinstance(b, dict) and b.get("type") == "tool_use"] if isinstance(blocks, list) else []
+    uses = [b for b in blocks or [] if isinstance(b, dict) and b.get("type") in ("tool_use", "server_tool_use")] if isinstance(blocks, list) else []
     return uses, ([f"raw tool markup leaked: {leaks}"] if leaks else [])
 
 
@@ -267,7 +306,7 @@ def parse_sse_tool_uses(payload: bytes) -> tuple[list[dict], list[str]]:
             continue
         if event.get("type") == "content_block_start":
             block = event.get("content_block")
-            if isinstance(block, dict) and block.get("type") == "tool_use":
+            if isinstance(block, dict) and block.get("type") in ("tool_use", "server_tool_use"):
                 starts[idx] = {"type": "tool_use", "name": block.get("name"), "input": block.get("input") or {}}
                 partial[idx] = ""
         elif event.get("type") == "content_block_delta" and idx in starts:
@@ -434,6 +473,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def _dispatch(self, route, body, path):
         body["model"] = route["backend_alias"]
+        try:
+            filtered_web_tools = filter_hosted_web_tools(body)
+        except ValueError as exc:
+            return self._json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": str(exc)}})
         apply_local_policy(body)
         count_only = path.endswith("/count_tokens")
         capacity = route.get("capacity")
@@ -561,10 +604,13 @@ class Handler(BaseHTTPRequestHandler):
 
                 # Tool-bearing turns are buffered so malformed arguments can be
                 # rejected/retried before Claude Code executes them.
-                if body.get("tools") and 200 <= resp.status < 300:
+                if (body.get("tools") or filtered_web_tools) and 200 <= resp.status < 300:
                     payload = resp.read()
                     errors = validate_backend_payload(payload, content_type, body.get("tools"))
                     if errors:
+                        if any(e.startswith("unsupported hosted web tool ") for e in errors):
+                            return self._json(400, {"type": "error", "error": {
+                                "type": "invalid_request_error", "message": WEB_TOOL_GUIDANCE}})
                         last_exc = RuntimeError("invalid backend tool arguments: " + "; ".join(errors[:12]))
                         self.log_message("invalid backend tool arguments; retrying=%s", attempt < attempts)
                         if attempt < attempts:

@@ -62,6 +62,8 @@ Model order:
 Built-ins: nemotron-3.5-lightning qwen3.6:35b qwen3.8:27b glm-5.3-flash
 
 Harness options (put before ordinary Claude Code flags):
+  --local-web-config FILE    installed wrapper: persistent custom web MCP JSON
+  --local-no-web             installed wrapper: disable automatic web MCP
   --select                   choose models interactively before provisioning
   --local-cache DIR          llama.cpp/Hugging Face model cache
   --folders, --system-info   show storage paths and disk usage, then exit
@@ -514,11 +516,15 @@ import json,sys
 print(json.load(open(sys.argv[1]))['role_ids']['sonnet'])
 PY
 )"
-    local -a args=(--setting-sources "" --settings '{"autoCompactEnabled":true}' "${CLAUDE_ARGS[@]}")
+    local -a args=(--setting-sources "" --settings '{"autoCompactEnabled":true,"permissions":{"deny":["WebSearch","WebFetch"]}}'
+        --disallowedTools "WebSearch,WebFetch"
+        --append-system-prompt "Local web policy: built-in WebSearch/WebFetch are unavailable on this local endpoint. Use the connected MCP search/fetch tools (pushbutton-web by default), using their exact advertised names. If no MCP web tool is connected, explain that web access is unavailable rather than calling web_search or web_fetch."
+        "${CLAUDE_ARGS[@]}")
     contains_claude_flag --model || args=(--model "$sonnet_id" "${args[@]}")
     contains_claude_flag --agents || args=(--agents "$(agents_json)" "${args[@]}")
     good "All local services ready. Launching Claude Code from $PWD"
     say "Claude Code -> local gateway http://127.0.0.1:$GATEWAY_PORT (no cloud fallback)"
+    say "Web policy: built-in WebSearch/WebFetch disabled; use connected MCP tools. Check /mcp if search is unavailable."
     if [[ "${VERBOSE:-0}" == 1 ]]; then
         debug "Claude executable: $(command -v claude || true)"
         debug "Runtime logs: $STATE_DIR/logs"

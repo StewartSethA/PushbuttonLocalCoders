@@ -469,16 +469,47 @@ variables are recommended.
 
 ### Claude Code local models
 
-The installed `claude-local` command automatically supplies an isolated MCP
-configuration containing Exa's hosted MCP endpoint. Local Qwen, Nemotron,
+The installed `claude-local` command creates an isolated MCP configuration with
+Exa's hosted MCP endpoint on first use and preserves it on subsequent launches. Local Qwen, Nemotron,
 DeepSeek and GLM models therefore get provider-neutral web search and page fetch
 inside Claude Code without relying on Anthropic's hosted WebSearch service.
+
+Built-in `WebSearch` and `WebFetch` are disabled for local sessions; the model is
+instructed to use the exact connected MCP tool names. Startup discloses the
+selected server names and the persistent config path (normally
+`~/.local/share/pushbutton/claude-local/web-mcp.json`). Check `/mcp` for a connected
+`pushbutton-web` server and use its advertised search/fetch tools.
+
+**Change the backend:** edit the disclosed JSON and restart. The launcher does
+not overwrite it. Alternatively, use `--local-web-config /absolute/path/web.json`
+before ordinary Claude flags, or set `CLAUDE_LOCAL_WEB_CONFIG` persistently in
+your shell environment. Supply a Claude-compatible `mcpServers` configuration
+for Exa, Tavily, or a SearXNG MCP adapter; a plain SearXNG HTTP endpoint is not an
+MCP server. Keep provider credentials out of source control and prefer the
+provider's environment/credential mechanism.
+
+If an old transcript keeps calling `web_search`, start a fresh session with a
+handoff summary. The gateway rejects unsupported web calls immediately with MCP
+recovery guidance instead of replaying slow inference or suggesting a temporary
+outage. Other tool schemas remain strictly validated.
+
+Claude may still ask permission for the MCP search tool. Choose **“Yes, and don't
+ask again”** only for the specific read-only search tool and directory you trust.
+This consent is separate from backend selection and can be reviewed with
+`/permissions`; the launcher does not automatically approve MCP tools. Local
+Claude settings/session storage is isolated under the local state directory, so
+changing that directory may require consent again.
 
 Disable the automatic web MCP layer for a session with:
 
 ```bash
 claude-local qwen3.8:27b --local-no-web
 ```
+
+This does not enable hosted WebSearch/WebFetch. You may still supply custom MCP
+tools with Claude's `--mcp-config` flag. For Anthropic's built-in web services,
+use a supported Anthropic API deployment outside the local launcher; it never
+falls back to the cloud.
 
 ### Qwen Code local models
 
