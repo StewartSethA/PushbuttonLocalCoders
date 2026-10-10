@@ -5,11 +5,41 @@ import math
 import re
 
 OPTION_KEYS = {
-    "slots", "context", "output", "client_context", "compact", "quant",
+    "slots", "context", "output", "client_context", "compact", "quant", "bits",
     "kv_k", "kv_v", "min_tps", "admission", "admission_limit", "safety",
 }
 KV_TYPES = {"f32": 4.0, "f16": 2.0, "bf16": 2.0, "q8_0": 1.0625,
             "q4_0": 0.5625, "q4_1": 0.625, "q5_0": 0.6875, "q5_1": 0.75}
+
+
+def quant_bits(quant):
+    match = re.search(r"(?:^|[-_])(?:IQ|Q|MXFP|NVFP|FP|BF)([0-9]+)(?:$|[_-])",
+                      str(quant).upper())
+    return int(match[1]) if match else None
+
+
+def matches_quant(quant, settings):
+    return (not settings.get("quant") or quant.upper() == settings["quant"]) and (
+        not settings.get("bits") or quant_bits(quant) == settings["bits"])
+
+
+def model_bits_specs(models):
+    """Apply a standalone bits=N fallback without overriding per-model bits."""
+    bits = None
+    specs = []
+    for text in models:
+        if text.startswith("bits="):
+            if bits is not None:
+                raise ValueError("duplicate bits specifier")
+            bits = parse_options({"bits": text.split("=", 1)[1]})["bits"]
+        else:
+            specs.append(text)
+    if bits is None:
+        return specs
+    return [text if any(field.strip().split("=", 1)[0].lower() == "bits"
+                        for field in text.partition("@")[2].split(","))
+            else text + ("," if "@" in text else "@") + f"bits={bits}"
+            for text in specs]
 
 
 def positive_int(value, name):
@@ -63,6 +93,10 @@ def parse_options(options: dict) -> dict:
             result[name] = positive_int(value, name)
             if name == "slots" and result[name] > 128:
                 raise ValueError("slots must be between 1 and 128")
+        elif name == "bits":
+            if isinstance(value, bool) or not re.fullmatch(r"[0-9]+", str(value).strip()) or int(value) < 1:
+                raise ValueError("bits must be a positive integer")
+            result[name] = int(value)
         elif name == "compact":
             result[name] = _compact(value)
         elif name == "min_tps":

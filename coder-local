@@ -45,7 +45,8 @@ Usage:
 Per-model placement syntax:
   MODEL@gpu=INDEX,vram=SIZE
   MODEL@gpu=INDEX+INDEX,vram=SIZE
-  MODEL@context=N,slots=N,output=N,client_context=N,compact=N,quant=Q,kv_k=K,kv_v=V,min_tps=N,admission=N
+  MODEL@context=N,slots=N,output=N,client_context=N,compact=N,quant=Q,bits=N,kv_k=K,kv_v=V,min_tps=N,admission=N
+  bits=N                        restrict all models to this weight bitness; @bits overrides
 
 `gpu=` pins that worker to exactly those physical NVIDIA GPU indices.
 `vram=` is a per-selected-GPU hard planning lease; the best quant that fits is

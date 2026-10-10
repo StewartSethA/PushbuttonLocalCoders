@@ -161,6 +161,8 @@ def parse_model_spec(text: str, defaults: dict[str, dict] | None = None) -> Work
                 raise ValueError(f"unknown placement key '{key}' in '{text}'")
     if "quant" in options and options["quant"] not in {p.quant.upper() for p in base.PROFILES[model]}:
         raise ValueError(f"unsupported quant '{options['quant']}' for {model}")
+    if "bits" in options and not any(capacity.matches_quant(p.quant, options) for p in base.PROFILES[model]):
+        raise ValueError(f"no supported {options['bits']}-bit quant for {model} with the requested quant constraints")
     return WorkerRequest(model, gpu_indices, vram_limit, source, options)
 
 
@@ -379,7 +381,7 @@ def main() -> int:
         if args.self_test:
             self_test(); return 0
         defaults = load_placement_config(args.placement_config)
-        requests = [parse_model_spec(x, defaults) for x in args.models]
+        requests = [parse_model_spec(x, defaults) for x in capacity.model_bits_specs(args.models)]
         gpus = base.inventory()
         print(json.dumps(build_plan(requests, args.agents, gpus, args.context, args.slots,
                                     args.client_context), indent=2))

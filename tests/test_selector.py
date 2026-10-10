@@ -24,6 +24,29 @@ runtime = importlib.util.module_from_spec(runtime_spec)
 runtime_loader.exec_module(runtime)
 
 class SelectorTests(unittest.TestCase):
+    def test_bits_only_interactive_selection_preserves_constraint(self):
+        code, out, _, launch, _ = self.run_sel(
+            "bits=3", tty=True, inputs=("1", "q38", "", "", "", "", "n"),
+            gpus=selector.workers.synthetic_3090(1))
+        self.assertEqual(code, 0)
+        self.assertIn("quant=IQ3_XXS", out)
+        launch.assert_not_called()
+
+    def test_standalone_bits_constrains_rows_and_launch(self):
+        code, out, _, launch, _ = self.run_sel(
+            "q38", "bits=3", "--context", "65536", "--json",
+            gpus=selector.workers.synthetic_3090(1))
+        self.assertEqual(code, 0)
+        result = json.loads(out)
+        worker = result["plan"]["workers"][0]
+        self.assertEqual(selector.capacity_settings.quant_bits(worker["profile"]["quant"]), 3)
+        for row in result["rows"]["qwen3.8:27b"]:
+            if row["status"] == "FIT":
+                self.assertEqual(selector.capacity_settings.quant_bits(row["artifact"]), 3)
+        self.assertTrue(any("quant=" + worker["profile"]["quant"] in arg
+                            for arg in result["launch_argv"]))
+        launch.assert_not_called()
+
     def setUp(self):
         FIXTURE_DIR.mkdir(exist_ok=True)
 

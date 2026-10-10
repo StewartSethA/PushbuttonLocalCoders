@@ -85,7 +85,7 @@ def configure(cfg,args):
     options=dict(defaults.get(model,{}))
     options={**{k:v for k,v in options.items() if k not in capacity.OPTION_KEYS},
              **capacity.parse_options({k:v for k,v in options.items() if k in capacity.OPTION_KEYS})}
-    for key in ('context','slots','output','client_context','compact','quant','kv_k','kv_v','min_tps','admission'):
+    for key in ('context','slots','output','client_context','compact','quant','bits','kv_k','kv_v','min_tps','admission'):
         value=getattr(args,key,None)
         if value is not None:options.update(capacity.parse_options({key:value}))
     cfg['models']={**defaults,model:options}
@@ -203,6 +203,7 @@ def healthy_resident(model,context,requested_capacity=None,artifact=None,request
         names={canon(x.get('model','')),*[canon(a) for a in x.get('aliases',[])]}
         if canon(model) not in names or int(x.get('max_context') or 0)<context:continue
         if artifact is not None and x.get('artifact')!=artifact:continue
+        if requested_capacity and requested_capacity.get('bits') and capacity.quant_bits(x.get('artifact'))!=requested_capacity['bits']:continue
         if request is not None:
             if request.gpu_indices is not None:
                 actual={int(i) for i in str(x.get('gpu','')).split(',') if i.strip().isdigit()}
@@ -212,7 +213,7 @@ def healthy_resident(model,context,requested_capacity=None,artifact=None,request
             if int(x.get('framework_max_concurrency') or 1)<requested_capacity['slots']:continue
             automatic_slots=request is not None and 'slots' not in request.capacity
             omitted={'slots','admission_limit'} if automatic_slots and 'admission_limit' not in request.capacity else set()
-            if any(x.get('capacity',{}).get(k)!=v for k,v in requested_capacity.items() if k not in omitted):continue
+            if any(x.get('capacity',{}).get(k)!=v for k,v in requested_capacity.items() if k not in omitted|{'bits'}):continue
         return x
     return None
 
@@ -375,12 +376,19 @@ def show_status(cfg):
 
 def main():
     ap=argparse.ArgumentParser(prog='pushbutton');ap.add_argument('model',nargs='?');ap.add_argument('--context',type=int);ap.add_argument('--frontend',choices=['qwen','opencode','none']);ap.add_argument('--status',action='store_true');ap.add_argument('--allow-slow',action='store_true');ap.add_argument('--reconfigure',action='store_true');ap.add_argument('--telemetry-on',action='store_true');ap.add_argument('--telemetry-off',action='store_true');ap.add_argument('--telemetry-url')
-    for name in ('slots','output','client-context','compact','quant','kv-k','kv-v','min-tps','admission'):
+    for name in ('slots','output','client-context','compact','quant','bits','kv-k','kv-v','min-tps','admission'):
         ap.add_argument('--'+name)
     ap.add_argument('--plan-only',action='store_true')
     argv=sys.argv[1:]
     separator=argv.index('--') if '--' in argv else len(argv)
-    a,extra=ap.parse_known_args(argv[:separator])
+    runtime_argv=[]
+    bits_seen=False
+    for arg in argv[:separator]:
+        if arg.startswith('bits=') or arg=='--bits' or arg.startswith('--bits='):
+            if bits_seen:ap.error('duplicate bits specifier')
+            bits_seen=True
+        runtime_argv.append('--'+arg if arg.startswith('bits=') else arg)
+    a,extra=ap.parse_known_args(runtime_argv)
     a.frontend_args=extra+argv[separator+1:]
     cfg={} if a.reconfigure else read_json(CONFIG,{})
     if a.status:return show_status(cfg)
@@ -390,7 +398,7 @@ def main():
         if model in plan.PROFILES:
             req=worker_plan.parse_model_spec(cfg['model_spec'],cfg.get('models',{}))
             requested=capacity.resolve_options(req.capacity,ctx);ctx=requested['context']
-            custom_placement=req.gpu_indices is not None or req.vram_limit_mib is not None or any(k in req.capacity for k in ('slots','quant','kv_k','kv_v'))
+            custom_placement=req.gpu_indices is not None or req.vram_limit_mib is not None or any(k in req.capacity for k in ('slots','quant','bits','kv_k','kv_v'))
             if a.plan_only:
                 if custom_placement:
                     proposed,row=capacity_candidate(req,ctx);print(json.dumps(proposed,indent=2))

@@ -10,6 +10,23 @@ import coder_local_plan as coder
 
 
 class CapacityBudgetTests(unittest.TestCase):
+    def test_bits_validation_and_quant_names(self):
+        for bits in (1, 2, 3, 4, 5, 6, 8, 16):
+            self.assertEqual(capacity.parse_options({"bits": str(bits)})["bits"], bits)
+        for value in (0, -1, True, 4.5, "4K", "four", "", None):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "bits"):
+                capacity.parse_options({"bits": value})
+        for quant, bits in (("Q6_K", 6), ("UD-IQ3_XXS", 3), ("UD-Q2_K_XL", 2),
+                            ("IQ4_XS", 4), ("MXFP4_MOE", 4), ("native", None)):
+            self.assertEqual(capacity.quant_bits(quant), bits)
+
+    def test_standalone_bits_fallback_and_model_override(self):
+        self.assertEqual(
+            capacity.model_bits_specs(["bits=4", "q38@gpu=0", "q36@bits=3"]),
+            ["q38@gpu=0,bits=4", "q36@bits=3"])
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            capacity.model_bits_specs(["q38", "bits=4", "bits=3"])
+
     def test_normalized_suffix_settings(self):
         options = capacity.parse_options({
             "slots": "2", "context": "64K", "output": "8K",
@@ -98,6 +115,34 @@ class CapacityBudgetTests(unittest.TestCase):
 
 
 class InstanceCapacityTests(unittest.TestCase):
+    def test_bits_filters_profiles_without_silent_down_selection(self):
+        for bits in (2, 3, 4, 6):
+            req = coder.parse_model_spec(f"qwen3.8:27b@bits={bits}")
+            candidates = coder.candidates_for_request(req, coder.synthetic_3090(4), 65536)
+            self.assertTrue(candidates)
+            self.assertTrue(all(capacity.quant_bits(c.profile.quant) == bits for c in candidates))
+        req = coder.parse_model_spec("qwen3.8:27b@bits=6,vram=12G,gpu=0")
+        self.assertEqual(coder.candidates_for_request(req, coder.synthetic_3090(1), 262144), [])
+
+    def test_bits_selects_lower_same_bitness_profile_when_needed(self):
+        model = "qwen3.8-flash-next"
+        profiles = [p for p in base.PROFILES[model] if capacity.quant_bits(p.quant) == 4]
+        self.assertGreater(len(profiles), 1)
+        profile, _ = base.best_profile_for_capacity(
+            model, profiles[-1].required_mib, 262144, {"bits": 4})
+        self.assertEqual(profile.quant, profiles[-1].quant)
+
+    def test_bits_rejects_unavailable_and_conflicting_quants(self):
+        for suffix in ("bits=7", "bits=4,quant=IQ3_XXS"):
+            with self.subTest(suffix=suffix), self.assertRaisesRegex(ValueError, "no supported"):
+                coder.parse_model_spec("q38@" + suffix)
+        req = coder.parse_model_spec("q38@bits=3,quant=IQ3_XXS")
+        self.assertEqual(req.capacity["quant"], "IQ3_XXS")
+
+    def test_role_planner_accepts_standalone_bits(self):
+        result = base.plan(["q38", "bits=3"], coder.synthetic_3090(1), 65536)
+        self.assertEqual(capacity.quant_bits(result["servers"][0]["profile"]["quant"]), 3)
+
     def test_config_defaults_inline_independent_override(self):
         defaults = {"qwen3.8:27b": {
             "gpu": 0, "vram": "16G", "slots": 2,
