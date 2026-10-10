@@ -618,7 +618,7 @@ to fail instead). `lib/cpu_platform.py` handles the CPU-specific work:
   - With MCDRAM/HBM, the best-quality quant whose weights and KV fit the on-package
     memory (flat mode), or whose weights fit the MCDRAM cache (cache mode).
   - Otherwise, the best-quality quant estimated to reach the decode target (`min_tps`,
-    default 25 tok/s), falling back to the fastest high-quality quant.
+    default `pushbutton_policy.MIN_DECODE_TOK_S`, 25 tok/s), falling back to the fastest high-quality quant.
 - **Launch strategy**:
   - On a Phi in flat mode: `numactl --membind=<MCDRAM node>` with `--no-mmap`.
   - On multi-socket hosts: `--numa distribute`/`isolate`.

@@ -124,10 +124,6 @@ def make_handler(collector: Collector, trust_forwarded: bool):
             if self.path not in {"/", "/v1/telemetry"}:
                 return self._json(404, {"error": "not found"})
             ip = client_ip(self, trust_forwarded)
-            wait = collector.reserve(ip)
-            if wait:
-                return self._json(429, {"error": "at most one upload per 5 minutes", "retry_after_s": wait},
-                                  {"Retry-After": str(wait)})
             try:
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
@@ -138,6 +134,10 @@ def make_handler(collector: Collector, trust_forwarded: bool):
                 rows = decode_body(self.rfile.read(length), self.headers.get("Content-Encoding", ""))
             except Exception as exc:
                 return self._json(400, {"error": f"invalid NDJSON payload: {type(exc).__name__}"})
+            wait = collector.reserve(ip)
+            if wait:
+                return self._json(429, {"error": "at most one upload per 5 minutes", "retry_after_s": wait},
+                                  {"Retry-After": str(wait)})
             n = collector.ingest(ip, rows)
             return self._json(200, {"accepted": n})
 

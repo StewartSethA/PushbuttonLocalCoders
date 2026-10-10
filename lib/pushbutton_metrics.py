@@ -230,8 +230,9 @@ def upload_pending() -> tuple[int,str]:
 def maybe_upload(min_bytes: int = 0, min_interval_s: int = MIN_UPLOAD_INTERVAL_S, force: bool = False) -> tuple[int,str]:
     """Upload queued data when due: never more often than every 5 minutes.
 
-    ``force`` (used at shutdown) skips only the optional batching thresholds; the
-    5-minute floor always applies. ``min_bytes`` is kept for API compatibility.
+    ``min_bytes`` batches small queues until ``min_interval_s`` (never below the
+    5-minute floor) has elapsed; ``force`` skips only that batching. The 5-minute
+    floor always applies, whatever the arguments.
     """
     cfg=telemetry_config()
     if not cfg.get("enabled"): return 0,"telemetry disabled"

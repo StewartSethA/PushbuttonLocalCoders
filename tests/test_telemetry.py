@@ -138,8 +138,9 @@ class CollectorTests(unittest.TestCase):
 
     def test_rejects_garbage_and_oversized(self):
         self.assertEqual(self.post(b'not json')[0], 400)
-        self.collector.last_by_ip.clear()
         self.assertEqual(self.post(b'x' * (collector_mod.MAX_BODY + 1))[0], 413)
+        # rejected payloads must not consume the sender's 5-minute slot
+        self.assertEqual(self.post(b'{"model":"x"}\n')[0], 200)
 
     def test_end_to_end_client_upload(self):
         old = m.CONFIG, m.QUEUE
