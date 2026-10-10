@@ -87,6 +87,26 @@ For `claude-local`, the Anthropic-compatible endpoint is local llama.cpp through
 
 This also keeps search behavior consistent if the model behind Claude Code changes.
 
+The installed launcher seeds Exa MCP once, preserves your edits, and discloses
+the selected server names and config path at startup. Built-in WebSearch/WebFetch
+are disabled and a local-session instruction directs the model to connected MCP
+tools. Use `/mcp` to verify the server is connected.
+
+To switch providers, edit the disclosed `web-mcp.json` and restart, or pass
+`--local-web-config /absolute/path/web.json` before ordinary Claude flags.
+`CLAUDE_LOCAL_WEB_CONFIG` selects a custom file across launches when set in your
+shell environment. Tavily or a SearXNG MCP adapter can replace Exa using their
+Claude-compatible MCP configuration. Credentials should use the provider's
+credential mechanism, not a checked-in config. `--local-no-web` disables only the
+automatic MCP layer, not the local restriction on hosted tools.
+
+If a resumed transcript keeps choosing `web_search`, start a fresh session with
+a handoff summary. Unsupported calls fail immediately with configuration
+guidance, while normal tool validation/retries remain intact. MCP permission
+prompts are independent: approve only the specific search tool you trust using
+Claude's “don't ask again” option, and review permissions with `/permissions`.
+No blanket MCP approval is added by the launcher.
+
 Anthropic server-side web search reference: https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/web-search-tool
 
 ## Qwen Code

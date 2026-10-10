@@ -106,6 +106,37 @@ class GatewayTests(unittest.TestCase):
     def test_unknown_internal_model_stays_local(self):
         self.assertEqual(self.router.resolve("unexpected-internal-id")["model_id"], "local-sonnet")
 
+    def test_hosted_web_tools_removed_but_client_tools_preserved(self):
+        client = {"name": "web_search", "input_schema": {"type": "object"}}
+        mcp = {"name": "mcp__pushbutton-web__web_search_exa", "input_schema": {"type": "object"}}
+        for hosted in ({"name": "web_search", "type": "web_search_20250305"},
+                       {"name": "web_fetch", "type": "web_fetch_20250910"},
+                       {"name": "WebSearch", "input_schema": {}},
+                       {"name": "WebFetch", "input_schema": {}}):
+            body = {"tools": [hosted, client, mcp], "tool_choice": {"type": "auto"}}
+            self.assertTrue(gwmod.filter_hosted_web_tools(body))
+            self.assertEqual(body["tools"], [client, mcp])
+            self.assertEqual(body["tool_choice"], {"type": "auto"})
+        self.assertFalse(gwmod.filter_hosted_web_tools({"tools": [client, mcp]}))
+
+    def test_filtered_only_web_tools_clear_choice(self):
+        body = {"tools": [{"name": "web_search", "type": "web_search_20250305"}],
+                "tool_choice": {"type": "any"}}
+        gwmod.filter_hosted_web_tools(body)
+        self.assertEqual(body, {"tools": []})
+
+    def test_sse_unsupported_web_call_has_recovery_guidance(self):
+        for kind in ("tool_use", "server_tool_use"):
+            block = {"type": kind, "name": "web_search", "input": {}}
+            payload = ("data: " + json.dumps({"type": "content_block_start",
+                                             "index": 0, "content_block": block}) + "\n\n").encode()
+            errors = gwmod.validate_backend_payload(payload, "text/event-stream", [])
+            self.assertIn("/mcp", errors[0])
+            self.assertIn("not a temporary outage", errors[0])
+            errors = gwmod.validate_backend_payload(json.dumps({"content": [block]}).encode(),
+                                                   "application/json", [])
+            self.assertIn("/mcp", errors[0])
+
     def test_count_tokens_cannot_bypass_smaller_route_capacity(self):
         import json
         import threading
@@ -352,8 +383,75 @@ class ContextPolicyTests(unittest.TestCase):
             i = captured["args"].index("--setting-sources")
             self.assertEqual(captured["args"][i + 1], "")
             i = captured["args"].index("--settings")
-            self.assertTrue(json.loads(captured["args"][i + 1])["autoCompactEnabled"])
+            settings = json.loads(captured["args"][i + 1])
+            self.assertTrue(settings["autoCompactEnabled"])
+            self.assertEqual(settings["permissions"]["deny"], ["WebSearch", "WebFetch"])
+            i = captured["args"].index("--disallowedTools")
+            self.assertEqual(captured["args"][i + 1], "WebSearch,WebFetch")
+            i = captured["args"].index("--append-system-prompt")
+            self.assertIn("exact advertised names", captured["args"][i + 1])
             self.assertEqual(user_config.read_text(), '{"autoCompactEnabled":false}')
+
+    def test_entry_web_config_is_sticky_and_customizable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            (tmp / "lib").mkdir()
+            entry = tmp / "lib" / "claude_local_entry.sh"
+            entry.write_text((ROOT / "lib" / "claude_local_entry.sh").read_text())
+            (tmp / "lib" / "pushbutton_folders.sh").write_text("initialize_folders() { :; }\n")
+            core = tmp / "claude-local"
+            core.write_text('#!/bin/bash\n'
+                            '[[ "${CLAUDE_LOCAL_STARTUP_ONLY:-}" != 1 ]] || exit 125\n'
+                            'printf "%s\\n" "$@"\n')
+            core.chmod(0o755)
+            state = tmp / "state"
+            env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE_LOCAL")}
+            env.update(CLAUDE_LOCAL_STATE=str(state), CLAUDE_LOCAL_WEB_MCP="1",
+                       CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY="1")
+
+            def run(*args):
+                return subprocess.run(["bash", str(entry), "q38", *args],
+                                      env=env, text=True, capture_output=True)
+
+            result = run()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            config = state / "web-mcp.json"
+            self.assertEqual(json.loads(config.read_text())["mcpServers"]["pushbutton-web"]["url"],
+                             "https://mcp.exa.ai/mcp")
+            self.assertIn(str(config), result.stdout)
+            self.assertIn("mcp.exa.ai", result.stdout)
+            self.assertIn("--local-web-config FILE", result.stdout)
+            self.assertEqual(config.stat().st_mode & 0o777, 0o600)
+            custom = '{"mcpServers":{"custom-search":{"type":"http","url":"http://localhost:8080/mcp"}}}'
+            config.write_text(custom)
+            result = run()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(config.read_text(), custom)
+            self.assertIn("custom-search", result.stdout)
+            config.write_text(json.dumps({"mcpServers": {"custom-search": {
+                "type": "http", "url": "https://" + "user:password@" + "example.com/mcp?key=private"}}}))
+            result = run()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("example.com", result.stdout)
+            self.assertNotIn("password", result.stdout)
+            self.assertNotIn("private", result.stdout)
+            alternate = tmp / "alternate.json"
+            alternate.write_text(custom)
+            result = run("--local-web-config", str(alternate))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(str(alternate), result.stdout)
+            self.assertNotIn("--local-web-config\n", result.stdout)
+            env["CLAUDE_LOCAL_WEB_CONFIG"] = str(alternate)
+            self.assertIn(str(alternate), run().stdout)
+            result = run("--local-no-web")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("--mcp-config", result.stdout.splitlines()[1:])
+            config.write_text("{")
+            env.pop("CLAUDE_LOCAL_WEB_CONFIG")
+            result = run()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Invalid web MCP config", result.stderr)
+            self.assertEqual(config.read_text(), "{")
 
     def test_launcher_rejects_unsafe_flags_before_dependencies(self):
         env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "DISABLE_"))}
@@ -691,6 +789,41 @@ class GatewayBudgetHTTPTests(unittest.TestCase):
         self.assertIn(b"invalid backend tool arguments", raw)
         self.assertEqual([p for p, _ in self.requests],
                          ["/v1/messages/count_tokens", "/v1/messages", "/v1/messages"])
+
+    def test_hosted_web_tools_filtered_for_count_and_inference(self):
+        body = {"model": "haiku", "max_tokens": 8192, "messages": [],
+                "tools": [{"name": "web_search", "type": "web_search_20250305"},
+                          {"name": "mcp__pushbutton-web__web_search_exa",
+                           "input_schema": {"type": "object"}}]}
+        self.assertEqual(self.request(body)[0], 200)
+        counted, inferred = (b for _, b in self.requests)
+        self.assertEqual(counted, inferred)
+        self.assertEqual(counted["tools"], body["tools"][1:])
+        self.requests.clear()
+        self.assertEqual(self.request(body, path="/v1/messages/count_tokens")[0], 200)
+        self.assertFalse(any(p == "/v1/messages" for p, _ in self.requests))
+
+    def test_forced_hosted_web_tool_rejected_without_backend_work(self):
+        body = {"model": "haiku", "max_tokens": 8192, "messages": [],
+                "tools": [{"name": "web_search", "type": "web_search_20250305"}],
+                "tool_choice": {"type": "tool", "name": "web_search"}}
+        status, raw, _ = self.request(body)
+        self.assertEqual(status, 400)
+        self.assertIn(b"/mcp", raw)
+        self.assertEqual(self.requests, [])
+
+    def test_unsupported_web_call_fails_without_retry_even_after_all_tools_filtered(self):
+        self.inference_result = {"type": "message", "content": [
+            {"type": "tool_use", "id": "t", "name": "web_search", "input": {}}]}
+        for tools in ([{"name": "test", "input_schema": {"type": "object"}}],
+                      [{"name": "web_search", "type": "web_search_20250305"}]):
+            self.requests.clear()
+            body = {"model": "haiku", "max_tokens": 8192, "messages": [], "tools": tools}
+            status, raw, _ = self.request(body)
+            self.assertEqual(status, 400)
+            self.assertIn(b"--local-web-config FILE", raw)
+            self.assertIn(b"not a temporary outage", raw)
+            self.assertEqual(sum(p == "/v1/messages" for p, _ in self.requests), 1)
 
     def test_valid_tool_response_preserved_after_budget_check(self):
         self.inference_result = {"type": "message", "content": [
