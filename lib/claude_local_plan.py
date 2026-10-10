@@ -279,7 +279,7 @@ def smart_defaults(gpus: list[GPU]) -> list[str]:
     total_free = sum(g.free_mib for g in gpus)
     if max_free >= 15800:
         if total_free >= 42000 and len(gpus) >= 2:
-            return ["nemotron-3.5-lightning", "qwen3.6:35b", "qwen3.6:35b", "qwen3.6:35b"]
+            return ["nemotron-3.5-lightning", "qwen3.6:35b"]
         return ["qwen3.6:35b"]
     if max_free >= 14500:
         return ["qwen3.8:27b"]

@@ -107,6 +107,13 @@ class SchedulerPolicyTests(unittest.TestCase):
         p = planmod.plan([f"q38@gpu={i}" for i in range(4)], gpus, 262144)
         self.assertEqual(list(p["role_ids"].values()), [s["id"] for s in p["servers"]])
 
+    def test_smart_defaults_use_two_instances_on_two_gpus(self):
+        gpus = [planmod.GPU(i, "RTX 3090", 24576, 24576) for i in range(2)]
+        models = planmod.smart_defaults(gpus)
+        self.assertEqual(len(models), 2)
+        p = planmod.plan(models, gpus, 262144)
+        self.assertEqual(len(p["servers"]), 2)
+
     def test_repeated_model_pins_still_cannot_overcommit(self):
         gpus = [planmod.GPU(i, "RTX 3090", 24576, 24576) for i in range(2)]
         with self.assertRaisesRegex(ValueError, "cannot place"):
