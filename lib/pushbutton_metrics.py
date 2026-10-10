@@ -10,7 +10,7 @@ The important distinction is between *measurement* and *upload*:
 - prompts, generated text, usernames, hostnames and local paths are never queued.
 """
 from __future__ import annotations
-import contextlib, gzip, json, os, pathlib, statistics, time, urllib.request
+import contextlib, gzip, json, os, pathlib, shutil, statistics, time, urllib.request
 try:
     import fcntl
 except ImportError:  # pragma: no cover - non-POSIX
@@ -28,9 +28,41 @@ CACHE = pathlib.Path(os.environ.get("PUSHBUTTON_CACHE_DIR", pathlib.Path.home()/
 RUNTIME = pathlib.Path(os.environ.get("PUSHBUTTON_RUNTIME_DIR", pathlib.Path.home()/".local/share/pushbutton/runtime"))
 LIVE_RESULTS = RUNTIME / "observations"
 QUEUE = CACHE / "telemetry-queue"
-CONSENT_VERSION = 1
+CONSENT_VERSION = 2
 MIN_UPLOAD_INTERVAL_S = 300
 TELEMETRY_SCHEMA = 2
+# Set to the deployed ingest relay (telemetry/worker) once it exists; until then
+# data stays queued unless the user or $PUSHBUTTON_TELEMETRY_UPLOAD_URL sets one.
+DEFAULT_UPLOAD_URL = ""
+PUBLIC_MIN_CONTRIBUTORS = 3
+CONSENT_TEXT = f"""\
+Pushbutton performance telemetry (on by default; answer n, or use --telemetry-off at any time)
+  Sent: model, quant, backend, hardware type (CPU/GPU model, sockets/cores, memory size),
+    launch strategy, model load time, and prompt/decode tok/s at each context depth.
+  Never sent: prompts, outputs, code, file names, paths, usernames or hostnames.
+  Stored: the collector adds the receive time and a keyed hash of your IP address. The raw IP
+    is used only for rate limiting and is not stored. Records go to a private repository
+    readable only by the maintainers.
+  Published: only aggregated, anonymized statistics (medians per model/quant/hardware/context
+    depth, shown only when at least {PUBLIC_MIN_CONTRIBUTORS} different contributors share a group) on the public
+    benchmark page. No IP hashes, timestamps or individual records are ever published.
+  Uploads happen at most once every {MIN_UPLOAD_INTERVAL_S // 60} minutes.
+  Disclaimer: telemetry is used only for performance analytics; it is never sold or used for
+    advertising or tracking. Published benchmarks are community-contributed and provided as-is,
+    without warranty. Because records carry no account or install id, past records cannot be
+    attributed to you; turning telemetry off stops all further uploads and clears the queue."""
+SANITIZED_FIELDS = (
+    "schema_version","timestamp_utc","model","backend","artifact","backend_commit",
+    "context","gpu_models","gpu_memory_mib","ram_gib","prompt_tokens","completion_tokens",
+    "prompt_tokens_estimated","completion_tokens_estimated","pp","tg","ttft","elapsed_s",
+    "concurrency","source","method","status_code",
+    "event","device","cpu_model","cpu_family","cpu_tier","cpu_sockets","cpu_cores",
+    "fast_mem_kind","fast_mem_mode","strategy","threads","threads_batch","memory_tier",
+    "load_time_s",
+)
+STRING_FIELDS = ("model","backend","artifact","device","cpu_model","cpu_family","cpu_tier","strategy",
+                 "memory_tier","event","source","method","fast_mem_kind","fast_mem_mode","backend_commit")
+DEPTH_FIELDS = ("depth","pp_tps","tg_tps","pp_tps_estimate","tg_tps_estimate")
 
 
 def _read_json(path: pathlib.Path, default):
@@ -50,6 +82,12 @@ def telemetry_config() -> dict:
     return _read_json(CONFIG/"telemetry.json", {})
 
 
+def telemetry_enabled() -> bool:
+    """Uploads need consent to the current disclosure (CONSENT_TEXT), not just an old flag."""
+    cfg=telemetry_config()
+    return bool(cfg.get("enabled")) and int(cfg.get("consent_version",0) or 0) >= CONSENT_VERSION
+
+
 def telemetry_consent_recorded() -> bool:
     cfg=telemetry_config()
     return int(cfg.get("consent_version",0) or 0) >= CONSENT_VERSION
@@ -59,6 +97,7 @@ def set_telemetry(enabled: bool, upload_url: str | None = None) -> pathlib.Path:
     old=telemetry_config()
     obj={**old,"enabled":bool(enabled),"consent_version":CONSENT_VERSION,"consent_timestamp":int(time.time())}
     if upload_url: obj["upload_url"]=upload_url
+    if not enabled: shutil.rmtree(QUEUE,ignore_errors=True)
     return _write_json(CONFIG/"telemetry.json",obj)
 
 
@@ -79,32 +118,22 @@ def _sanitize_depths(rows) -> list[dict]:
     out=[]
     for r in rows if isinstance(rows,list) else []:
         if not isinstance(r,dict):continue
-        row={k:_num(r.get(k)) for k in ("depth","pp_tps","tg_tps","pp_tps_estimate","tg_tps_estimate")}
+        row={k:_num(r.get(k)) for k in DEPTH_FIELDS}
         row={k:v for k,v in row.items() if v is not None}
         if "depth" in row:out.append(row)
     return out[:32]
 
 
 def _sanitize_observation(obs: dict) -> dict:
-    allowed=(
-        "schema_version","timestamp_utc","model","backend","artifact","backend_commit",
-        "context","gpu_models","gpu_memory_mib","ram_gib","prompt_tokens","completion_tokens",
-        "prompt_tokens_estimated","completion_tokens_estimated","pp","tg","ttft","elapsed_s",
-        "concurrency","source","method","status_code",
-        "event","device","cpu_model","cpu_family","cpu_tier","cpu_sockets","cpu_cores",
-        "fast_mem_kind","fast_mem_mode","strategy","threads","threads_batch","memory_tier",
-        "load_time_s",
-    )
-    out={k:obs.get(k) for k in allowed if obs.get(k) is not None}
-    for k in ("model","backend","artifact","device","cpu_model","cpu_family","cpu_tier","strategy",
-              "memory_tier","event","source","method","fast_mem_kind","fast_mem_mode","backend_commit"):
+    out={k:obs.get(k) for k in SANITIZED_FIELDS if obs.get(k) is not None}
+    for k in STRING_FIELDS:
         if k in out:out[k]=str(out[k])[:160]
     if obs.get("depths") is not None:out["depths"]=_sanitize_depths(obs.get("depths"))
     return out
 
 
 def _queue_line(obs: dict) -> pathlib.Path | None:
-    if not telemetry_config().get("enabled"): return None
+    if not telemetry_enabled(): return None
     QUEUE.mkdir(parents=True,exist_ok=True)
     p=QUEUE/"live.ndjson"
     with p.open("a") as f: f.write(json.dumps(_sanitize_observation(obs),separators=(",",":"))+"\n")
@@ -150,7 +179,7 @@ def device_descriptor(cpu_summary: dict | None = None, strategy: dict | None = N
 
 
 def queue_report(report: dict) -> pathlib.Path | None:
-    if not telemetry_config().get("enabled"):return None
+    if not telemetry_enabled():return None
     backend=report.get("backend") or {}
     compact={
         "schema_version":1,"timestamp_utc":report.get("timestamp_utc"),"model":report.get("model"),
@@ -177,7 +206,8 @@ def queued_bytes() -> int:
 
 
 def upload_url() -> str | None:
-    return telemetry_config().get("upload_url") or os.environ.get("PUSHBUTTON_TELEMETRY_UPLOAD_URL")
+    return (telemetry_config().get("upload_url") or os.environ.get("PUSHBUTTON_TELEMETRY_UPLOAD_URL")
+            or DEFAULT_UPLOAD_URL or None)
 
 
 @contextlib.contextmanager
@@ -203,7 +233,7 @@ def upload_pending() -> tuple[int,str]:
     lock, and the attempt is recorded *before* sending so failures back off too.
     """
     cfg=telemetry_config(); url=upload_url()
-    if not cfg.get("enabled"):return 0,"telemetry disabled"
+    if not telemetry_enabled():return 0,"telemetry disabled or awaiting consent to the current disclosure"
     if not url:return 0,"telemetry enabled; measurements are queued locally because no collector URL is configured"
     with _upload_lock():
         cfg=telemetry_config()
@@ -235,7 +265,7 @@ def maybe_upload(min_bytes: int = 0, min_interval_s: int = MIN_UPLOAD_INTERVAL_S
     floor always applies, whatever the arguments.
     """
     cfg=telemetry_config()
-    if not cfg.get("enabled"): return 0,"telemetry disabled"
+    if not telemetry_enabled(): return 0,"telemetry disabled or awaiting consent to the current disclosure"
     last=max(float(cfg.get("last_upload_epoch",0) or 0),float(cfg.get("last_attempt_epoch",0) or 0))
     age=time.time()-last
     size=queued_bytes()

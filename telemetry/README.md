@@ -1,47 +1,102 @@
-# Telemetry records
+# Telemetry destination
 
-`records/YYYY-MM-DD.ndjson` holds the telemetry received by
-[`pushbutton-telemetry-collector`](../pushbutton-telemetry-collector), one JSON object per line.
+GitHub can host the **storage** (a private repository for raw records) and the **public
+dashboard** (GitHub Pages). It cannot host the **always-on ingest endpoint**:
 
-## Record fields
+- Pages serves static files only.
+- Actions jobs are not servers.
+- Every GitHub write API needs a token, which must never ship inside the client.
 
-The collector adds two fields to every record:
+So a tiny relay that holds the token sits in front:
 
-- `received_utc`: the time the server received the record.
-- `sender_ip`: the uploader's IP address, taken from the TCP peer, or from
-  `X-Forwarded-For` only with `--trust-forwarded-for`.
-
-All other fields are whitelisted by `lib/pushbutton_metrics._sanitize_observation`:
-
-| category | fields |
-|---|---|
-| model and backend | `model`, `artifact` (quant), `backend` |
-| load and throughput | `load_time_s`; `depths`: `[{depth, pp_tps, tg_tps, pp_tps_estimate, tg_tps_estimate}]`; per-request `pp`, `tg`, `ttft`, `prompt_tokens` |
-| hardware | GPU names/memory, or `cpu_model`, `cpu_family`, `cpu_tier`, `cpu_sockets`, `cpu_cores`, `fast_mem_kind`, `fast_mem_mode` |
-| CPU launch strategy | `strategy`, `threads`, `threads_batch`, `memory_tier` |
-
-Prompts, generated text, usernames, hostnames and local paths are never accepted.
-
-## Running the collector
-
-```bash
-./pushbutton-telemetry-collector --port 8787 --git-commit --git-push   # behind TLS, e.g. a reverse proxy
-# clients:
-pushbutton --telemetry-on --telemetry-url https://YOUR-HOST/v1/telemetry
+```
+pushbutton client ──POST gzip NDJSON──▶ relay (Cloudflare Worker, always on, free tier)
+   ≤ 1 upload / 5 min                    │  whitelist fields, stamp received_utc,
+                                         │  sender_hash = HMAC-SHA256(IP_SALT, ip)[:16]
+                                         ▼  (raw IP never stored)
+                     PRIVATE repo  <owner>/pushbutton-telemetry-data   records/YYYY/MM/DD/*.ndjson
+                                         │  read-only token, every 6 h
+                                         ▼
+             .github/workflows/telemetry-dashboard.yml → telemetry/aggregate.py
+                                         │  anonymize: drop hashes/timestamps, k ≥ 3 contributors
+                                         ▼
+                      GitHub Pages (public): index.html + summary.json
 ```
 
-The collector enforces these limits:
+| piece | file | runs on |
+|---|---|---|
+| relay | [`worker/src/index.js`](worker/src/index.js), [`worker/wrangler.toml`](worker/wrangler.toml) | Cloudflare Workers (100k requests/day free) |
+| self-hosted alternative | [`../pushbutton-telemetry-collector`](../pushbutton-telemetry-collector) | any small VM behind TLS |
+| aggregator | [`aggregate.py`](aggregate.py) | GitHub Actions |
+| dashboard | [`dashboard/index.html`](dashboard/index.html) | GitHub Pages |
 
-- One accepted upload per sender IP every 5 minutes; otherwise it returns HTTP 429 with
-  `Retry-After`. Clients enforce the same interval themselves.
-- 256 KiB compressed and 4 MiB decompressed per upload, and at most 2000 records per upload.
+## Setup (once)
 
-`--git-commit` commits new records every `--commit-interval` seconds. `--git-push` also
-pushes, using the operator's git credentials. Clients never receive repository
-credentials.
+1. **Private data repository.** Create `pushbutton-telemetry-data` as **private**.
+   - Create two fine-grained tokens, each scoped to that repository only:
+     - **relay**: Contents read and write.
+     - **dashboard**: Contents read-only.
+2. **Relay.** In `telemetry/worker`, set `DATA_REPO` in `wrangler.toml`, then:
+   ```bash
+   npx wrangler secret put GITHUB_TOKEN    # the relay token
+   npx wrangler secret put IP_SALT         # e.g. `openssl rand -hex 32`; keep it secret
+   npx wrangler kv namespace create RATE_KV   # optional: paste the id into wrangler.toml
+   npx wrangler deploy
+   ```
+   Put the resulting `https://pushbutton-telemetry.<account>.workers.dev/v1/telemetry` into
+   `DEFAULT_UPLOAD_URL` in `lib/pushbutton_metrics.py`.
+3. **Dashboard.** In this public repository:
+   - Settings → Pages → Source: **GitHub Actions**.
+   - Add the variable `TELEMETRY_DATA_REPO=<owner>/pushbutton-telemetry-data`.
+   - Add the secret `TELEMETRY_DATA_TOKEN` (the dashboard token).
+   - Run the **telemetry dashboard** workflow. It also runs every 6 hours.
 
-## Privacy
+## What is stored, and what is public
 
-IP addresses are personal data in many jurisdictions (for example under GDPR). Records in
-this directory are public once pushed. Operators should publish a privacy notice and
-consider truncating or hashing `sender_ip` before pushing.
+**Raw records (private repository).**
+- Whitelisted fields only: `pushbutton_metrics.SANITIZED_FIELDS`, the same list as the
+  worker's `SANITIZED_FIELDS`; a unit test keeps the two in sync.
+  - model, quant, backend
+  - hardware type
+  - CPU launch strategy
+  - load time
+  - PP/TG per context depth
+- Plus `received_utc` and `sender_hash`.
+- `sender_hash` is a keyed HMAC of the IP. Without `IP_SALT` it cannot be reversed or matched
+  against a list of IPs, and rotating the salt unlinks all future records from past ones.
+
+**Public dashboard.** Built by `aggregate.py`:
+- Keeps only model, quant, backend, a normalized hardware class, the strategy and a
+  context-depth bucket.
+- Publishes median and p25–p75 of PP/TG tok/s and load time.
+- Never publishes hashes, IPs, timestamps or individual records.
+- k-anonymity: a group is published only when at least 3 distinct senders
+  (`PUBLIC_MIN_CONTRIBUTORS`) contributed. Smaller groups are counted as withheld.
+- Strings that don't look like model or hardware names become `other`.
+- The page renders data with DOM text nodes only.
+- The workflow fails if `sender_*` or `received_utc` ever reach the artifact.
+
+## Limits
+
+- One accepted upload per sender every 5 minutes (HTTP 429 + `Retry-After`). Clients enforce
+  the same interval.
+- Rejected payloads do not consume the slot.
+- 256 KiB compressed / 4 MiB decompressed per upload; at most 2000 records per upload.
+
+## Self-hosted collector
+
+```bash
+git clone git@github.com:<owner>/pushbutton-telemetry-data.git ~/telemetry-data
+./pushbutton-telemetry-collector --port 8787 --records ~/telemetry-data/records --git-commit --git-push
+```
+
+- The collector writes the same `sender_hash` format as the relay.
+- The salt is read from `$PUSHBUTTON_TELEMETRY_SALT` or a generated 0600 file
+  (`--salt-file`).
+
+## Tests
+
+```bash
+python3 -m unittest tests/test_telemetry.py
+(cd telemetry/worker && npm test)
+```

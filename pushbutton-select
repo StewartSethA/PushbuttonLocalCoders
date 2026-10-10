@@ -364,7 +364,7 @@ def main():
    raise ValueError(f'{arg} changes the plan; use selector options instead of --launch-arg')
  interactive=sys.stdin.isatty() and sys.stdout.isatty() and not (a.no_interactive or a.json or a.plan_only)
  if a.telemetry_opt_in:
-  p=metrics.set_telemetry(True,a.telemetry_upload_url); print(f'Opt-in telemetry enabled in {p}. Only compact benchmark metadata is queued; prompts/text are excluded.',file=sys.stderr)
+  p=metrics.set_telemetry(True,a.telemetry_upload_url); print(metrics.CONSENT_TEXT,file=sys.stderr); print(f'Opt-in telemetry enabled in {p}. Only compact benchmark metadata is queued; prompts/text are excluded.',file=sys.stderr)
  if a.telemetry_off:
   p=metrics.set_telemetry(False); print(f'Telemetry disabled in {p}.',file=sys.stderr)
  action=None

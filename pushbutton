@@ -121,12 +121,9 @@ def configure(cfg,args):
             if raw in {'qwen','opencode','none'}:cfg['frontend']=raw
     if args.telemetry_on:metrics.set_telemetry(True,args.telemetry_url)
     elif args.telemetry_off:metrics.set_telemetry(False)
-    elif first and sys.stdin.isatty() and not metrics.telemetry_consent_recorded():
-        print('Pushbutton can contribute compact performance telemetry: model load time and prompt/decode\n'
-              'tok/s at each context depth, with model/quant and hardware type. No prompts, outputs,\n'
-              'usernames, hostnames or paths are sent. The collector records the receive timestamp and\n'
-              'your IP address. Uploads happen at most once every 5 minutes. Change later with\n'
-              '--telemetry-off / --telemetry-on.',file=sys.stderr)
+    elif (first or metrics.telemetry_config().get('enabled')) and sys.stdin.isatty() and not metrics.telemetry_consent_recorded():
+        # first run, or an earlier opt-in under an older disclosure: ask (again) with the current one
+        print(metrics.CONSENT_TEXT,file=sys.stderr)
         raw=input('Enable telemetry? [Y/n]: ').strip().lower()
         metrics.set_telemetry(raw not in {'n','no'},args.telemetry_url)
     if not getattr(args,'plan_only',False):write_json(CONFIG,cfg)

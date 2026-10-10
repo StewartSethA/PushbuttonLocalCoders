@@ -645,9 +645,11 @@ print a warning.
 
 ## Telemetry
 
-On first interactive run, `pushbutton` asks `Enable telemetry? [Y/n]`. Pressing Enter enables it.
-Non-interactive first runs never enable telemetry silently. Change your choice at any time
-with `--telemetry-on` / `--telemetry-off`.
+On first interactive run, `pushbutton` shows the full disclosure and disclaimer
+(`pushbutton_metrics.CONSENT_TEXT`) and asks `Enable telemetry? [Y/n]`. Pressing Enter enables it.
+Non-interactive first runs never enable telemetry silently. Users who opted in under an older
+disclosure are asked again, and nothing is queued or uploaded until they answer. Change your
+choice at any time with `--telemetry-on` / `--telemetry-off`; opting out also clears the queue.
 
 When enabled, compact records are queued locally and uploaded **at most once every 5
 minutes**. This limit is enforced across processes with a file lock, and failed attempts
@@ -659,11 +661,18 @@ also back off. Records contain:
 
 Records never contain prompts, outputs, usernames, hostnames or paths.
 
-Records go to the URL in `~/.config/pushbutton-local/telemetry.json` (`upload_url`, set with
-`--telemetry-url`) or `PUSHBUTTON_TELEMETRY_UPLOAD_URL`. With no URL configured, they stay queued.
-The public ingest API is `pushbutton-telemetry-collector`. It stamps every record with the
-receive time and the **sender's IP address** and appends it to
-`telemetry/records/YYYY-MM-DD.ndjson` in this repository; see [telemetry/README.md](telemetry/README.md).
+Where the data goes:
+
+| stage | where | contents |
+|---|---|---|
+| ingest | always-on relay ([telemetry/worker](telemetry/worker), Cloudflare Worker) or self-hosted `pushbutton-telemetry-collector` | adds receive time and a **keyed hash of the sender IP**; the raw IP is never stored |
+| raw store | a **private** GitHub data repository | hashed records, readable only by maintainers |
+| public | GitHub Pages benchmark dashboard built by `telemetry/aggregate.py` | anonymized aggregates only: medians per model/quant/hardware/strategy/depth, shown only when ≥3 contributors share a group |
+
+The client sends to `upload_url` in `~/.config/pushbutton-local/telemetry.json` (set with
+`--telemetry-url`), `PUSHBUTTON_TELEMETRY_UPLOAD_URL`, or `pushbutton_metrics.DEFAULT_UPLOAD_URL`
+once the maintainers' relay is deployed. With no URL, records stay queued. Setup is in
+[telemetry/README.md](telemetry/README.md).
 
 ---
 

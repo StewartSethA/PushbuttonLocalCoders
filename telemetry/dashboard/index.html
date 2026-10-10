@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'none'">
+<title>Pushbutton Local Coders — community benchmarks</title>
+<style>
+  body { font: 14px/1.45 system-ui, sans-serif; margin: 1.5rem auto; max-width: 1200px; padding: 0 1rem; color: #1f2328; }
+  h1 { font-size: 1.5rem; margin-bottom: .25rem; }
+  .note { background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 6px; padding: .75rem 1rem; margin: 1rem 0; }
+  table { border-collapse: collapse; width: 100%; margin: .5rem 0 2rem; }
+  th, td { border-bottom: 1px solid #d0d7de; padding: .3rem .5rem; text-align: left; white-space: nowrap; }
+  th { background: #f6f8fa; position: sticky; top: 0; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .muted { color: #656d76; }
+  input { padding: .35rem .5rem; width: 20rem; max-width: 100%; }
+</style>
+</head>
+<body>
+<h1>Community benchmarks</h1>
+<p class="muted" id="meta"></p>
+
+<div class="note">
+  <strong>Privacy:</strong> this page shows aggregated, anonymized analytics only: medians and
+  interquartile ranges per model, quant, hardware class, launch strategy and context-depth bucket.
+  A group is shown only when at least <span id="k"></span> different contributors measured it.
+  No IP addresses or IP hashes, timestamps, or individual records are published.
+  Telemetry is opt-in at first run and can be turned off with <code>--telemetry-off</code>.
+  <br><strong>Disclaimer:</strong> results are community-contributed and provided as-is, without
+  warranty; real throughput depends on drivers, build flags, thermals and workload. CPU roofline
+  estimates are in <a href="https://github.com/StewartSethA/PushbuttonLocalCoders/blob/main/benchmarks/cpu/ESTIMATES.md">benchmarks/cpu/ESTIMATES.md</a>.
+</div>
+
+<input id="filter" type="search" placeholder="Filter by model, quant or hardware…" aria-label="filter">
+
+<h2>Prompt processing and decode speed by context depth (tok/s)</h2>
+<table id="perf"><thead><tr>
+  <th>model</th><th>quant</th><th>backend</th><th>hardware</th><th>strategy</th><th>depth</th>
+  <th>PP median</th><th>PP p25–p75</th><th>TG median</th><th>TG p25–p75</th><th>samples</th><th>contributors</th>
+</tr></thead><tbody></tbody></table>
+
+<h2>Model load time (s)</h2>
+<table id="load"><thead><tr>
+  <th>model</th><th>quant</th><th>backend</th><th>hardware</th><th>strategy</th>
+  <th>median</th><th>p25–p75</th><th>samples</th><th>contributors</th>
+</tr></thead><tbody></tbody></table>
+
+<script>
+const SUMMARY = /*__SUMMARY__*/null;
+const cell = (tr, text, num) => {
+  const td = document.createElement("td");
+  td.textContent = text == null || text === "" ? "–" : String(text);
+  if (num) td.className = "num";
+  tr.appendChild(td);
+};
+const med = (s) => (s ? s.median : null);
+const iqr = (s) => (s ? `${s.p25}–${s.p75}` : null);
+const n = (...ss) => Math.max(0, ...ss.map((s) => (s ? s.n : 0)));
+function render() {
+  const q = document.getElementById("filter").value.toLowerCase();
+  const keep = (r) => !q || [r.model, r.quant, r.hardware, r.backend, r.strategy].join(" ").toLowerCase().includes(q);
+  const perf = document.querySelector("#perf tbody");
+  const load = document.querySelector("#load tbody");
+  perf.replaceChildren();
+  load.replaceChildren();
+  for (const r of (SUMMARY && SUMMARY.performance || []).filter(keep)) {
+    const tr = document.createElement("tr");
+    [r.model, r.quant, r.backend, r.hardware, r.strategy, r.depth].forEach((v) => cell(tr, v));
+    cell(tr, med(r.pp_tps), 1); cell(tr, iqr(r.pp_tps), 1);
+    cell(tr, med(r.tg_tps), 1); cell(tr, iqr(r.tg_tps), 1);
+    cell(tr, n(r.pp_tps, r.tg_tps), 1); cell(tr, r.contributors, 1);
+    perf.appendChild(tr);
+  }
+  for (const r of (SUMMARY && SUMMARY.load_time || []).filter(keep)) {
+    const tr = document.createElement("tr");
+    [r.model, r.quant, r.backend, r.hardware, r.strategy].forEach((v) => cell(tr, v));
+    cell(tr, med(r.load_time_s), 1); cell(tr, iqr(r.load_time_s), 1);
+    cell(tr, n(r.load_time_s), 1); cell(tr, r.contributors, 1);
+    load.appendChild(tr);
+  }
+}
+document.getElementById("k").textContent = SUMMARY ? SUMMARY.min_contributors : "?";
+document.getElementById("meta").textContent = SUMMARY
+  ? `Updated ${SUMMARY.generated_utc}. ${SUMMARY.groups_published} group(s) shown; ${SUMMARY.groups_suppressed} withheld (too few contributors).`
+  : "No data yet.";
+document.getElementById("filter").addEventListener("input", render);
+render();
+</script>
+</body>
+</html>

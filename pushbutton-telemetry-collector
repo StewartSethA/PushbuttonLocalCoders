@@ -4,8 +4,9 @@
 POST /v1/telemetry with gzip or plain NDJSON (one compact record per line, as
 sent by ``lib/pushbutton_metrics.upload_pending``). Each accepted record is
 whitelisted, stamped with the server receive time (``received_utc``) and the
-sender's IP address (``sender_ip``), and appended to
-``telemetry/records/YYYY-MM-DD.ndjson``.
+sender's IP address as a keyed hash (``sender_hash``, HMAC-SHA256 with a secret
+salt), and appended to ``<records>/YYYY-MM-DD.ndjson``. Raw IP addresses are only
+held in memory for rate limiting and are never written to disk.
 
 Protections: one accepted upload per sender IP per 5 minutes (HTTP 429 with
 Retry-After otherwise), compressed/decompressed size limits, a per-upload record
@@ -14,21 +15,44 @@ cap and field whitelisting. ``X-Forwarded-For`` is only honoured with
 
 With ``--git-commit`` the collector commits new records every ``--commit-interval``
 seconds, and ``--git-push`` also pushes using the operator's own git credentials.
-No credentials are ever shipped to clients.
+Point ``--records`` at a clone of a *private* data repository; the public
+dashboard is built from it by ``telemetry/aggregate.py``. No credentials are
+ever shipped to clients.
 """
 from __future__ import annotations
-import argparse, gzip, io, ipaddress, json, pathlib, subprocess, sys, threading, time
+import argparse, gzip, hashlib, hmac, io, ipaddress, json, os, pathlib, secrets, subprocess, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "lib"))
 import pushbutton_metrics as metrics  # noqa: E402
 
-RECORDS = ROOT / "telemetry/records"
+# Raw (hashed) records belong in a private data repository clone, never in this public repo.
+RECORDS = pathlib.Path(os.environ.get("PUSHBUTTON_TELEMETRY_RECORDS",
+                                      pathlib.Path.home() / ".local/share/pushbutton/telemetry-records"))
 MAX_BODY = 256 * 1024
 MAX_DECOMPRESSED = 4 * 1024 * 1024
 MAX_RECORDS = 2000
 RATE_LIMIT_S = metrics.MIN_UPLOAD_INTERVAL_S
+SALT_FILE = pathlib.Path.home() / ".config/pushbutton/telemetry-collector.salt"
+
+
+def load_salt(path: pathlib.Path = SALT_FILE) -> bytes:
+    """Secret HMAC key for sender hashes: $PUSHBUTTON_TELEMETRY_SALT or a private 0600 file."""
+    env = os.environ.get("PUSHBUTTON_TELEMETRY_SALT")
+    if env:
+        return env.encode()
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(secrets.token_hex(32))
+    return path.read_text().strip().encode()
+
+
+def sender_hash(ip: str, salt: bytes) -> str:
+    """Pseudonymous sender id; must match telemetry/worker/src/index.js senderHash()."""
+    return hmac.new(salt, ip.encode(), hashlib.sha256).hexdigest()[:16]
 
 
 def client_ip(handler: BaseHTTPRequestHandler, trust_forwarded: bool) -> str:
@@ -61,8 +85,10 @@ def decode_body(raw: bytes, encoding: str) -> list[dict]:
 
 
 class Collector:
-    def __init__(self, records: pathlib.Path, rate_limit_s: float = RATE_LIMIT_S, clock=time.time):
+    def __init__(self, records: pathlib.Path, rate_limit_s: float = RATE_LIMIT_S, clock=time.time,
+                 salt: bytes | None = None):
         self.records = records
+        self.salt = salt if salt is not None else secrets.token_bytes(32)
         self.rate_limit_s = rate_limit_s
         self.clock = clock
         self.last_by_ip: dict[str, float] = {}
@@ -85,12 +111,13 @@ class Collector:
     def ingest(self, ip: str, rows: list[dict]) -> int:
         now = self.clock()
         stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+        sender = sender_hash(ip, self.salt)
         lines = []
         for row in rows:
             clean = metrics._sanitize_observation(row)
             if not clean:
                 continue
-            lines.append(json.dumps({"received_utc": stamp, "sender_ip": ip, **clean},
+            lines.append(json.dumps({**clean, "received_utc": stamp, "sender_hash": sender},
                                     separators=(",", ":"), sort_keys=True))
         with self.lock:
             if lines:
@@ -153,10 +180,11 @@ def git_committer(collector: Collector, interval: float, push: bool, stop: threa
         if not dirty:
             continue
         try:
-            subprocess.run(["git", "-C", str(ROOT), "add", str(collector.records)], check=True)
-            subprocess.run(["git", "-C", str(ROOT), "commit", "-q", "-m", "telemetry: append records"], check=False)
+            repo = str(collector.records)
+            subprocess.run(["git", "-C", repo, "add", "."], check=True)
+            subprocess.run(["git", "-C", repo, "commit", "-q", "-m", "telemetry: append records"], check=False)
             if push:
-                subprocess.run(["git", "-C", str(ROOT), "push", "-q"], check=False)
+                subprocess.run(["git", "-C", repo, "push", "-q"], check=False)
         except Exception as exc:
             sys.stderr.write(f"[telemetry-collector] git commit failed: {exc}\n")
 
@@ -170,8 +198,10 @@ def main(argv=None) -> int:
     ap.add_argument("--git-commit", action="store_true")
     ap.add_argument("--git-push", action="store_true")
     ap.add_argument("--commit-interval", type=float, default=300)
+    ap.add_argument("--salt-file", default=str(SALT_FILE),
+                    help="secret HMAC key for sender hashes (or set PUSHBUTTON_TELEMETRY_SALT)")
     a = ap.parse_args(argv)
-    collector = Collector(pathlib.Path(a.records))
+    collector = Collector(pathlib.Path(a.records), salt=load_salt(pathlib.Path(a.salt_file)))
     server = ThreadingHTTPServer((a.host, a.port), make_handler(collector, a.trust_forwarded_for))
     stop = threading.Event()
     if a.git_commit or a.git_push:
