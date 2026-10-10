@@ -10,6 +10,7 @@ PLAN_PY="$LIB/claude_local_plan.py"
 GATEWAY_PY="$LIB/claude_local_gateway.py"
 HOSTCC_SH="$LIB/claude_local_hostcc.sh"
 source "$LIB/pushbutton_download.sh"
+source "$LIB/claude_local_policy.sh"
 
 STATE_DIR="${CLAUDE_LOCAL_STATE:-$HOME/.local/share/pushbutton/claude-local}"
 CACHE_DIR="${CLAUDE_LOCAL_CACHE:-$HOME/.cache/pushbutton/llama}"
@@ -409,6 +410,41 @@ start_gateway() {
 
 contains_claude_flag() { local w="$1" x; for x in "${CLAUDE_ARGS[@]:-}"; do [[ "$x" == "$w" || "$x" == "$w="* ]] && return 0; done; return 1; }
 
+confirm_single_slot_auto_mode() {
+    claude_local_auto_mode_requested "${CLAUDE_ARGS[@]}" || return 0
+
+    warn "This launcher uses one request slot per local model server (-np 1). Auto mode's client-side classifier shares those slots, so it may queue behind other inference and hit the configured stream-idle/request timeout."
+    if [[ ! -r /dev/tty || ! -w /dev/tty ]]; then
+        warn "Non-interactive session: keeping auto mode. To avoid classifier requests, choose --permission-mode default or acceptEdits; do not use a permission-bypass mode as a timeout workaround."
+        return 0
+    fi
+
+    printf '\nAuto mode will keep its classifier checks, but may be slow on this single-slot backend.\n' >/dev/tty
+    printf '  [c] Continue in auto mode (default)\n  [d] Use default mode (ask before protected actions)\n  [e] Use acceptEdits (auto-approve edits; other permissions still apply)\n  [q] Cancel before starting local services\nChoice [c/d/e/q]: ' >/dev/tty
+    local choice
+    IFS= read -r choice </dev/tty || choice=c
+    case "${choice,,}" in
+        ""|c|continue)
+            warn "Continuing in auto mode; classifier requests may queue or time out."
+            ;;
+        d|default)
+            claude_local_set_permission_mode default
+            say "Using default permission mode for this launch."
+            ;;
+        e|edits|acceptedits)
+            claude_local_set_permission_mode acceptEdits
+            say "Using acceptEdits permission mode for this launch."
+            ;;
+        q|quit|cancel)
+            say "Cancelled before starting local services."
+            return 1
+            ;;
+        *)
+            warn "Unrecognized choice; continuing in auto mode."
+            ;;
+    esac
+}
+
 agents_json() {
 python3 - "$PLAN_FILE" <<'PY'
 import json,sys
@@ -451,6 +487,7 @@ show_runtime_errors() {
 run_claude() {
     local key="claude-local-$RANDOM-$$" role id sonnet_id rc
     export ANTHROPIC_BASE_URL="http://127.0.0.1:$GATEWAY_PORT" ANTHROPIC_AUTH_TOKEN="$key" ANTHROPIC_API_KEY="$key" CLAUDE_CODE_MAX_CONTEXT_TOKENS="$CLIENT_CTX"
+    export CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY="${CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY:-1}"
     export CLAUDE_CODE_AUTO_MODE_SERVER="${CLAUDE_CODE_AUTO_MODE_SERVER:-0}"
     unset CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY ANTHROPIC_BEDROCK_BASE_URL ANTHROPIC_VERTEX_BASE_URL || true
     while IFS=$'\t' read -r role id; do
@@ -528,6 +565,7 @@ mkdir -p "$STATE_DIR" "$CACHE_DIR"; PLAN_FILE="$STATE_DIR/plan.$$.json"
 plan_args=(plan --context "$CTX"); if ((${#MODELS[@]})); then plan_args+=("${MODELS[@]}"); else plan_args+=(--smart); fi
 python3 "$PLAN_PY" "${plan_args[@]}" > "$PLAN_FILE" || exit $?
 print_plan; [[ $DRY_RUN -eq 1 ]] && exit 0
+confirm_single_slot_auto_mode || exit 130
 install_claude_code; prepare_host_compiler; activate_cuda; ensure_llamacpp
 grep -q '"template": "qwen-fixed"' "$PLAN_FILE" && fetch_qwen_template || true
 start_backends; write_gateway_config; start_gateway

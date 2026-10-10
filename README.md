@@ -317,12 +317,24 @@ The installed `claude-local` wrapper therefore defaults to:
 - a 15-minute stream-idle budget
 - only two API retries instead of repeatedly replaying an expensive local request
 - local subagent stall budget of 30 minutes
-- read-only/tool/subagent concurrency capped to the number of visible GPUs (max 4)
+- Claude request concurrency defaults to one, matching each local `llama-server -np 1` slot
 - one safe gateway retry only before an SSE response is committed downstream
 
 These can all be overridden with the corresponding Claude Code environment
 variables (`API_TIMEOUT_MS`, `CLAUDE_STREAM_IDLE_TIMEOUT_MS`,
 `CLAUDE_CODE_MAX_RETRIES`, `CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY`, etc.).
+Increasing `CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY` only permits more client-side
+work; it does not increase llama-server's `-np 1` capacity, so requests can queue.
+
+When `claude-local` detects Auto permission mode from the command line or settings,
+it warns before downloading/building models and offers to continue in Auto mode,
+switch this launch to `default` or `acceptEdits`, or cancel. Auto mode keeps its
+classifier checks, but on a single-slot local backend the classifier request may
+queue and hit a timeout. `default` retains interactive permission prompts;
+`acceptEdits` auto-approves edits while other permission checks still apply.
+Neither choice bypasses permissions. In a non-interactive launch, it warns and
+keeps Auto mode; explicitly pass `--permission-mode default` or
+`--permission-mode acceptEdits` to choose a different mode.
 
 If you use Claude Code's `auto` permission mode on a slow single-GPU local model,
 remember that auto mode itself uses model-classified background safety checks.

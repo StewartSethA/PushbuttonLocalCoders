@@ -150,6 +150,16 @@ does not provide the new no-charge server-side checks. To override the default,
 set `CLAUDE_CODE_AUTO_MODE_SERVER=1` before launching. This setting is scoped to
 `claude-local` and is not written to persistent Claude Code configuration.
 
+Each local llama-server currently has one request slot (`-np 1`), so client-side
+request concurrency defaults to one too. When Auto mode is selected, the launcher
+warns that classifier requests share that capacity and may time out, then offers
+to continue, use `default` (interactive permission prompts), use `acceptEdits`
+(edits auto-approved; other permission checks remain), or cancel before model
+setup. Neither alternative disables permission checks. Non-interactive launches
+warn and continue in Auto mode unless a permission mode is specified explicitly.
+Increasing `CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY` does not increase backend slots
+and can create more queued requests.
+
 ## Useful commands
 
 ```bash

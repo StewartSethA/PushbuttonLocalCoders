@@ -31,16 +31,9 @@ export CLAUDE_CODE_MAX_RETRIES="${CLAUDE_CODE_MAX_RETRIES:-2}"
 export CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS="${CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS:-1800000}"
 export MCP_TIMEOUT="${MCP_TIMEOUT:-60000}"
 
-# Do not let ten concurrent Claude requests pile up behind a local -np 1
-# backend. Default to one concurrent request per visible NVIDIA GPU, capped at
-# four; users can override CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY explicitly.
-if [[ -z "${CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY:-}" ]] && command -v nvidia-smi >/dev/null 2>&1; then
-  n="$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ')"
-  [[ "$n" =~ ^[0-9]+$ ]] || n=1
-  (( n < 1 )) && n=1
-  (( n > 4 )) && n=4
-  export CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY="$n"
-fi
+# Each local llama-server currently runs with -np 1. Match client-side request
+# concurrency to that single slot unless the user explicitly chooses otherwise.
+export CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY="${CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY:-1}"
 
 # Provider-neutral web search/fetch for local models. Exa's hosted MCP supports
 # search + page fetch without requiring a local Node process or an API key.
