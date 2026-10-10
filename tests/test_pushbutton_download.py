@@ -48,6 +48,38 @@ class MetadataTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 download.select_files({"siblings": files}, "UD-Q4_K_XL" if len(files) == 1 else "Q4_K")
 
+    def test_quant_selects_standard_build_unless_mtp_requested(self):
+        for quant in ("IQ3_XXS", "IQ2_S", "IQ2_XS"):
+            standard = f"Qwen3.8-27B-GSQ-RCO-{quant}.gguf"
+            mtp = f"Qwen3.8-27B-GSQ-RCO-{quant}-mtp.gguf"
+            metadata = {"siblings": [
+                {"rfilename": mtp, "size": 48},
+                {"rfilename": standard, "size": 32},
+            ]}
+            for selector, expected in ((quant, standard), (quant.lower(), standard),
+                                       (standard, standard), (quant + "-mtp", mtp),
+                                       (mtp, mtp)):
+                with self.subTest(selector=selector):
+                    self.assertEqual(download.select_files(metadata, selector)[0]["name"], expected)
+            self.assertEqual(len(download.select_files(metadata, quant + "," + mtp)), 2)
+            with self.assertRaisesRegex(ValueError, "No GGUF files"):
+                download.select_files({"siblings": metadata["siblings"][:1]}, quant)
+
+    def test_standard_and_mtp_shards_selected_separately(self):
+        metadata = {"siblings": [
+            {"rfilename": f"Qwen-IQ3_XXS{suffix}-{index:05d}-of-00002.gguf", "size": 32}
+            for suffix in ("", "-mtp") for index in (1, 2)
+        ]}
+        for selector, start in (("IQ3_XXS", 0), ("IQ3_XXS-mtp", 2),
+                                (metadata["siblings"][2]["rfilename"], 2)):
+            with self.subTest(selector=selector):
+                self.assertEqual(
+                    [f["name"] for f in download.select_files(metadata, selector)],
+                    [f["rfilename"] for f in metadata["siblings"][start:start + 2]])
+        metadata["siblings"].pop(1)
+        with self.assertRaisesRegex(ValueError, "incomplete GGUF shard set"):
+            download.select_files(metadata, "IQ3_XXS")
+
     def test_display_name(self):
         self.assertEqual(download.display_name("short"), "short")
         self.assertEqual(download.display_name("x" * 100), "x" * 69 + "...")
@@ -79,6 +111,33 @@ class MetadataTests(unittest.TestCase):
             self.assertEqual(manifest["download_bytes"], 80)
             self.assertIn(REVISION, (work / "urls").read_text())
 
+    def test_reported_large_disk_uses_fixed_reserve_for_both_models(self):
+        gib = 1024**3
+        free = int(36.30 * gib)
+        with tempfile.TemporaryDirectory() as tmp:
+            for size in (int(7.04 * gib), int(10.73 * gib)):
+                manifest = {"directory": tmp, "files": [{"name": "model.gguf", "size": size}]}
+                disk = shutil._ntuple_diskusage(959218776 * 1024, 0, free)
+                with mock.patch.object(download.shutil, "disk_usage", return_value=disk):
+                    download.validate_space(manifest)
+                free -= size
+            self.assertGreater(free, 10 * gib)
+
+    def test_fixed_reserve_boundary_on_large_and_small_disks(self):
+        gib = 1024**3
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = {"directory": tmp, "files": [{"name": "model.gguf", "size": 7 * gib}]}
+            for total in (100 * gib, 1024 * gib):
+                for reuse_partial in (False, True):
+                    with self.subTest(total=total, reuse_partial=reuse_partial):
+                        disk = shutil._ntuple_diskusage(total, total - 17 * gib, 17 * gib)
+                        with mock.patch.object(download.shutil, "disk_usage", return_value=disk):
+                            download.validate_space(manifest, reuse_partial=reuse_partial)
+                        disk = disk._replace(free=disk.free - 1)
+                        with mock.patch.object(download.shutil, "disk_usage", return_value=disk):
+                            with self.assertRaisesRegex(ValueError, r"\+ 10.0 GiB reserve"):
+                                download.validate_space(manifest, reuse_partial=reuse_partial)
+
     def test_existing_blob_reused_without_copying(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = pathlib.Path(tmp) / REVISION
@@ -87,7 +146,9 @@ class MetadataTests(unittest.TestCase):
             blob = pathlib.Path(tmp) / "blobs" / digest
             blob.parent.mkdir()
             blob.write_bytes(b"x" * 16)
-            with contextlib.redirect_stderr(io.StringIO()):
+            with contextlib.redirect_stderr(io.StringIO()), \
+                    mock.patch.object(pathlib.Path, "is_relative_to",
+                                      side_effect=AttributeError("not available"), create=True):
                 download.reuse_blobs(directory, [{"name": "model.gguf", "size": 16, "sha256": digest}])
             self.assertEqual(blob.stat().st_ino, (directory / "model.gguf").stat().st_ino)
 
@@ -127,7 +188,9 @@ class MetadataTests(unittest.TestCase):
             directory = pathlib.Path(tmp) / "cache"
             directory.mkdir()
             (directory / "escape").symlink_to(tmp, target_is_directory=True)
-            with self.assertRaisesRegex(ValueError, "escapes cache"):
+            with self.assertRaisesRegex(ValueError, "escapes cache"), \
+                    mock.patch.object(pathlib.Path, "is_relative_to",
+                                      side_effect=AttributeError("not available"), create=True):
                 download.reuse_blobs(directory, [{"name": "escape/model.gguf", "size": 16}])
 
 
@@ -161,7 +224,7 @@ urls=pathlib.Path(next(a.split('=',1)[1] for a in sys.argv if a.startswith('--in
 manifest=json.loads((urls.parent/'manifest.json').read_text())
 for f in manifest['files']:
     path=pathlib.Path(manifest['directory'])/f['name']
-    path.write_bytes(b'x'*f['size'])
+    with path.open('wb') as stream: stream.truncate(f['size'])
     pathlib.Path(str(path)+'.aria2').unlink(missing_ok=True)
     if os.environ.get('TEST_ARIA_PARTIAL_FAILURE'): sys.exit(1)
 print('[parallel chunks] 45% ETA: 3m42s',file=sys.stderr)
@@ -173,7 +236,7 @@ if os.environ.get('TEST_HF_FAIL'): sys.exit(1)
 directory=pathlib.Path(sys.argv[sys.argv.index('--local-dir')+1])
 item=next(f for f in json.load(open(os.environ['TEST_METADATA']))['siblings'] if f['rfilename']==sys.argv[3])
 path=directory/item['rfilename']
-path.write_bytes(b'x'*(item.get('size') or item['lfs']['size']))
+with path.open('wb') as stream: stream.truncate(item.get('size') or item['lfs']['size'])
 print('huggingface_hub: 100%',file=sys.stderr)
 """)
 
@@ -215,6 +278,26 @@ print('huggingface_hub: 100%',file=sys.stderr)
         self.assertEqual(self.calls.read_text().count("hf "), 2)
         self.assertIn("100%", proc.stderr)
 
+    def test_standard_build_download_with_optional_mtp(self):
+        standard = "Qwen3.8-27B-GSQ-RCO-IQ3_XXS.gguf"
+        mtp = "Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf"
+        self.metadata.write_text(json.dumps({"sha": REVISION, "siblings": [
+            {"rfilename": standard, "size": 32},
+            {"rfilename": mtp, "size": 48},
+        ]}))
+        for sequential in (False, True):
+            with self.subTest(sequential=sequential):
+                self.env["PUSHBUTTON_NO_PARALLEL"] = "1" if sequential else "0"
+                proc = self.shell(
+                    'download_model_fast ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF:IQ3_XXS '
+                    '"$2" MODEL_PATH; printf "%s\\n" "$MODEL_PATH"')
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                path = pathlib.Path(proc.stdout.strip())
+                self.assertEqual(path.name, standard)
+                self.assertEqual(path.stat().st_size, 32)
+                self.assertFalse((path.parent / mtp).exists())
+                shutil.rmtree(self.cache)
+
     def test_fallback_skips_completed_shards(self):
         self.env["TEST_ARIA_PARTIAL_FAILURE"] = "1"
         proc = self.fast()
@@ -241,6 +324,74 @@ print('huggingface_hub: 100%',file=sys.stderr)
         self.assertIn("Insufficient disk space", proc.stderr)
         self.assertNotIn("INSTALL_ATTEMPT", proc.stderr)
         self.assertFalse(self.calls.exists())
+
+    def test_plan_and_download_agree_on_reported_disk_space(self):
+        gib = 1024**3
+        models = (
+            ("ornith-ai/Ornith-1.5-9B-GGUF", "Q6_K", "Ornith-Q6_K.gguf", int(7.04 * gib)),
+            ("unsloth/Qwen3.6-35B-A3B-GGUF", "UD-IQ2_M", "Qwen-UD-IQ2_M.gguf", int(10.73 * gib)),
+        )
+        metadata = {"sha": REVISION, "siblings": [
+            {"rfilename": name, "size": size} for _, _, name, size in models]}
+        self.metadata.write_text(json.dumps(metadata))
+        plan = self.base / "plan.json"
+        plan.write_text(json.dumps({"servers": [
+            {"profile": {"hf_spec": repo + ":" + quant}} for repo, quant, _, _ in models]}))
+        self.env.update(TEST_CACHE=str(self.cache), HF_HUB_OFFLINE="1")
+        self.executable("python3", f"""#!{sys.executable}
+import io,json,os,pathlib,runpy,shutil,sys,urllib.request
+urllib.request.urlopen=lambda *a,**k: io.BytesIO(open(os.environ['TEST_METADATA'],'rb').read())
+def disk_usage(path):
+    total=959218776*1024
+    used=sum(p.stat().st_size for p in pathlib.Path(os.environ['TEST_CACHE']).rglob('*.gguf'))
+    free=int(os.environ['TEST_FREE_BYTES'])-used
+    return shutil._ntuple_diskusage(total,total-free,free)
+shutil.disk_usage=disk_usage
+sys.argv=sys.argv[1:]
+if sys.argv[0]=='-':
+    exec(compile(sys.stdin.read(),'<stdin>','exec'))
+else:
+    runpy.run_path(sys.argv[0],run_name='__main__')
+""")
+        self.executable("stat", f"""#!{sys.executable}
+import os,pathlib
+used=sum(p.stat().st_size for p in pathlib.Path(os.environ['TEST_CACHE']).rglob('*.gguf'))
+print(int(os.environ['TEST_FREE_BYTES'])-used,1)
+""")
+        for mode in ("parallel", "sequential", "fallback", "insufficient"):
+            with self.subTest(mode=mode):
+                shutil.rmtree(self.cache, ignore_errors=True)
+                self.calls.unlink(missing_ok=True)
+                for repo, _, _, _ in models:
+                    root = self.cache / ("models--" + repo.replace("/", "--"))
+                    root.mkdir(parents=True)
+                    (root / "metadata.json").write_text(json.dumps(metadata))
+                self.env["TEST_FREE_BYTES"] = str(int(36.30 * gib) if mode != "insufficient" else 27 * gib)
+                self.env["PUSHBUTTON_NO_PARALLEL"] = "1" if mode == "sequential" else "0"
+                self.env["TEST_ARIA_FAIL"] = "1" if mode == "fallback" else ""
+                commands = [
+                    f'source "{ROOT / "lib/pushbutton_folders.sh"}"',
+                    f'validate_plan_download_space "{plan}" "$2" || exit $?',
+                ]
+                for repo, quant, _, _ in models:
+                    commands.append(f'download_model_fast {repo}:{quant} "$2" MODEL_PATH || exit $?')
+                    commands.append('printf "%s\\n" "$MODEL_PATH"')
+                proc = self.shell("; ".join(commands))
+                self.assertIn("17.77 GiB remaining + 10 GiB safety reserve", proc.stderr)
+                if mode == "insufficient":
+                    self.assertEqual(proc.returncode, 2, proc.stderr)
+                    self.assertIn("Insufficient cache space", proc.stderr)
+                    self.assertFalse(self.calls.exists())
+                    continue
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                paths = [pathlib.Path(line) for line in proc.stdout.splitlines()]
+                self.assertEqual(len(paths), 2)
+                for path, (_, _, name, size) in zip(paths, models):
+                    self.assertEqual(path.name, name)
+                    self.assertEqual(path.stat().st_size, size)
+                calls = self.calls.read_text()
+                self.assertEqual(calls.count("hf "), 0 if mode == "parallel" else 2)
+                self.assertEqual(len((self.cache / ".download-log").read_text().splitlines()), 2)
 
     def test_resume_and_sequential_removes_aria_marker(self):
         directory = self.cache / "models--owner--repo" / REVISION
@@ -272,8 +423,11 @@ print('huggingface_hub: 100%',file=sys.stderr)
         self.assertFalse((self.cache / ".download-log").exists())
 
     def test_folder_validation_hook(self):
-        proc = self.fast('validate_download_space() { echo "folder policy rejected" >&2; return 1; }; ')
-        self.assertNotEqual(proc.returncode, 0)
+        self.env["TEST_CACHE"] = str(self.cache)
+        proc = self.fast('validate_download_space() { '
+                         '[[ "$1" == "$TEST_CACHE" && "$2" == owner/repo:UD-Q4_K_XL ]] || return 99; '
+                         'echo "folder policy rejected" >&2; return 2; }; ')
+        self.assertEqual(proc.returncode, 2)
         self.assertIn("folder policy rejected", proc.stderr)
         self.assertFalse(self.calls.exists())
 

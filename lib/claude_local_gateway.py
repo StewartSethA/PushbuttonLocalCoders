@@ -13,13 +13,22 @@ and is never handed to Claude Code as a bogus invocation.
 from __future__ import annotations
 
 import argparse
+from collections import OrderedDict
+import hashlib
 import http.client
 import json
 import os
+import pathlib
 import signal
 import sys
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import pushbutton_request_budget as request_budget
+
+from claude_local_budget import BudgetError, input_tokens, positive_integer, request_budget_error
 
 HOP_HEADERS = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -29,6 +38,42 @@ RAW_TOOL_MARKERS = (
     "<tool_call", "</tool_call", "<function=", "</function>",
     "<parameter=", "</parameter>", "</prompt>", "</tool>", "</tool_calls>",
 )
+WEB_TOOL_NAMES = {"WebSearch", "WebFetch", "web_search", "web_fetch"}
+WEB_TOOL_GUIDANCE = (
+    "Built-in WebSearch/WebFetch require a supported Anthropic API deployment, not this local gateway. "
+    "Use the exact connected MCP search/fetch tool name; check /mcp for pushbutton-web. "
+    "Edit the disclosed web-mcp.json or launch with --local-web-config FILE and restart to change providers. "
+    "If an old session repeats web_search, start a fresh session with a handoff summary. "
+    "This is a tool configuration mismatch, not a temporary outage."
+)
+
+
+def hosted_web_tool(tool: object) -> bool:
+    if not isinstance(tool, dict):
+        return False
+    kind = tool.get("type", "")
+    return (
+        isinstance(kind, str) and kind.startswith(("web_search_", "web_fetch_"))
+        or tool.get("name") in ("WebSearch", "WebFetch")
+        or tool.get("name") in ("web_search", "web_fetch") and "input_schema" not in tool
+    )
+
+
+def filter_hosted_web_tools(body: dict) -> bool:
+    tools = body.get("tools")
+    if not isinstance(tools, list):
+        return False
+    removed = [t for t in tools if hosted_web_tool(t)]
+    if not removed:
+        return False
+    choice = body.get("tool_choice")
+    if isinstance(choice, dict) and choice.get("type") == "tool":
+        if any(t.get("name") == choice.get("name") for t in removed):
+            raise ValueError(WEB_TOOL_GUIDANCE)
+    body["tools"] = [t for t in tools if not hosted_web_tool(t)]
+    if not body["tools"]:
+        body.pop("tool_choice", None)
+    return True
 
 
 def family_for(model: str) -> str | None:
@@ -71,9 +116,18 @@ class Router:
     def __init__(self, config: dict):
         self.roles: dict[str, dict] = config["roles"]
         self.alias_map: dict[str, dict] = {}
+        self.token_counts: OrderedDict[tuple, tuple[float, int]] = OrderedDict()
+        self.count_lock = threading.Lock()
         for role, route in self.roles.items():
+            if "context_capacity" in route:
+                positive_integer(route["context_capacity"], "route context_capacity")
+                positive_integer(route.get("prompt_reserve"), "route prompt_reserve")
             self.alias_map[str(route["model_id"]).lower()] = route
             self.alias_map[role] = route
+        self.gates = {}
+        for route in self.unique_routes():
+            limit = request_budget.direct_admission_limit(route.get("capacity") or {})
+            self.gates[(route["url"], route["backend_alias"])] = threading.BoundedSemaphore(limit)
 
     def resolve(self, model: str) -> dict:
         key = (model or "").lower()
@@ -83,6 +137,27 @@ class Router:
         if fam and fam in self.roles:
             return self.roles[fam]
         return self.roles["sonnet"]
+
+    def count_key(self, route: dict, raw: bytes) -> tuple:
+        # Retain only digests/counts, never prompts. Exact-payload reuse also
+        # avoids rendering/tokenizing again when Claude just counted a request.
+        return route["url"], hashlib.sha256(raw).digest()
+
+    def cached_count(self, key: tuple) -> int | None:
+        with self.count_lock:
+            entry = self.token_counts.get(key)
+            if entry and time.monotonic() - entry[0] < 30:
+                self.token_counts.move_to_end(key)
+                return entry[1]
+            self.token_counts.pop(key, None)
+        return None
+
+    def remember_count(self, key: tuple, count: int):
+        with self.count_lock:
+            self.token_counts[key] = (time.monotonic(), count)
+            self.token_counts.move_to_end(key)
+            while len(self.token_counts) > 128:
+                self.token_counts.popitem(last=False)
 
     def unique_routes(self) -> list[dict]:
         out: list[dict] = []
@@ -187,7 +262,10 @@ def validate_tool_uses(uses: list[dict], tools: object) -> list[str]:
             continue
         schema = schemas.get(name)
         if schema is None:
-            errors.append(f"unknown tool {name!r}")
+            if name in WEB_TOOL_NAMES:
+                errors.append(f"unsupported hosted web tool {name!r}: {WEB_TOOL_GUIDANCE}")
+            else:
+                errors.append(f"unknown tool {name!r}")
             continue
         errors.extend(f"{name}: {e}" for e in validate_schema(inp, schema))
     return errors
@@ -201,7 +279,7 @@ def parse_nonstream_tool_uses(payload: bytes) -> tuple[list[dict], list[str]]:
     serialized = json.dumps(obj, ensure_ascii=False)
     leaks = [m for m in RAW_TOOL_MARKERS if m in serialized]
     blocks = obj.get("content") if isinstance(obj, dict) else None
-    uses = [b for b in blocks or [] if isinstance(b, dict) and b.get("type") == "tool_use"] if isinstance(blocks, list) else []
+    uses = [b for b in blocks or [] if isinstance(b, dict) and b.get("type") in ("tool_use", "server_tool_use")] if isinstance(blocks, list) else []
     return uses, ([f"raw tool markup leaked: {leaks}"] if leaks else [])
 
 
@@ -228,7 +306,7 @@ def parse_sse_tool_uses(payload: bytes) -> tuple[list[dict], list[str]]:
             continue
         if event.get("type") == "content_block_start":
             block = event.get("content_block")
-            if isinstance(block, dict) and block.get("type") == "tool_use":
+            if isinstance(block, dict) and block.get("type") in ("tool_use", "server_tool_use"):
                 starts[idx] = {"type": "tool_use", "name": block.get("name"), "input": block.get("input") or {}}
                 partial[idx] = ""
         elif event.get("type") == "content_block_delta" and idx in starts:
@@ -355,13 +433,15 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"object": "list", "data": data})
         return self._json(404, {"type": "error", "error": {"type": "not_found_error", "message": "local gateway route not found"}})
 
-    def _forward_headers(self, resp: http.client.HTTPResponse, content_length: str | None):
+    def _forward_headers(self, resp: http.client.HTTPResponse, content_length: str | None, token_source: str):
         self.send_response(resp.status, resp.reason)
+        self.send_header("X-Pushbutton-Token-Source", token_source)
+        self.send_header("X-Pushbutton-SLA-Warning", request_budget.SLA_WARNING)
         for k, v in resp.getheaders():
             kl = k.lower()
             if kl in HOP_HEADERS or kl == "content-length":
                 continue
-            self.send_header(k, v)
+            self.send_header(k.replace("\r", "").replace("\n", ""), v.replace("\r", "").replace("\n", ""))
         if content_length:
             self.send_header("content-length", content_length)
         else:
@@ -377,15 +457,134 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(n) or b"{}")
         except Exception as exc:
             return self._json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": f"bad JSON: {exc}"}})
+        if not isinstance(body, dict):
+            return self._json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": "request body must be an object"}})
 
         route = self.router.resolve(str(body.get("model", "")))
+        if path.endswith("/count_tokens"):
+            return self._dispatch(route, body, path)
+        gate = self.router.gates[(route["url"], route["backend_alias"])]
+        gate.acquire()
+        try:
+            return self._dispatch(route, body, path)
+        finally:
+            gate.release()
+
+    def _dispatch(self, route, body, path):
         body["model"] = route["backend_alias"]
+        try:
+            filtered_web_tools = filter_hosted_web_tools(body)
+        except ValueError as exc:
+            return self._json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": str(exc)}})
         apply_local_policy(body)
+        count_only = path.endswith("/count_tokens")
+        capacity = route.get("capacity")
+        native_budget = "context_capacity" in route
+        admission = None
+        if not native_budget:
+            capacity = capacity or {"context": route.get("context", 65536), "output_tokens": 4096}
+            try:
+                admission = request_budget.enforce(
+                    body, capacity, route["url"], "anthropic",
+                    headers={k: v for k, v in self.headers.items() if k.lower() not in HOP_HEADERS},
+                    count_only=count_only)
+            except request_budget.BudgetError as exc:
+                return self._json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": str(exc)}})
+            if not admission.source.startswith("backend-tokenizer"):
+                return self._json(503, {"type": "error", "error": {"type": "api_error", "message": "authoritative native token count unavailable; inference was not attempted; estimate is not a token count"}})
+            if count_only:
+                return self._json(200, {"input_tokens": admission.input_tokens})
+            if "max_tokens" not in body:
+                body["max_tokens"] = admission.output_tokens
+        elif capacity and not count_only:
+            try:
+                output = request_budget.output_tokens(body, capacity)
+            except request_budget.BudgetError as exc:
+                return self._json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": str(exc)}})
+            if "max_tokens" not in body:
+                body["max_tokens"] = output
         raw = json.dumps(body, separators=(",", ":")).encode()
         headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP_HEADERS}
         headers["content-type"] = "application/json"; headers["content-length"] = str(len(raw))
 
+        if path == "/v1/messages":
+            try:
+                positive_integer(body.get("max_tokens"), "max_tokens")
+            except BudgetError as exc:
+                return self._json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": str(exc)}})
+        # Native llama.cpp count_tokens performs the same Anthropic conversion,
+        # tool/system rendering and template tokenization as inference. Never
+        # approximate with text-only /tokenize.
+        count_key = self.router.count_key(route, raw)
+        prompt_tokens = admission.input_tokens if admission else self.router.cached_count(count_key)
         attempts = int(route.get("proxy_attempts", 2))
+        if prompt_tokens is None:
+            for attempt in range(1, attempts + 1):
+                conn = backend_connection(route)
+                try:
+                    conn.request("POST", "/v1/messages/count_tokens", body=raw, headers=headers)
+                    resp = conn.getresponse()
+                    if resp.status in (500, 502, 503, 504) and attempt < attempts:
+                        resp.read()
+                        continue
+                    result = json.loads(resp.read())
+                    if resp.status != 200:
+                        # Includes 400: not a transient inference/network failure.
+                        return self._json(resp.status, result)
+                    prompt_tokens = input_tokens(result)
+                    self.router.remember_count(count_key, prompt_tokens)
+                    break
+                except (OSError, http.client.HTTPException) as exc:
+                    if attempt < attempts:
+                        continue
+                    return self._json(503, {"type": "error", "error": {"type": "api_error", "message": f"Local tokenizer preflight unavailable ({type(exc).__name__}); inference was not attempted. Check the backend /v1/messages/count_tokens endpoint."}})
+                except (ValueError, TypeError) as exc:
+                    return self._json(503, {"type": "error", "error": {"type": "api_error", "message": f"Invalid native tokenizer response ({type(exc).__name__}); inference was not attempted. Check the backend /v1/messages/count_tokens endpoint."}})
+                finally:
+                    conn.close()
+        if native_budget:
+            effective_route = dict(route)
+            if capacity:
+                try:
+                    # The verified native reserve and the per-route plan are
+                    # independent ceilings; neither may relax the other.
+                    context = min(route["context_capacity"],
+                                  request_budget.integer(capacity.get("context"), "route context"))
+                    props = request_budget.backend_json(route["url"], "/props", headers=headers)
+                    actual = request_budget.per_slot_context(props) if isinstance(props, dict) else None
+                    if actual is not None:
+                        context = min(context, request_budget.integer(actual, "backend per-slot context"))
+                    elif capacity.get("no_context_shift") is not True:
+                        raise request_budget.BudgetError("backend /props cannot prove per-slot context; require verified --no-context-shift before serving this route")
+                    reserve = max(route["prompt_reserve"], request_budget.integer(
+                        capacity.get("safety_tokens", 0), "safety_tokens", zero=True))
+                    effective_route.update(context_capacity=context, prompt_reserve=reserve)
+                    output = 0 if count_only else request_budget.output_tokens(body, capacity)
+                    if not count_only:
+                        error = request_budget_error(body, prompt_tokens, effective_route)
+                        if error:
+                            raise request_budget.BudgetError(error)
+                    limit = min(request_budget.integer(
+                        capacity.get("input_tokens", context - output - reserve), "input_tokens"),
+                        context - output - reserve)
+                    if prompt_tokens > limit:
+                        raise request_budget.BudgetError(
+                            f"request input {prompt_tokens} (backend-tokenizer) exceeds route input budget {limit}; "
+                            "compact/summarize history and oversized tool results or reduce attachments; history was not truncated")
+                except request_budget.BudgetError as exc:
+                    return self._json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": str(exc)}})
+            if count_only:
+                return self._json(200, {"input_tokens": prompt_tokens})
+            error = request_budget_error(body, prompt_tokens, effective_route)
+            if error:
+                return self._json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": error}})
+            admission = request_budget.Admission(
+                prompt_tokens, body["max_tokens"], effective_route["prompt_reserve"],
+                effective_route["context_capacity"], "backend-tokenizer")
+
+        # One transparent retry is useful for an immediately reset local
+        # connection or transient 5xx. We only retry before response headers /
+        # bytes are committed to Claude Code.
         last_exc: Exception | None = None
         for attempt in range(1, attempts + 1):
             conn = backend_connection(route)
@@ -404,21 +603,26 @@ class Handler(BaseHTTPRequestHandler):
 
                 # Tool-bearing turns are buffered so malformed arguments can be
                 # rejected/retried before Claude Code executes them.
-                if body.get("tools") and 200 <= resp.status < 300:
+                if (body.get("tools") or filtered_web_tools) and 200 <= resp.status < 300:
                     payload = resp.read()
                     errors = validate_backend_payload(payload, content_type, body.get("tools"))
                     if errors:
+                        if any(e.startswith("unsupported hosted web tool ") for e in errors):
+                            return self._json(400, {"type": "error", "error": {
+                                "type": "invalid_request_error", "message": WEB_TOOL_GUIDANCE}})
                         last_exc = RuntimeError("invalid backend tool arguments: " + "; ".join(errors[:12]))
-                        self.log_message("%s; retrying=%s", last_exc, attempt < attempts)
+                        self.log_message("invalid backend tool arguments; retrying=%s", attempt < attempts)
                         if attempt < attempts:
                             continue
                         break
                     self.send_response(resp.status, resp.reason)
+                    self.send_header("X-Pushbutton-Token-Source", admission.source)
+                    self.send_header("X-Pushbutton-SLA-Warning", request_budget.SLA_WARNING)
                     for k, v in resp.getheaders():
                         kl = k.lower()
                         if kl in HOP_HEADERS or kl == "content-length":
                             continue
-                        self.send_header(k, v)
+                        self.send_header(k.replace("\r", "").replace("\n", ""), v.replace("\r", "").replace("\n", ""))
                     self.send_header("content-length", str(len(payload)))
                     self.end_headers(); committed = True
                     self.wfile.write(payload); self.wfile.flush(); return
@@ -428,13 +632,21 @@ class Handler(BaseHTTPRequestHandler):
                     first = resp.read1(65536)
                     if not first:
                         raise ConnectionError("backend closed SSE stream before first event")
-                self._forward_headers(resp, content_length); committed = True
+                self._forward_headers(resp, content_length, admission.source); committed = True
                 if first:
-                    self.wfile.write(first); self.wfile.flush()
+                    self.wfile.write(first)
+                    self.wfile.flush()
+                sent = len(first)
                 while True:
                     chunk = resp.read1(65536)
-                    if not chunk: break
-                    self.wfile.write(chunk); self.wfile.flush()
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                    sent += len(chunk)
+                if content_length and sent < int(content_length):
+                    self.log_message("backend closed before advertised response length; closing without replay")
+                    self.close_connection = True
                 return
             except (BrokenPipeError, ConnectionResetError) as exc:
                 last_exc = exc
@@ -464,6 +676,7 @@ def main() -> int:
         config = json.load(f)
     router = Router(config)
     probe_all_routes(router)
+    print(f"claude-local gateway: {request_budget.SLA_WARNING}; unproven admission defaults to C1", file=sys.stderr, flush=True)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.router = router  # type: ignore[attr-defined]
     server.verbose = args.verbose  # type: ignore[attr-defined]

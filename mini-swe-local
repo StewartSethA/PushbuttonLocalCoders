@@ -12,6 +12,13 @@ while (($#)); do
     *) PASS+=("$1"); shift ;;
   esac
 done
+if [[ -n "$SWARM_TASK" ]]; then export MINI_SWE_SWARM_TASK="$SWARM_TASK"; fi
+if CODER_LOCAL_MENU_FRONTEND=mini-swe-local CODER_LOCAL_STARTUP_ONLY=1 "$ROOT/coder-local" --frontend qwen "${PASS[@]}"; then
+  exit 0
+else
+  startup_rc=$?
+  [[ $startup_rc -eq 125 ]] || exit "$startup_rc"
+fi
 if ! command -v mini >/dev/null 2>&1; then
   if command -v uv >/dev/null 2>&1; then
     echo "[mini-swe-local] Installing mini-SWE-agent with uv..."
@@ -28,17 +35,18 @@ cat >"$shim/qwen" <<'INNER'
 #!/usr/bin/env bash
 set -euo pipefail
 state="${CLAUDE_LOCAL_STATE:-$HOME/.local/share/pushbutton/claude-local}"
+if [[ "${DISABLE_TELEMETRY:-}" == 1 ]]; then export LITELLM_TELEMETRY=false; fi
 root="$state/frontends/mini-swe"; mkdir -p "$root/configs" "$root/runs"
 mapfile -t rows < <(python3 - "$QWEN_HOME/settings.json" <<'PY'
 import json,sys
 q=json.load(open(sys.argv[1]))
 for i,m in enumerate(q['modelProviders']['openai'],1):
- print(i, m['id'], m['baseUrl'])
+ print(i, m['id'], m['baseUrl'], m.get('generationConfig',{}).get('samplingParams',{}).get('max_tokens',32768))
 PY
 )
 [[ ${#rows[@]} -gt 0 ]] || { echo "no Pushbutton workers available" >&2; exit 1; }
 make_cfg(){
-  local i="$1" mid="$2" url="$3" cfg="$root/configs/worker-$i.yaml"
+  local i="$1" mid="$2" url="$3" output="$4" cfg="$root/configs/worker-$i.yaml"
   cat >"$cfg" <<CFG
 model:
   model_name: "openai/$mid"
@@ -47,6 +55,7 @@ model:
     custom_llm_provider: "openai"
     api_base: "$url"
     api_key: "pushbutton-local"
+    max_tokens: $output
 CFG
   printf '%s\n' "$cfg"
 }
@@ -54,14 +63,14 @@ swarm="${MINI_SWE_SWARM_TASK:-}"
 if [[ -n "$swarm" ]]; then
   pids=(); i=0
   for row in "${rows[@]}"; do
-    read -r n mid url <<<"$row"; cfg="$(make_cfg "$n" "$mid" "$url")"; log="$root/runs/worker-$n.log"
+    read -r n mid url output <<<"$row"; cfg="$(make_cfg "$n" "$mid" "$url" "$output")"; log="$root/runs/worker-$n.log"
     echo "[mini-swe-local] worker $n -> $mid ($url); log=$log"
     mini -c "$cfg" -t "$swarm" -y > >(tee "$log") 2>&1 & pids+=("$!"); i=$((i+1))
   done
   rc=0; for p in "${pids[@]}"; do wait "$p" || rc=1; done
   exit "$rc"
 fi
-read -r n mid url <<<"${rows[0]}"; cfg="$(make_cfg "$n" "$mid" "$url")"
+read -r n mid url output <<<"${rows[0]}"; cfg="$(make_cfg "$n" "$mid" "$url" "$output")"
 if ((${#rows[@]} > 1)); then
   echo "[mini-swe-local] interactive mini uses worker 1; use --swarm TASK to run all ${#rows[@]} workers concurrently." >&2
 fi
@@ -69,5 +78,4 @@ exec mini -c "$cfg" "$@"
 INNER
 chmod +x "$shim/qwen"
 export PATH="$shim:$PATH"
-if [[ -n "$SWARM_TASK" ]]; then export MINI_SWE_SWARM_TASK="$SWARM_TASK"; fi
 exec "$ROOT/coder-local" --frontend qwen "${PASS[@]}"

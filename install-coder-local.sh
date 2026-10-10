@@ -5,12 +5,26 @@ REF="${PUSHBUTTON_REF:-main}"
 ROOT="${PUSHBUTTON_DIR:-$HOME/.local/share/pushbutton}"
 DEST="$ROOT/PushbuttonLocalCoders"
 SYSTEM=0
-[[ "${1:-}" == --system ]] && { SYSTEM=1; shift; }
 SELECT=0
-[[ "${1:-}" == --select ]] && { SELECT=1; shift; }
 INSTALL_ONLY="${PUSHBUTTON_INSTALL_ONLY:-0}"
-[[ "${1:-}" == --install-only ]] && { INSTALL_ONLY=1; shift; }
+while (($#)); do
+  case "$1" in
+    --system) SYSTEM=1; shift;;
+    --select) SELECT=1; shift;;
+    --install-only) INSTALL_ONLY=1; shift;;
+    -h|--help) echo "Usage: install-coder-local.sh [--system] [--install-only] [--select] [MODEL ...] [options]"; exit 0;;
+    *) break;;
+  esac
+done
+if ((SELECT)) && [[ ! -t 0 || ! -t 1 ]]; then
+  echo "Run --select in an interactive terminal, or supply a MODEL without --select. Piped installs without arguments only install and print help." >&2
+  exit 1
+fi
 command -v git >/dev/null || { echo "git is required" >&2; exit 1; }
+command -v python3 >/dev/null || { echo "python3 is required for folder configuration" >&2; exit 1; }
+ROOT="$(python3 -c 'import os,sys; print(os.path.realpath(os.path.expanduser(sys.argv[1])))' "$ROOT")"
+DEST="$ROOT/PushbuttonLocalCoders"
+printf '[pushbutton] Code will be installed at %s\n' "$DEST"
 mkdir -p "$ROOT"
 if [[ -d "$DEST/.git" ]]; then
   git -C "$DEST" fetch --depth=1 origin "$REF"
@@ -20,6 +34,13 @@ if [[ -d "$DEST/.git" ]]; then
 else
   git clone --depth=1 --branch "$REF" "$REPO_URL" "$DEST"
 fi
+for asset in lib/pushbutton_capacity.py lib/pushbutton_request_budget.py lib/pushbutton_capacity_proxy.py; do
+  [[ -f "$DEST/$asset" ]] || { echo "missing capacity runtime asset: $asset" >&2; exit 1; }
+done
+source "$DEST/lib/pushbutton_folders.sh"
+PUSHBUTTON_CODE_DIR="$DEST"
+configure_folders
+printf '[pushbutton] Configuration saved at %s/folders.json\n' "$CONFIG_DIR"
 chmod +x \
   "$DEST/pushbutton" "$DEST/pushbutton-instance" "$DEST/pushbutton-broker" "$DEST/pushbutton-proxy" \
   "$DEST/claude-local" "$DEST/claude-local-safe" "$DEST/coder-local" "$DEST/qwen-local" \
@@ -28,7 +49,13 @@ chmod +x \
 
 install_wrapper(){
   local target="$1" body="$2" tmp="$ROOT/.coder-shim.$$"
-  printf '#!/usr/bin/env bash\nexec %s "$@"\n' "$body" >"$tmp"
+  local config_default
+  config_default="$(printf '%q' "$CONFIG_DIR")"
+  if [[ "$CONFIG_DIR" == "$(python3 -c 'import os; print(os.path.realpath(os.path.expanduser("~/.config/pushbutton-local")))')" ]]; then
+    config_default='"$HOME/.config/pushbutton-local"'
+  fi
+  printf '#!/usr/bin/env bash\nDEFAULT_CONFIG_DIR=%s\nexport PUSHBUTTON_CONFIG_DIR="${PUSHBUTTON_CONFIG_DIR:-$DEFAULT_CONFIG_DIR}"\nexec %s "$@"\n' \
+    "$config_default" "$body" >"$tmp"
   chmod +x "$tmp"
   if [[ "$target" == /usr/local/bin/* ]]; then sudo install -m755 "$tmp" "$target"; else mkdir -p "$(dirname "$target")"; mv "$tmp" "$target"; fi
   rm -f "$tmp" 2>/dev/null || true
@@ -88,5 +115,7 @@ printf '[pushbutton] Expert frontends/tools remain available: qwen-local, openco
 
 export QWEN_CODE_SYSTEM_DEFAULTS_PATH="$DEST/configs/qwen-local-defaults.json"
 if ((INSTALL_ONLY)); then exit 0; fi
-if ((SELECT)); then exec "$DEST/pushbutton-select" "$@"; fi
-exec "$DEST/pushbutton" "$@"
+if ((SELECT)); then exec "$DEST/qwen-local" --select "$@"; fi
+if (($#)); then exec "$DEST/pushbutton" "$@"; fi
+if [[ -t 0 && -t 1 ]]; then exec "$DEST/qwen-local"; fi
+exec "$DEST/qwen-local" --help

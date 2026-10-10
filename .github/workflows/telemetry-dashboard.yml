@@ -1,0 +1,60 @@
+name: telemetry dashboard
+# Builds the anonymized public benchmark page from the PRIVATE telemetry data repository
+# and publishes it with GitHub Pages. Raw records never enter the Pages artifact or logs.
+# Setup (once): Settings -> Pages -> Source: "GitHub Actions"; repository variable
+# TELEMETRY_DATA_REPO=owner/private-repo; secret TELEMETRY_DATA_TOKEN (fine-grained,
+# Contents: read-only on that repository). See telemetry/README.md.
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "telemetry/aggregate.py"
+      - "telemetry/dashboard/**"
+      - ".github/workflows/telemetry-dashboard.yml"
+permissions:
+  contents: read
+concurrency:
+  group: telemetry-dashboard
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      HAS_DATA: ${{ secrets.TELEMETRY_DATA_TOKEN != '' && vars.TELEMETRY_DATA_REPO != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch private records (read-only)
+        if: env.HAS_DATA == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.TELEMETRY_DATA_REPO }}
+          token: ${{ secrets.TELEMETRY_DATA_TOKEN }}
+          path: _private
+          persist-credentials: false
+      - name: Aggregate and anonymize
+        run: |
+          mkdir -p _private
+          python3 telemetry/aggregate.py _private --out _site
+          # guard: nothing identifying may reach the public artifact
+          if grep -rEq 'sender_(hash|ip)|received_utc' _site; then echo "identifying field leaked"; exit 1; fi
+      - name: Remove private records from the workspace
+        if: always()
+        run: rm -rf _private
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

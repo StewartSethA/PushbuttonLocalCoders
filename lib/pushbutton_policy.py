@@ -59,14 +59,15 @@ def clamp_context(requested: int | None, *, model_context: int | None = None, ba
     return lim, f"requested context {requested:,} exceeds safe model/framework/instance limit {lim:,}; clamped"
 
 
-def speed_label(tg: float | None, *, measured: bool) -> tuple[str, str | None]:
+def speed_label(tg: float | None, *, measured: bool, min_client_tg: float = MIN_DECODE_TOK_S) -> tuple[str, str | None]:
+    minimum = max(MIN_DECODE_TOK_S, float(min_client_tg))
     if tg is None:
         return "UNKNOWN", "no decode SLA yet; conservative scheduling until normal use measures it"
     source = "measured" if measured else "estimated"
     if tg < SLOW_SEVERE_TOK_S:
-        return "VERY_SLOW", f"{source} decode {tg:.1f} tok/s is far below the {MIN_DECODE_TOK_S:.0f} tok/s Pushbutton floor"
-    if tg < MIN_DECODE_TOK_S:
-        return "SLOW", f"{source} decode {tg:.1f} tok/s is below the {MIN_DECODE_TOK_S:.0f} tok/s Pushbutton floor"
+        return "VERY_SLOW", f"{source} decode {tg:.1f} tok/s is far below the {minimum:.0f} tok/s route minimum; conservative C1 admission is not an SLA guarantee"
+    if tg < minimum:
+        return "SLOW", f"{source} decode {tg:.1f} tok/s is below the {minimum:.0f} tok/s route minimum; conservative C1 admission is not an SLA guarantee"
     return "OK", None
 
 

@@ -5,6 +5,12 @@ SELF="${BASH_SOURCE[0]}"; command -v readlink >/dev/null 2>&1 && SELF="$(readlin
 ROOT="$(cd "$(dirname "$SELF")" && pwd)"
 STATE_DIR="${CLAUDE_LOCAL_STATE:-$HOME/.local/share/pushbutton/claude-local}"
 have(){ command -v "$1" >/dev/null 2>&1; }
+if CODER_LOCAL_MENU_FRONTEND=opencode-local CODER_LOCAL_STARTUP_ONLY=1 "$ROOT/coder-local" --frontend qwen "$@"; then
+  exit 0
+else
+  startup_rc=$?
+  [[ $startup_rc -eq 125 ]] || exit "$startup_rc"
+fi
 if ! have opencode; then
   printf '[opencode-local] Installing OpenCode...\n'
   curl -fsSL https://opencode.ai/install | bash
@@ -19,20 +25,37 @@ state="${CLAUDE_LOCAL_STATE:-$HOME/.local/share/pushbutton/claude-local}"
 config="$state/frontends/opencode/opencode.json"
 mkdir -p "$(dirname "$config")"
 python3 - "$QWEN_HOME/settings.json" "$config" <<'PY'
-import json,sys
-q=json.load(open(sys.argv[1])); models=q['modelProviders']['openai']; ctx=200000
+import json,os,sys
+with open(sys.argv[1]) as source: q=json.load(source)
+models=q['modelProviders']['openai']; ctx=200000
+capacity_path=os.environ.get('PUSHBUTTON_CAPACITY_CONFIG')
+routes={}
+if capacity_path:
+ with open(capacity_path) as source: routes=json.load(source).get('routes',{})
+budgets={}
+for m in models:
+ generation=m.get('generationConfig',{})
+ context=generation.get('contextWindowSize',ctx)
+ output=generation.get('samplingParams',{}).get('max_tokens',32768)
+ c=routes.get(m['id'],{}).get('capacity',{})
+ input_tokens=c.get('input_tokens',context-output-min(1024,context//32))
+ trigger=c.get('compact_trigger',max(1,int(input_tokens*.8)))
+ budgets[m['id']]={'output':output,'input':input_tokens,'trigger':trigger}
+reserve=min(c['input']-c['trigger'] for c in budgets.values())
 providers={}; agents={}
 for i,m in enumerate(models,1):
  pid=f"pushbutton{i}"; mid=m['id']; ctx=m.get('generationConfig',{}).get('contextWindowSize',ctx)
- providers[pid]={"npm":"@ai-sdk/openai-compatible","name":f"Pushbutton worker {i}","options":{"baseURL":m['baseUrl'],"apiKey":"pushbutton-local"},"models":{mid:{"name":m['name'],"limit":{"context":ctx,"output":32768},"capabilities":{"tools":True,"input":["text"],"output":["text"]}}}}
+ c=budgets[mid]
+ providers[pid]={"npm":"@ai-sdk/openai-compatible","name":f"Pushbutton worker {i}","options":{"baseURL":m['baseUrl'],"apiKey":"pushbutton-local"},"models":{mid:{"name":m['name'],"limit":{"context":ctx,"input":c['trigger']+reserve,"output":c['output']},"capabilities":{"tools":True,"input":["text"],"output":["text"]}}}}
  if i==1:
   agents['pushbutton-orchestrator']={"mode":"primary","model":f"{pid}/{mid}","description":"Primary coding orchestrator. Delegate independent work to Pushbutton workers when parallelism helps.","permission":{"task":{"*":"allow"}}}
  else:
   agents[f'pushbutton-worker-{i}']={"mode":"subagent","model":f"{pid}/{mid}","description":f"Independent coding worker {i} for implementation, testing, debugging, review, or research.","permission":{"edit":"allow","bash":"allow"}}
-obj={"$schema":"https://opencode.ai/config.json","model":f"pushbutton1/{models[0]['id']}","default_agent":"pushbutton-orchestrator","subagent_depth":1,"provider":providers,"agent":agents}
-open(sys.argv[2],'w').write(json.dumps(obj,indent=2)+'\n')
+obj={"$schema":"https://opencode.ai/config.json","model":f"pushbutton1/{models[0]['id']}","default_agent":"pushbutton-orchestrator","subagent_depth":1,"provider":providers,"agent":agents,"compaction":{"auto":True,"reserved":reserve}}
+with open(sys.argv[2],'w') as destination: destination.write(json.dumps(obj,indent=2)+'\n')
 PY
 export OPENCODE_CONFIG="$config" OPENCODE_DISABLE_AUTOUPDATE=1
+if [[ "${DISABLE_TELEMETRY:-}" == 1 ]]; then export OPENCODE_DISABLE_TELEMETRY=1; fi
 resume=0; pass=()
 while (($#)); do
   case "$1" in

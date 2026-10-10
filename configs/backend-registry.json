@@ -31,6 +31,16 @@
       "status": "experimental",
       "gpu_arch": ["sm70"],
       "models": ["qwen3.8-flash-next"],
+      "artifact": "NVFP4 / E5M2 KV / MTP",
+      "constraints": {
+        "gpu_count": 4,
+        "tested_card_mib": 32768,
+        "tested_gpu_name": "V100",
+        "max_context": 262144,
+        "topology": "NVLink recipe; topology must be validated separately",
+        "tested_host_ram_gib": 256,
+        "host_ram_minimum_gib": null
+      },
       "notes": "Four-V100 optimized SGLang path with MTP and V100-specific kernels."
     },
     "vllm-qwen38-3090": {
@@ -55,6 +65,16 @@
       "status": "experimental",
       "gpu_arch": ["sm86"],
       "models": ["qwen3.8-flash-next"],
+      "artifact": "W4A16 / default mtp profile",
+      "constraints": {
+        "gpu_count": 4,
+        "tested_card_mib": 24576,
+        "tested_gpu_name": "RTX 3090",
+        "default_profile": "mtp",
+        "max_context": 65536,
+        "other_profiles": "bf16: 131072; fp8mtp128k: 131072 and fp8deep: 262144 require optional patch and calibrated scales.json; not selectable through pushbutton-bench",
+        "host_ram_minimum_gib": null
+      },
       "notes": "Four-RTX-3090 W4A16 Flash-Next path; MTP profile is the default benchmark lane."
     }
   }

@@ -11,6 +11,25 @@ ROOT="$(cd "$(dirname "$SELF")" && pwd)"
 STATE_DIR="${CLAUDE_LOCAL_STATE:-$HOME/.local/share/pushbutton/claude-local}"
 HOSTCC_SH="$ROOT/lib/claude_local_hostcc.sh"
 
+if CODER_LOCAL_MENU_FRONTEND=qwen-local CODER_LOCAL_STARTUP_ONLY=1 "$ROOT/coder-local" --frontend qwen "$@"; then
+  exit 0
+else
+  startup_rc=$?
+  [[ $startup_rc -eq 125 ]] || exit "$startup_rc"
+fi
+folder_args=("$@")
+for ((i=0; i<${#folder_args[@]}; i++)); do
+  case "${folder_args[i]}" in
+    --local-cache)
+      export CLAUDE_LOCAL_CACHE="${folder_args[i+1]}"; i=$((i+1));;
+    --agents|--placement-config|--local-context|--local-client-context|--local-port-base)
+      i=$((i+1));;
+    --) break;;
+  esac
+done
+source "$ROOT/lib/pushbutton_folders.sh"
+initialize_folders 1
+
 # Select/provision the compiler before inspecting CMake caches.  This affects the
 # whole llama.cpp/BoringSSL build; coder-local will source the helper again later
 # (idempotently) before invoking CMake/nvcc.

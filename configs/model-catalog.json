@@ -28,7 +28,7 @@
     },
     "ornith-1.5:35b-a3b": {
       "display": "Ornith 1.5 35B-A3B",
-      "aliases": ["ornith-35b", "ornith-1.5-35b", "ornith-1.5-35b-a3b"],
+      "aliases": ["ornith-35b", "ornith-1.5-35b", "ornith-1.5-35b-a3b", "ornith-1.5:35b"],
       "family": "Ornith 1.5",
       "context": 262144,
       "local": true,

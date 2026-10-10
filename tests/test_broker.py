@@ -9,34 +9,58 @@ def free_port():
 
 
 class FakeState:
-    lock=threading.Lock();active=0;max_active=0;calls=0
+    lock=threading.Lock();active=0;max_active=0;calls=0;native_calls=0
+    timings=None
 
 
 class FakeBackend(BaseHTTPRequestHandler):
     def log_message(self,*a):pass
     def do_GET(self):
+        if self.path == '/props':
+            b=json.dumps({'default_generation_settings':{'n_ctx':128},'total_slots':1}).encode();self.send_response(200);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(b)));self.end_headers();self.wfile.write(b);return
         if self.path.endswith('/models'):
             b=json.dumps({'data':[{'id':'backend-real-id'}]}).encode();self.send_response(200);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(b)));self.end_headers();self.wfile.write(b);return
         self.send_error(404)
     def do_POST(self):
         n=int(self.headers.get('Content-Length') or 0);obj=json.loads(self.rfile.read(n) or b'{}')
+        if self.path == '/apply-template':
+            out={'prompt': ''.join(m.get('content','') for m in obj.get('messages',[])) + json.dumps(obj.get('tools',[]))}
+        elif self.path == '/tokenize':
+            if 'messages' in obj:
+                count=len(''.join(m.get('content','') for m in obj['messages']))+len(json.dumps(obj.get('tools',[])))
+                out={'count':count,'tokens':list(range(count)),'max_model_len':128}
+                FakeState.native_calls+=1
+            else:
+                out={'tokens': list(range(len(obj.get('content',''))))}
+        else:
+            out=None
+        if out is not None:
+            b=json.dumps(out).encode();self.send_response(200);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(b)));self.end_headers();self.wfile.write(b);return
         with FakeState.lock:
             FakeState.active+=1;FakeState.calls+=1;FakeState.max_active=max(FakeState.max_active,FakeState.active)
         time.sleep(.18)
         with FakeState.lock:FakeState.active-=1
         content='seen:'+str(obj.get('model'))
         out={'id':'x','model':'backend-real-id','choices':[{'message':{'role':'assistant','content':content}}],'usage':{'prompt_tokens':10,'completion_tokens':4}}
+        if FakeState.timings is not None:out['timings']=FakeState.timings
+        if obj.get('stream'):
+            self.send_response(200);self.send_header('Content-Type','text/event-stream');self.end_headers()
+            events=[{'choices':[{'delta':{'content':content}}]},dict(out,choices=[])]
+            for event in events:self.wfile.write(b'data: '+json.dumps(event).encode()+b'\n\n');self.wfile.flush()
+            self.wfile.write(b'data: [DONE]\n\n');return
         b=json.dumps(out).encode();self.send_response(200);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(b)));self.end_headers();self.wfile.write(b)
 
 
 class BrokerTests(unittest.TestCase):
     def setUp(self):
         FakeState.active=FakeState.max_active=FakeState.calls=0
+        FakeState.native_calls=0
+        FakeState.timings=None
         self.backend_port=free_port();self.backend=ThreadingHTTPServer(('127.0.0.1',self.backend_port),FakeBackend);self.bt=threading.Thread(target=self.backend.serve_forever,daemon=True);self.bt.start()
-        self.td=tempfile.TemporaryDirectory();state=pathlib.Path(self.td.name);self.broker_port=free_port()
+        self.td=tempfile.TemporaryDirectory(dir=ROOT);state=pathlib.Path(self.td.name);self.broker_port=free_port()
         reg={'instances':[{'id':'i1','model':'logical-model','backend':'llama.cpp','endpoint':f'http://127.0.0.1:{self.backend_port}/v1','max_context':128,'framework_max_concurrency':1,'measured_envelopes':[{'concurrency':1,'max_context':128,'safe':True,'evidence':'PROVEN'}],'tg':50.0,'tg_measured':True,'healthy':True}]}
         (state/'instances.json').write_text(json.dumps(reg))
-        env=os.environ.copy();env['PUSHBUTTON_RUNTIME_STATE']=self.td.name;env['PUSHBUTTON_CONFIG_DIR']=str(state/'cfg');env['PUSHBUTTON_CACHE_DIR']=str(state/'cache')
+        env=os.environ.copy();env['PUSHBUTTON_RUNTIME_STATE']=self.td.name;env['PUSHBUTTON_RUNTIME_DIR']=self.td.name;env['PUSHBUTTON_CONFIG_DIR']=str(state/'cfg');env['PUSHBUTTON_CACHE_DIR']=str(state/'cache')
         self.proc=subprocess.Popen([sys.executable,str(ROOT/'pushbutton-broker'),'--port',str(self.broker_port),'--registry',str(state/'instances.json'),'--no-scaler','--no-calibrator'],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         deadline=time.time()+5
         while time.time()<deadline:
@@ -57,6 +81,57 @@ class BrokerTests(unittest.TestCase):
         with urllib.request.urlopen(req,timeout=5) as r:return json.load(r)
     def test_logical_auto_model_is_translated(self):
         obj=self.request();self.assertEqual(obj['choices'][0]['message']['content'],'seen:backend-real-id')
+    def observation(self):
+        deadline=time.time()+2
+        while time.time()<deadline:
+            files=list((pathlib.Path(self.td.name)/'observations').glob('*.jsonl'))
+            if files:
+                lines=files[0].read_text().splitlines()
+                if lines:return json.loads(lines[-1])
+            time.sleep(.02)
+        self.fail('no observation recorded')
+    def test_actual_backend_timings_nonstream_and_stream(self):
+        FakeState.timings={'prompt_n':2,'cache_n':8,'prompt_ms':20,'prompt_per_second':100,
+                           'predicted_n':4,'predicted_ms':200,'predicted_per_second':20,'prompt':'PRIVATE'}
+        for stream in (False,True):
+            with self.subTest(stream=stream):
+                for p in (pathlib.Path(self.td.name)/'observations').glob('*.jsonl'):p.unlink()
+                body=json.dumps({'model':'pushbutton/auto','messages':[{'role':'user','content':'hi'}],'max_tokens':4,'stream':stream}).encode()
+                req=urllib.request.Request(f'http://127.0.0.1:{self.broker_port}/v1/chat/completions',data=body,headers={'Content-Type':'application/json'})
+                with urllib.request.urlopen(req,timeout=5) as r:
+                    result=r.read()
+                self.assertIn(b'seen:backend-real-id',result)
+                obs=self.observation()
+                self.assertEqual((obs['pp'],obs['tg'],obs['method']),(100,20,'backend-timings'))
+                self.assertEqual((obs['prompt_processed_tokens'],obs['cached_tokens'],obs['prompt_tokens']),(2,8,10))
+                self.assertEqual((obs['prompt_ms'],obs['predicted_ms'],obs['concurrency']),(20,200,1))
+                self.assertEqual(obs['depths'][0]['depth'],10)
+                self.assertNotIn('PRIVATE',json.dumps(obs))
+    def test_stream_fallback_is_explicitly_labeled(self):
+        body=json.dumps({'model':'pushbutton/auto','messages':[{'role':'user','content':'hi'}],'max_tokens':4,'stream':True}).encode()
+        req=urllib.request.Request(f'http://127.0.0.1:{self.broker_port}/v1/chat/completions',data=body,headers={'Content-Type':'application/json'})
+        with urllib.request.urlopen(req,timeout=5) as r:r.read()
+        obs=self.observation()
+        self.assertEqual((obs['pp_method'],obs['tg_method']),('broker-ttft','broker-stream'))
+        self.assertGreater(obs['pp'],0);self.assertGreater(obs['tg'],0)
+    def test_backend_duration_rate_derivation(self):
+        FakeState.timings={'prompt_n':2,'prompt_ms':20,'predicted_n':4,'predicted_ms':200,'predicted_per_second':15}
+        self.request();obs=self.observation()
+        self.assertEqual((obs['pp'],obs['tg']),(100,15))
+    def test_missing_decode_rate_is_not_derived_with_backend_dependent_token_semantics(self):
+        FakeState.timings={'predicted_n':4,'predicted_ms':200}
+        self.request();obs=self.observation()
+        self.assertNotIn('tg',obs)
+        self.assertEqual(obs['tg_method'],'unavailable')
+    def test_nonstream_without_timings_does_not_invent_rates(self):
+        self.request();obs=self.observation()
+        self.assertNotIn('pp',obs);self.assertNotIn('tg',obs)
+        self.assertEqual((obs['pp_method'],obs['tg_method']),('unavailable','unavailable'))
+    def test_invalid_and_empty_backend_timings(self):
+        FakeState.timings={'prompt_n':0,'prompt_ms':0,'prompt_per_second':float('inf'),
+                           'predicted_n':4,'predicted_ms':-1,'predicted_per_second':True}
+        self.request();obs=self.observation()
+        self.assertNotIn('pp',obs);self.assertNotIn('tg',obs)
     def test_c1_serializes_two_clients(self):
         out=[]
         ts=[threading.Thread(target=lambda:out.append(self.request())) for _ in range(2)]
@@ -66,7 +141,32 @@ class BrokerTests(unittest.TestCase):
     def test_context_over_limit_is_rejected_before_backend(self):
         before=FakeState.calls
         with self.assertRaises(urllib.error.HTTPError) as cm:self.request(text='x'*1600,max_tokens=32)
-        self.assertEqual(cm.exception.code,503);self.assertEqual(FakeState.calls,before)
+        self.assertEqual(cm.exception.code,400);self.assertEqual(FakeState.calls,before)
+    def test_invalid_output_rejected(self):
+        for value in (0,-1,True,1.5,"4"):
+            with self.subTest(value=value), self.assertRaises(urllib.error.HTTPError) as cm:
+                self.request(max_tokens=value)
+            self.assertEqual(cm.exception.code,400)
+        self.assertEqual(FakeState.calls,0)
+    def test_auto_skips_smaller_route_but_explicit_switch_rechecks(self):
+        path=pathlib.Path(self.td.name)/'instances.json'
+        large=json.loads(path.read_text())['instances'][0]
+        small=dict(large,id='a-small',max_context=32,aliases=['small'])
+        path.write_text(json.dumps({'instances':[small,large]}))
+        self.request(text='x'*70)
+        self.assertEqual(FakeState.calls,1)
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            self.request(model='small',text='x'*70)
+        self.assertEqual(cm.exception.code,400)
+        self.assertEqual(FakeState.calls,1)
+    def test_known_vllm_route_uses_native_chat_tokenizer(self):
+        path=pathlib.Path(self.td.name)/'instances.json'
+        registry=json.loads(path.read_text())
+        registry['instances'][0]['backend']='vllm-qwen38-3090'
+        path.write_text(json.dumps(registry))
+        self.request()
+        self.assertEqual(FakeState.native_calls,1)
+        self.assertEqual(FakeState.calls,1)
     def test_maintenance_lease_queues_new_work_until_release(self):
         lease=self.control('/pushbutton/maintenance/acquire',{'id':'i1'});self.assertTrue(lease['ok'])
         out=[]

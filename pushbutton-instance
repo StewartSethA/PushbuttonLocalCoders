@@ -6,8 +6,9 @@ model+quant selections. Specialized backend adapters remain available when their
 measured SLA is better.
 """
 from __future__ import annotations
-import argparse, os, pathlib, platform, shutil, subprocess, sys
+import argparse, json, os, pathlib, platform, shutil, subprocess, sys
 
+sys.path.insert(0,str(pathlib.Path(__file__).resolve().parent/'lib'))
 STATE=pathlib.Path(os.environ.get('PUSHBUTTON_RUNTIME_STATE',pathlib.Path.home()/'.local/share/pushbutton/runtime'))
 SRC=STATE/'engines/llama.cpp'
 
@@ -43,33 +44,61 @@ def ensure_source(update=False):
             run(['git','-C',SRC,'fetch','--depth=1','origin','master']);run(['git','-C',SRC,'reset','--hard','origin/master'])
     else:run(['git','clone','--depth=1','https://github.com/ggml-org/llama.cpp.git',SRC])
 
-def ensure_server(gpus,update=False):
+def ensure_server(gpus,update=False,cpu=False,targets=('llama-server',)):
     ensure_source(update)
-    caps=gpu_caps(gpus);system=platform.system().lower()
+    caps=[] if cpu else gpu_caps(gpus);system=platform.system().lower()
     if caps:
         tag='cuda-'+'_'.join(caps);args=['-DGGML_CUDA=ON','-DGGML_CUDA_FA_ALL_QUANTS=ON',f"-DCMAKE_CUDA_ARCHITECTURES={';'.join(caps)}"]
-    elif system=='darwin':tag='metal';args=['-DGGML_METAL=ON']
-    else:tag='cpu';args=[]
+    elif system=='darwin' and not cpu:tag='metal';args=['-DGGML_METAL=ON']
+    else:
+        # CPU-only: enable exactly the ISA extensions this host has (AVX2, AVX-512,
+        # VNNI, BF16, AMX; AVX2 kernels + -mtune=knl on Xeon Phi) in a per-ISA build dir.
+        import cpu_platform
+        info=cpu_platform.detect();args=cpu_platform.cmake_flags(info);tag=cpu_platform.build_tag(info,args)
     build=SRC/f'build-{tag}';server=build/'bin/llama-server'
-    if server.exists() and not update:return server
+    if all((build/'bin'/t).exists() for t in targets) and not update:return server
     gen=['-G','Ninja'] if shutil.which('ninja') else []
     run(['cmake','-S',SRC,'-B',build,*gen,'-DCMAKE_BUILD_TYPE=Release',*args])
-    run(['cmake','--build',build,'--target','llama-server','-j',str(os.cpu_count() or 8)])
+    run(['cmake','--build',build,'--target',*targets,'-j',str(os.cpu_count() or 8)])
     return server
+
+def cpu_mode(gpus,flag):
+    """CPU serving when asked, or automatically when no NVIDIA GPU is visible on Linux."""
+    if flag:return True
+    return not gpus and platform.system().lower()!='darwin' and not gpu_caps([])
 
 def main():
     ap=argparse.ArgumentParser(prog='pushbutton-instance')
-    ap.add_argument('--hf-spec',required=True);ap.add_argument('--alias',required=True);ap.add_argument('--gpus',default='')
-    ap.add_argument('--host',default='127.0.0.1');ap.add_argument('--port',type=int,required=True);ap.add_argument('--context',type=int,default=65536)
-    ap.add_argument('--parallel',type=int,default=1);ap.add_argument('--kv-k',default='q8_0');ap.add_argument('--kv-v',default='q8_0')
+    ap.add_argument('--hf-spec');ap.add_argument('--alias');ap.add_argument('--gpus',default='')
+    ap.add_argument('--host',default='127.0.0.1');ap.add_argument('--port',type=int);ap.add_argument('--context',type=int,default=65536)
+    ap.add_argument('--cpu',action='store_true',help='force a CPU-only build/launch')
+    ap.add_argument('--cpu-strategy',default='',help='JSON strategy from lib/cpu_platform.py (threads, NUMA, numactl, mmap)')
+    ap.add_argument('--with-bench',action='store_true',help='also build llama-bench')
+    ap.add_argument('--parallel','--slots',dest='parallel',type=int,default=1);ap.add_argument('--kv-k',default='q8_0');ap.add_argument('--kv-v',default='q8_0')
     ap.add_argument('--batch',type=int,default=2048);ap.add_argument('--ubatch',type=int,default=512);ap.add_argument('--update-engine',action='store_true');ap.add_argument('--prepare-only',action='store_true')
-    a=ap.parse_args();gpus=[int(x) for x in a.gpus.split(',') if x.strip()];server=ensure_server(gpus,a.update_engine)
+    a=ap.parse_args()
+    if a.context < 1 or not 1 <= a.parallel <= 128:ap.error('context must be positive and slots must be between 1 and 128')
+    if a.batch < 1 or a.ubatch < 1:ap.error('batch sizes must be positive')
+    if not a.prepare_only and not (a.hf_spec and a.alias and a.port):ap.error('--hf-spec, --alias and --port are required unless --prepare-only')
+    gpus=[int(x) for x in a.gpus.split(',') if x.strip()];cpu=cpu_mode(gpus,a.cpu or bool(a.cpu_strategy))
+    targets=('llama-server','llama-bench') if a.with_bench else ('llama-server',)
+    server=ensure_server(gpus,a.update_engine,cpu,targets)
     if a.prepare_only:print(server);return
     env=os.environ.copy()
     if gpus:env['CUDA_VISIBLE_DEVICES']=','.join(map(str,gpus))
     env.setdefault('GGML_CUDA_ENABLE_UNIFIED_MEMORY','0');env.setdefault('LLAMA_CACHE',str(pathlib.Path.home()/'.cache/pushbutton/llama'))
-    total_ctx=max(1024,a.context*max(1,a.parallel))
-    cmd=[str(server),'-hf',a.hf_spec,'--alias',a.alias,'--host',a.host,'--port',str(a.port),'-ngl','999','-c',str(total_ctx),'--parallel',str(max(1,a.parallel)),'--cache-type-k',a.kv_k,'--cache-type-v',a.kv_v,'-b',str(a.batch),'-ub',str(a.ubatch),'-fa','on','--jinja','--cache-prompt']
+    total_ctx=a.context*a.parallel
+    cmd=[str(server),'-hf',a.hf_spec,'--alias',a.alias,'--host',a.host,'--port',str(a.port),'-ngl','999','-c',str(total_ctx),'--parallel',str(a.parallel),'--cache-type-k',a.kv_k,'--cache-type-v',a.kv_v,'-b',str(a.batch),'-ub',str(a.ubatch),'-fa','on','--jinja','--cache-prompt','--no-context-shift']
+    if cpu:
+        import cpu_platform
+        if a.cpu_strategy:strat=cpu_platform.strategy_from_dict(json.loads(a.cpu_strategy))
+        else:strat=cpu_platform.candidate_strategies(cpu_platform.detect(),0)[0]
+        prefix=list(strat.numactl)
+        if prefix and not shutil.which(prefix[0]):
+            say(f'{prefix[0]} not found; launching without memory binding');prefix=[]
+        # A later -ngl wins in llama.cpp's parser, so the CPU args override -ngl 999.
+        cmd=prefix+cmd+cpu_platform.adapt_load_args(strat.llama_args(),str(server))
+        say(f'CPU strategy {strat.name}: {strat.threads} threads ({strat.threads_batch} batch), memory {strat.memory_tier}')
     say(f'serving {a.alias} with C{a.parallel}, {a.context:,} context/slot on {a.host}:{a.port}')
     os.execvpe(cmd[0],cmd,env)
 

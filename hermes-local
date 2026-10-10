@@ -7,13 +7,15 @@ command -v readlink >/dev/null 2>&1 && SELF="$(readlink -f "$SELF" 2>/dev/null |
 ROOT="$(cd "$(dirname "$SELF")" && pwd)"
 PLAN_PY="$ROOT/lib/claude_local_plan.py"
 HOSTCC_SH="$ROOT/lib/claude_local_hostcc.sh"
-source "$ROOT/lib/pushbutton_download.sh"
 
 STATE_DIR="${CLAUDE_LOCAL_STATE:-$HOME/.local/share/pushbutton/claude-local}"
 CACHE_DIR="${CLAUDE_LOCAL_CACHE:-$HOME/.cache/pushbutton/llama}"
 LOCK_FILE="${CLAUDE_LOCAL_LOCK_FILE:-$HOME/.local/share/pushbutton/claude-local/startup.lock}"
 CTX="${CLAUDE_LOCAL_CONTEXT:-262144}"
+SLOTS=1
 CLIENT_CTX="${CLAUDE_LOCAL_CLIENT_CONTEXT:-200000}"
+CLIENT_CTX_EXPLICIT=0
+[[ -z "${CLAUDE_LOCAL_CLIENT_CONTEXT+x}" ]] || CLIENT_CTX_EXPLICIT=1
 PORT_BASE="${HERMES_LOCAL_PORT_BASE:-19180}"
 BOT_PREFIX="${HERMES_LOCAL_BOT_PREFIX:-pushbutton}"
 WEB_SEARCH_BACKEND="${HERMES_LOCAL_WEB_SEARCH_BACKEND:-exa}"
@@ -21,6 +23,11 @@ WEB_EXTRACT_BACKEND="${HERMES_LOCAL_WEB_EXTRACT_BACKEND:-firecrawl}"
 UI=desktop
 RESUME=0
 KEEP_SERVERS=0
+QUIET=0
+FOLDERS_ONLY=0
+SELECT=0
+NO_TELEMETRY=0
+SELECT_ARGS=()
 MODELS=()
 PIDS=()
 STARTUP_LOCK_FD=""
@@ -52,14 +59,20 @@ Hermes frontends:
   --resume               Resume latest manager session for TUI/CLI
 
 Harness options:
+  --select              choose models interactively before provisioning
   --local-cache DIR
+  --folders, --system-info   Show storage paths and disk usage, then exit
+  --quiet                   Suppress the startup folder banner
   --no-parallel           Force sequential Hugging Face downloads
-  --local-context N
+  --local-context N           fallback hard context per slot
+  --slots N                  fallback parallel slots per model
+  MODEL@context=N,slots=N,output=N,client_context=N,compact=N,quant=Q,kv_k=K,kv_v=V,min_tps=N,admission=N
   --local-client-context N
   --local-port-base N
   --bot-prefix NAME      Profile prefix (default: pushbutton)
   --web-search-backend NAME   Hermes web_search backend (default: exa)
   --web-extract-backend NAME  Hermes web_extract backend (default: firecrawl)
+  --no-telemetry             disable framework telemetry and error reporting
   --local-keep-servers   Keep llama.cpp servers after Hermes exits
   -h, --help
 
@@ -288,7 +301,8 @@ import json,sys
 sep='\x1f'
 for s in json.load(open(sys.argv[1]))['servers']:
     x=s['profile']; env=';'.join(f'{k}={v}' for k,v in x.get('extra_env',{}).items())
-    print(sep.join(map(str,[s['id'],x['hf_spec'],s['cuda_visible_devices'],int(s['multi_gpu']),x['kv_k'],x['kv_v'],x['batch'],x['ubatch'],x['flash_attn'],x['template'],env,x.get('note','')])))
+    c=s['capacity']
+    print(sep.join(map(str,[s['id'],x['hf_spec'],s['cuda_visible_devices'],int(s['multi_gpu']),x['kv_k'],x['kv_v'],x['batch'],x['ubatch'],x['flash_attn'],x['template'],env,x.get('note',''),c['context'],c['slots'],json.dumps(c,separators=(',',':'))])))
 PY
 }
 
@@ -301,6 +315,23 @@ print('Servers:')
 for s in p['servers']:
     x=s['profile']; gs=', '.join(f"GPU{g['index']} {g['name']} ({g['free_mib']/1024:.1f} GiB free, PCIe Gen{g['pcie_gen']} x{g['pcie_width']})" for g in s['gpus'])
     print(f"  {s['id']}: {x['hf_spec']}\n    {gs}\n    KV={x['kv_k']}/{x['kv_v']} batch={x['batch']}/{x['ubatch']} FA={x['flash_attn']} quality-tier={x['quality']}")
+    c=s['capacity']
+    print(f"    slots={c['slots']} hard={c['context']} input={c['input_tokens']} output={c['output_tokens']} client={c['client_context']} compact={c['compact_trigger']} estimated-memory={s['required_mib']/1024:.2f} GiB")
+    if c.get('min_tps') is not None:
+        print(f"    WARNING: min_tps={c['min_tps']} is requested, not proven; no matching runtime throughput SLA evidence is verified by this launcher.")
+PY
+}
+
+verify_capacity() {
+python3 - "$ROOT/lib" "$1" "$2" <<'PY'
+import json,sys
+sys.path.insert(0,sys.argv[1])
+from pushbutton_request_budget import verify_backend_capacity
+try:
+ verify_backend_capacity(f'http://127.0.0.1:{sys.argv[2]}',json.loads(sys.argv[3]))
+except Exception as error:
+ print(f'Capacity readiness failed: {error}',file=sys.stderr)
+ raise SystemExit(1)
 PY
 }
 
@@ -309,11 +340,12 @@ start_backends() {
     export LLAMA_CACHE="$CACHE_DIR" GGML_CUDA_ENABLE_UNIFIED_MEMORY=0 CUDA_SCALE_LAUNCH_QUEUES=4x
     local next=$((PORT_BASE+1))
     BACKENDS_TSV="$STATE_DIR/hermes-backends.$$"; : > "$BACKENDS_TSV"
-    while IFS=$'\x1f' read -r id hf gpus multi kvk kvv batch ubatch fa template envpairs note; do
+    while IFS=$'\x1f' read -r id hf gpus multi kvk kvv batch ubatch fa template envpairs note context slots capacity; do
         local port log pid model_path failed=0 waited=0
-        download_model_fast "$hf" "$CACHE_DIR" model_path || die "failed to download $hf"
+        validate_download_space "$CACHE_DIR" "$hf" "${hf##*:}" || exit 2
+        download_model_fast "$hf" "$CACHE_DIR" model_path || { rc=$?; [[ $rc != 2 ]] || exit 2; die "failed to download $hf"; }
         port="$(free_port "$next")"; next=$((port+1)); log="$STATE_DIR/logs/hermes-${id}.log"; : > "$log"
-        local -a cmd=("$LLAMA_SERVER" -m "$model_path" --alias "$id" --no-mmproj -ngl 999 -c "$CTX" -np 1 --cache-type-k "$kvk" --cache-type-v "$kvv" -b "$batch" -ub "$ubatch" -fa "$fa" --jinja --no-context-shift --host 127.0.0.1 --port "$port")
+        local -a cmd=("$LLAMA_SERVER" -m "$model_path" --alias "$id" --no-mmproj -ngl 999 -c "$((context * slots))" -np "$slots" --cache-type-k "$kvk" --cache-type-v "$kvv" -b "$batch" -ub "$ubatch" -fa "$fa" --jinja --no-context-shift --host 127.0.0.1 --port "$port")
         [[ "$multi" == 1 ]] && cmd+=(--split-mode layer)
         [[ "$template" == qwen-fixed ]] && cmd+=(--chat-template-file "$QWEN_TEMPLATE")
         local -a envcmd=(env "CUDA_VISIBLE_DEVICES=$gpus" "LLAMA_CACHE=$CACHE_DIR" "GGML_CUDA_ENABLE_UNIFIED_MEMORY=0" "CUDA_SCALE_LAUNCH_QUEUES=4x")
@@ -321,7 +353,8 @@ start_backends() {
             local -a pairs; IFS=';' read -ra pairs <<< "$envpairs"; local pair
             for pair in "${pairs[@]}"; do envcmd+=("$pair"); done
         fi
-        say "Starting $id on GPU(s) [$gpus], $hf, ctx=$CTX${note:+ — $note}"
+        say "Starting $id on GPU(s) [$gpus], $hf, hard=$context slots=$slots${note:+ — $note}"
+        printf '[hermes-local] Follow %s logs in another terminal:\n  tail -n 50 -F -- %q\n' "$id" "$log" >&2
         "${envcmd[@]}" "${cmd[@]}" > >(tee -a "$log" >&2) 2>&1 & pid=$!; PIDS+=("$pid")
         while ! curl -fsS "http://127.0.0.1:$port/health" >/dev/null 2>&1; do
             kill -0 "$pid" 2>/dev/null || { failed=1; break; }
@@ -333,8 +366,9 @@ start_backends() {
             tail -80 "$log" >&2 || true
             die "failed to start $id"
         fi
+        verify_capacity "$port" "$capacity" || die "$id effective per-slot capacity is unsafe"
         say "Backend ready: $id on http://127.0.0.1:$port/v1"
-        printf '%s\t%s\t%s\n' "$id" "$port" "$hf" >> "$BACKENDS_TSV"
+        printf '%s\t%s\t%s\t%s\n' "$id" "$port" "$hf" "$capacity" >> "$BACKENDS_TSV"
     done < <(server_rows)
 }
 
@@ -345,11 +379,29 @@ print(json.load(open(sys.argv[1]))['role_ids'][sys.argv[2]])
 PY
 }
 
+start_capacity_proxy() {
+    CAPACITY_PROXY_CONFIG="$STATE_DIR/hermes-capacity.$$.json"
+    CAPACITY_PROXY_PORT="$(free_port "$PORT_BASE")"
+    python3 - "$BACKENDS_TSV" "$CAPACITY_PROXY_CONFIG" <<'PY'
+import json,sys
+routes={}
+for line in open(sys.argv[1]):
+ mid,port,hf,raw=line.rstrip('\n').split('\t')
+ routes[mid]={'model_id':mid,'backend_alias':mid,'url':f'http://127.0.0.1:{port}','capacity':{**json.loads(raw),'no_context_shift':True}}
+json.dump({'routes':routes},open(sys.argv[2],'w'),indent=2)
+PY
+    local pid log="$STATE_DIR/logs/hermes-capacity.log"
+    python3 "$ROOT/lib/pushbutton_capacity_proxy.py" --config "$CAPACITY_PROXY_CONFIG" --port "$CAPACITY_PROXY_PORT" >"$log" 2>&1 &
+    pid=$!; PIDS+=("$pid")
+    until curl -fsS "http://127.0.0.1:$CAPACITY_PROXY_PORT/health" >/dev/null 2>&1; do
+        kill -0 "$pid" 2>/dev/null || { tail -80 "$log" >&2 || true; die "capacity guard failed"; }
+        sleep 1
+    done
+    say "Guarded OpenAI endpoint ready: http://127.0.0.1:$CAPACITY_PROXY_PORT/v1"
+}
+
 backend_url() {
-    local model_id="$1" port
-    port="$(awk -F '\t' -v m="$model_id" '$1==m {print $2; exit}' "$BACKENDS_TSV")"
-    [[ -n "$port" ]] || die "no backend port found for $model_id"
-    printf 'http://127.0.0.1:%s/v1\n' "$port"
+    printf 'http://127.0.0.1:%s/v1\n' "$CAPACITY_PROXY_PORT"
 }
 
 profile_exists() {
@@ -368,11 +420,25 @@ ensure_profile() {
 
 configure_profile() {
     local name="$1" model_id="$2" url="$3" effort="$4"
-    hermes -p "$name" config set model.provider custom >/dev/null
+    local client_context compact_trigger output_tokens role_budget
+    role_budget="$(python3 - "$PLAN_FILE" "$model_id" <<'PY'
+import json,sys
+p=json.load(open(sys.argv[1]))
+c=next(s['capacity'] for s in p['servers'] if s['id']==sys.argv[2])
+print(c['client_context'],c['compact_trigger'],c['output_tokens'])
+PY
+)"
+    read -r client_context compact_trigger output_tokens <<<"$role_budget"
+    hermes -p "$name" config set model.provider custom:pushbutton >/dev/null
     hermes -p "$name" config set model.default "$model_id" >/dev/null
     hermes -p "$name" config set model.base_url "$url" >/dev/null
     hermes -p "$name" config set model.api_mode chat_completions >/dev/null
-    hermes -p "$name" config set model.context_length "$CLIENT_CTX" >/dev/null
+    hermes -p "$name" config set providers.pushbutton.base_url "$url" >/dev/null
+    hermes -p "$name" config set providers.pushbutton.transport chat_completions >/dev/null
+    hermes -p "$name" config set providers.pushbutton.extra_body.max_tokens "$output_tokens" >/dev/null
+    hermes -p "$name" config set model.context_length "$client_context" >/dev/null
+    hermes -p "$name" config set compression.enabled true >/dev/null
+    hermes -p "$name" config set compression.threshold_tokens "$compact_trigger" >/dev/null
     hermes -p "$name" config set terminal.cwd . >/dev/null
     hermes -p "$name" config set agent.reasoning_effort "$effort" >/dev/null || true
     hermes -p "$name" config set web.search_backend "$WEB_SEARCH_BACKEND" >/dev/null || true
@@ -445,30 +511,66 @@ launch_hermes() {
     esac
 }
 
-[[ -f "$PLAN_PY" ]] || die "missing $PLAN_PY"
 while (($#)); do
     case "$1" in
         -h|--help) usage; exit 0 ;;
-        --desktop) UI=desktop; shift ;;
-        --tui) UI=tui; shift ;;
-        --cli) UI=cli; shift ;;
-        --resume) RESUME=1; shift ;;
-        --local-cache) [[ $# -ge 2 ]] || die "--local-cache needs a directory"; CACHE_DIR="$2"; shift 2 ;;
-        --no-parallel) PUSHBUTTON_NO_PARALLEL=1; shift ;;
+        --select) SELECT=1; shift ;;
+        --desktop) UI=desktop; SELECT_ARGS+=("$1"); shift ;;
+        --tui) UI=tui; SELECT_ARGS+=("$1"); shift ;;
+        --cli) UI=cli; SELECT_ARGS+=("$1"); shift ;;
+        --resume) RESUME=1; SELECT_ARGS+=("$1"); shift ;;
+        --local-cache) [[ $# -ge 2 ]] || die "--local-cache needs a directory"; export CLAUDE_LOCAL_CACHE="$2"; SELECT_ARGS+=("$1" "$2"); shift 2 ;;
+        --folders|--system-info) FOLDERS_ONLY=1; shift ;;
+        --quiet) QUIET=1; SELECT_ARGS+=("$1"); shift ;;
+        --no-telemetry) NO_TELEMETRY=1; SELECT_ARGS+=("$1"); shift ;;
+        --no-parallel) PUSHBUTTON_NO_PARALLEL=1; SELECT_ARGS+=("$1"); shift ;;
         --local-context) [[ $# -ge 2 ]] || die "--local-context needs a value"; CTX="$2"; shift 2 ;;
-        --local-client-context) [[ $# -ge 2 ]] || die "--local-client-context needs a value"; CLIENT_CTX="$2"; shift 2 ;;
-        --local-port-base) [[ $# -ge 2 ]] || die "--local-port-base needs a value"; PORT_BASE="$2"; shift 2 ;;
-        --bot-prefix) [[ $# -ge 2 ]] || die "--bot-prefix needs a name"; BOT_PREFIX="$2"; shift 2 ;;
-        --web-search-backend) [[ $# -ge 2 ]] || die "--web-search-backend needs a name"; WEB_SEARCH_BACKEND="$2"; shift 2 ;;
-        --web-extract-backend) [[ $# -ge 2 ]] || die "--web-extract-backend needs a name"; WEB_EXTRACT_BACKEND="$2"; shift 2 ;;
-        --local-keep-servers) KEEP_SERVERS=1; shift ;;
+        --slots) [[ $# -ge 2 ]] || die "--slots needs a value"; SLOTS="$2"; shift 2 ;;
+        --local-client-context) [[ $# -ge 2 ]] || die "--local-client-context needs a value"; CLIENT_CTX="$2"; CLIENT_CTX_EXPLICIT=1; shift 2 ;;
+        --local-port-base) [[ $# -ge 2 ]] || die "--local-port-base needs a value"; PORT_BASE="$2"; SELECT_ARGS+=("$1" "$2"); shift 2 ;;
+        --bot-prefix) [[ $# -ge 2 ]] || die "--bot-prefix needs a name"; BOT_PREFIX="$2"; SELECT_ARGS+=("$1" "$2"); shift 2 ;;
+        --web-search-backend) [[ $# -ge 2 ]] || die "--web-search-backend needs a name"; WEB_SEARCH_BACKEND="$2"; SELECT_ARGS+=("$1" "$2"); shift 2 ;;
+        --web-extract-backend) [[ $# -ge 2 ]] || die "--web-extract-backend needs a name"; WEB_EXTRACT_BACKEND="$2"; SELECT_ARGS+=("$1" "$2"); shift 2 ;;
+        --local-keep-servers) KEEP_SERVERS=1; SELECT_ARGS+=("$1"); shift ;;
         -*) die "unknown option: $1" ;;
         *) MODELS+=("$1"); shift ;;
     esac
 done
 
+if ((NO_TELEMETRY)); then
+    export DISABLE_TELEMETRY=1 DISABLE_ERROR_REPORTING=1 DO_NOT_TRACK=1
+    export OTEL_SDK_DISABLED=true HERMES_DISABLE_TELEMETRY=1
+fi
+
+if ((FOLDERS_ONLY)); then
+    source "$ROOT/lib/pushbutton_folders.sh"
+    load_folder_config
+    check_folders_exist
+    print_folder_summary 1
+    printf '  Hermes profiles: %s/.hermes/profiles\n' "$HOME"
+    exit 0
+fi
+if ((SELECT)) || ((${#MODELS[@]} == 0)); then
+    if [[ ! -t 0 || ! -t 1 ]]; then
+        usage >&2
+        die "supply a MODEL, or run hermes-local --select in an interactive terminal"
+    fi
+    have_cmd python3 || die "python3 is required for the interactive selector"
+    [[ -f "$ROOT/pushbutton-select" ]] || die "missing $ROOT/pushbutton-select; reinstall hermes-local"
+    selector_args=(--frontend hermes-local --menu --context "$CTX")
+    [[ "$SLOTS" == 1 ]] || selector_args+=(--slots "$SLOTS")
+    ((CLIENT_CTX_EXPLICIT == 0)) || selector_args+=(--client-context "$CLIENT_CTX")
+    selector_args+=("${MODELS[@]}")
+    for arg in "${SELECT_ARGS[@]}"; do selector_args+=("--launch-arg=$arg"); done
+    exec python3 "$ROOT/pushbutton-select" "${selector_args[@]}"
+fi
+[[ -f "$PLAN_PY" ]] || die "missing $PLAN_PY"
+source "$ROOT/lib/pushbutton_download.sh"
+source "$ROOT/lib/pushbutton_folders.sh"
+initialize_folders "$QUIET"
+((QUIET)) || say "Hermes profiles and sessions: $HOME/.hermes (managed by Hermes)"
+LOCK_FILE="${CLAUDE_LOCAL_LOCK_FILE:-$STATE_DIR/startup.lock}"
 [[ "$CTX" =~ ^[0-9]+$ && "$CLIENT_CTX" =~ ^[0-9]+$ ]] || die "context values must be integers"
-(( CLIENT_CTX <= CTX )) || die "client context ($CLIENT_CTX) exceeds physical context ($CTX)"
 ((${#MODELS[@]} <= 4)) || die "at most four model selectors may be supplied"
 
 install_base_deps
@@ -477,15 +579,19 @@ ensure_hermes
 mkdir -p "$STATE_DIR" "$CACHE_DIR"
 PLAN_FILE="$STATE_DIR/hermes-plan.$$.json"
 acquire_startup_lock
-plan_args=(plan --context "$CTX")
+plan_args=(plan --context "$CTX" --slots "$SLOTS")
+((CLIENT_CTX_EXPLICIT == 0)) || plan_args+=(--client-context "$CLIENT_CTX")
 if ((${#MODELS[@]})); then plan_args+=("${MODELS[@]}"); else plan_args+=(--smart); fi
 python3 "$PLAN_PY" "${plan_args[@]}" > "$PLAN_FILE"
 print_plan
+validate_plan_download_space "$PLAN_FILE" "$CACHE_DIR" || exit 2
 prepare_host_compiler
 activate_cuda
 ensure_llamacpp
 grep -q '"template": "qwen-fixed"' "$PLAN_FILE" && fetch_qwen_template || true
 start_backends
+start_capacity_proxy
+say "Hermes profiles use their own client context, output limits, and absolute compression thresholds."
 configure_bots
 release_startup_lock
 launch_hermes

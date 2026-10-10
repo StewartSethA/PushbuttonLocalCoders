@@ -36,6 +36,10 @@ def select_files(metadata, quant):
             continue
         # Token boundaries prevent Q4_K matching Q4_K_M or IQ3 matching UD-IQ3.
         base = path.name
+        # Optional MTP builds require an explicit variant or filename selector.
+        if (re.search(r"-mtp(?:-\d{5}-of-\d{5})?\.gguf$", base, re.IGNORECASE)
+                and not re.search(r"(?:^|-)mtp(?:[.-]|$)", quant, re.IGNORECASE)):
+            continue
         pattern = r"(?:^|[-.])" + re.escape(quant) + r"(?:[.-]|$)"
         shard = re.fullmatch(r"(.*)-\d{5}-of-\d{5}\.gguf", name)
         if exact_shard and shard and exact_shard[1] == shard[1]:
@@ -78,7 +82,7 @@ def validate_space(manifest, reuse_partial=False):
     if not remaining:
         return
     disk = shutil.disk_usage(directory)
-    reserve = max(10 * 1024**3, int(disk.total * 0.05))
+    reserve = 10 * 1024**3
     if remaining + reserve > disk.free:
         raise ValueError(
             f"Insufficient disk space in {directory}: need {remaining / 1024**3:.1f} GiB "
@@ -87,9 +91,15 @@ def validate_space(manifest, reuse_partial=False):
 
 
 def reuse_blobs(directory, files):
+    root = os.path.realpath(directory)
     for item in files:
         target = directory / item["name"]
-        if not target.resolve().is_relative_to(directory.resolve()):
+        resolved_target = os.path.realpath(target)
+        try:
+            contained = os.path.commonpath((root, resolved_target)) == root
+        except ValueError:
+            contained = False
+        if not contained:
             raise ValueError("Model filename escapes cache directory")
         if target.exists():
             continue

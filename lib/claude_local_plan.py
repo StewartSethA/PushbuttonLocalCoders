@@ -2,7 +2,7 @@
 """Hardware-aware model and GPU planner for claude-local.
 
 No third-party Python dependencies. The planner treats VRAM as a hard resource:
-concurrently served unique models receive disjoint GPU sets. A single model is
+concurrently served model instances receive disjoint GPU sets. A single model is
 placed on the freest viable GPU set, with system-aware maximum PCIe link
 capability as the next placement tie-breaker. Multiple requested models are
 planned jointly before any server is started so an early assignment cannot
@@ -13,13 +13,19 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from functools import lru_cache
 from typing import Iterable
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+import pushbutton_capacity as capacity
 
 MIB_PER_GIB = 1024
 
@@ -94,6 +100,12 @@ class Profile:
 
 
 ALIASES = {
+    "ornith-1.5:9b": "ornith-1.5:9b", "ornith": "ornith-1.5:9b",
+    "ornith-1.5": "ornith-1.5:9b", "ornith-9b": "ornith-1.5:9b",
+    "ornith-1.5-9b": "ornith-1.5:9b",
+    "ornith-1.5:35b-a3b": "ornith-1.5:35b-a3b", "ornith-35b": "ornith-1.5:35b-a3b",
+    "ornith-1.5:35b": "ornith-1.5:35b-a3b",
+    "ornith-1.5-35b": "ornith-1.5:35b-a3b", "ornith-1.5-35b-a3b": "ornith-1.5:35b-a3b",
     "qwen3.8:27b": "qwen3.8:27b", "qwen3.8-27b": "qwen3.8:27b", "q38": "qwen3.8:27b",
     "qwen3.8": "qwen3.8:27b", "qwen38": "qwen3.8:27b",
     "qwen3.8-flash-next": "qwen3.8-flash-next", "qwen3.8:flash-next": "qwen3.8-flash-next",
@@ -112,6 +124,20 @@ ALIASES = {
 # quant, compute buffers, and a modest CUDA safety margin. Profiles are ordered
 # best quality first. Values are conservative planning envelopes, not promises.
 PROFILES: dict[str, tuple[Profile, ...]] = {
+    # Catalog weights plus context/buffer overhead, rounded up to whole GiB.
+    # These envelopes are planning estimates, not local allocation/speed evidence.
+    "ornith-1.5:9b": (
+        Profile("ornith-1.5:9b", "Ornith 1.5 9B", "ornith-ai/Ornith-1.5-9B-GGUF", "Q8_0", 17*1024, 100),
+        Profile("ornith-1.5:9b", "Ornith 1.5 9B", "ornith-ai/Ornith-1.5-9B-GGUF", "Q6_K", 15*1024, 98),
+        Profile("ornith-1.5:9b", "Ornith 1.5 9B", "ornith-ai/Ornith-1.5-9B-GGUF", "Q5_K_M", 14*1024, 97),
+        Profile("ornith-1.5:9b", "Ornith 1.5 9B", "ornith-ai/Ornith-1.5-9B-GGUF", "Q4_K_M", 13*1024, 95),
+    ),
+    "ornith-1.5:35b-a3b": (
+        Profile("ornith-1.5:35b-a3b", "Ornith 1.5 35B-A3B", "ornith-ai/Ornith-1.5-35B-A3B-GGUF", "Q8_0", 49*1024, 100),
+        Profile("ornith-1.5:35b-a3b", "Ornith 1.5 35B-A3B", "ornith-ai/Ornith-1.5-35B-A3B-GGUF", "Q6_K", 40*1024, 98),
+        Profile("ornith-1.5:35b-a3b", "Ornith 1.5 35B-A3B", "ornith-ai/Ornith-1.5-35B-A3B-GGUF", "Q5_K_M", 36*1024, 97),
+        Profile("ornith-1.5:35b-a3b", "Ornith 1.5 35B-A3B", "ornith-ai/Ornith-1.5-35B-A3B-GGUF", "Q4_K_M", 33*1024, 95),
+    ),
     "qwen3.8:27b": (
         Profile("qwen3.8:27b", "Qwen3.8 27B", "unsloth/Qwen3.8-27B-GGUF", "Q8_0", 35*1024, 100, template="qwen-fixed"),
         Profile("qwen3.8:27b", "Qwen3.8 27B", "unsloth/Qwen3.8-27B-GGUF", "UD-Q6_K", 28*1024, 98, template="qwen-fixed"),
@@ -247,14 +273,64 @@ def inventory() -> list[GPU]:
     return out
 
 
-def smart_defaults(gpus: list[GPU]) -> list[str]:
+def cpu_fallback_enabled() -> bool:
+    return os.environ.get("PUSHBUTTON_DISABLE_CPU_FALLBACK", "0") != "1"
+
+
+def cpu_plan(requests, context: int, slots: int, rm: dict) -> dict:
+    """Plan every requested instance on the CPU when no GPU is visible."""
+    import cpu_platform
+    from coder_local_plan import request_capacity
+    info = cpu_platform.detect()
+    items = [(r.model, capacity.resolve_options(r.capacity, context, slots)) for r in requests]
+    choices = cpu_platform.place_requests(items, info, [r.vram_limit_mib for r in requests])
+    servers = []
+    for i, (request, c) in enumerate(zip(requests, choices)):
+        settings = request_capacity(request, c.profile, context, slots)
+        server_id = f"local-{c.model.replace(':', '-').replace('.', '').replace('_', '-')}"
+        if sum(r.model == request.model for r in requests) > 1:
+            server_id += f"-{i + 1}"
+        servers.append({
+            "id": server_id,
+            "model": c.model,
+            "profile": {**asdict(c.profile), "extra_env": dict(c.profile.extra_env),
+                        "hf_spec": c.profile.hf_spec},
+            "gpus": [],
+            "cuda_visible_devices": "",
+            "multi_gpu": False,
+            "allocated_mib": c.memory_cap_mib,
+            "required_mib": c.required_mib,
+            "headroom_mib": c.memory_cap_mib - c.required_mib,
+            "placement_policy": "cpu",
+            "capacity": settings,
+            "requested_gpus": None,
+            "vram_limit_mib_per_gpu": request.vram_limit_mib,
+            "placement_source": request.source,
+            **cpu_platform.server_fields(c, info),
+        })
+    role_ids = {role: servers[min(i, len(servers) - 1)]["id"] for i, role in enumerate(ROLES)}
+    return {"context": context, "roles": rm, "role_ids": role_ids, "servers": servers,
+            "unused_gpus": [], "placement_policy": "cpu", "device": "cpu"}
+
+
+def smart_defaults(gpus: list[GPU], context: int = 262144) -> list[str]:
     if not gpus:
-        raise ValueError("no NVIDIA GPU detected")
+        if not cpu_fallback_enabled():
+            raise ValueError("no NVIDIA GPU detected")
+        # Small-active-parameter MoE models decode fastest on CPUs; take the
+        # first preference that fits this host's RAM at the requested context.
+        import cpu_platform
+        info = cpu_platform.detect()
+        for model in ("qwen3.6:35b", "ornith-1.5:35b-a3b", "nemotron-3.5-lightning", "ornith-1.5:9b"):
+            settings = capacity.resolve_options({}, min(context, PROFILES[model][0].native_context))
+            if cpu_platform.choose_profile(model, settings, info) is not None:
+                return [model]
+        raise ValueError("no model fits the available host RAM at this context; lower --context")
     max_free = max(g.free_mib for g in gpus)
     total_free = sum(g.free_mib for g in gpus)
     if max_free >= 15800:
         if total_free >= 42000 and len(gpus) >= 2:
-            return ["nemotron-3.5-lightning", "qwen3.6:35b", "qwen3.6:35b", "qwen3.6:35b"]
+            return ["nemotron-3.5-lightning", "qwen3.6:35b"]
         return ["qwen3.6:35b"]
     if max_free >= 14500:
         return ["qwen3.8:27b"]
@@ -282,12 +358,7 @@ class Candidate:
 
 
 def scaled_required_mib(profile: Profile, context: int) -> int:
-    if context >= profile.native_context:
-        return profile.required_mib
-    # Most of required_mib is immutable model weight. Shorter context can only
-    # reduce the context-dependent fraction, capped here at 15% conservatively.
-    frac = max(0.0, min(1.0, context / profile.native_context))
-    return int(profile.required_mib * (0.85 + 0.15 * frac))
+    return capacity.memory_estimate(profile, capacity.resolve_options({}, context))["required_mib"]
 
 
 def gpu_subsets(gpus: list[GPU]) -> Iterable[tuple[int, ...]]:
@@ -297,21 +368,36 @@ def gpu_subsets(gpus: list[GPU]) -> Iterable[tuple[int, ...]]:
 
 
 def best_profile_for_capacity(
-    model: str, capacity_mib: int, context: int
+    model: str, capacity_mib: int, context: int, settings: dict | None = None
 ) -> tuple[Profile, int] | None:
+    settings = capacity.resolve_options(
+        {k: v for k, v in (settings or {}).items() if k in capacity.OPTION_KEYS and v is not None},
+        context)
+    if settings.get("quant") and settings["quant"] not in {p.quant.upper() for p in PROFILES[model]}:
+        raise ValueError(f"unsupported quant '{settings['quant']}' for {model}")
+    if settings["context"] > max(p.native_context for p in PROFILES[model]):
+        raise ValueError(f"context exceeds supported native context for {model}")
     for profile in PROFILES[model]:
-        req = scaled_required_mib(profile, context)
+        if not capacity.matches_quant(profile.quant, settings):
+            continue
+        if settings["context"] > profile.native_context:
+            continue
+        req = capacity.memory_estimate(profile, settings)["required_mib"]
         if req <= capacity_mib:
-            return profile, req
+            return replace(profile, kv_k=settings.get("kv_k", profile.kv_k),
+                           kv_v=settings.get("kv_v", profile.kv_v)), req
     return None
 
 
-def placement_candidates(model: str, gpus: list[GPU], context: int) -> list[Candidate]:
+def placement_candidates(model: str, gpus: list[GPU], context: int,
+                         settings: dict | None = None, exact_gpus=None) -> list[Candidate]:
     raw: list[Candidate] = []
     for positions in gpu_subsets(gpus):
         group = [gpus[p] for p in positions]
+        if exact_gpus is not None and {g.index for g in group} != set(exact_gpus):
+            continue
         free_mib = sum(g.free_mib for g in group)
-        picked = best_profile_for_capacity(model, free_mib, context)
+        picked = best_profile_for_capacity(model, free_mib, context, settings)
         if picked is None:
             continue
         profile, req = picked
@@ -386,13 +472,15 @@ def _score_add(a: tuple[int, ...], b: tuple[int, ...]) -> tuple[int, ...]:
 
 
 def joint_model_choices(
-    models: list[str], gpus: list[GPU], context: int, sonnet_model: str
+    models: list[str] | list[int], gpus: list[GPU], context: int, sonnet_model: str,
+    candidate_map: dict | None = None,
 ) -> list[Candidate] | None:
     """Find the best complete disjoint model/GPU plan before launching."""
     if not models:
         return []
 
-    candidates = {m: placement_candidates(m, gpus, context) for m in models}
+    candidates = candidate_map if candidate_map is not None else {
+        m: placement_candidates(m, gpus, context) for m in models}
     if any(not candidates[m] for m in models):
         return None
 
@@ -401,15 +489,19 @@ def joint_model_choices(
         # hardest models first, with the same freest/link-aware local policy.
         remaining = list(gpus)
         result: list[Candidate] = []
-        for model in sorted(
+        order = sorted(
             models,
             key=lambda m: min(c.required_mib for c in candidates[m]),
             reverse=True,
-        ):
-            local = single_model_choice(model, remaining, context)
+        )
+        for model in order:
+            available = {gpus.index(g) for g in remaining}
+            viable = [c for c in candidates[model] if set(c.gpu_positions) <= available]
+            local = min(viable, key=lambda c: (c.card_count, -c.free_mib, -c.link_score,
+                                               -c.profile.quality, -c.speed_score)) if viable else None
             if local is None:
                 return None
-            chosen = [remaining[p] for p in local.gpu_positions]
+            chosen = [gpus[p] for p in local.gpu_positions]
             physical_positions = tuple(gpus.index(g) for g in chosen)
             result.append(
                 Candidate(
@@ -424,7 +516,7 @@ def joint_model_choices(
                 )
             )
             remaining = [g for g in remaining if g not in chosen]
-        by_model = {c.model: c for c in result}
+        by_model = dict(zip(order, result))
         return [by_model[m] for m in models]
 
     # Hardest-first ordering reduces branching only; the global score chooses
@@ -471,7 +563,7 @@ def joint_model_choices(
     if found is None:
         return None
     _, choices = found
-    by_model = {c.model: c for c in choices}
+    by_model = dict(zip(order, choices))
     return [by_model[m] for m in models]
 
 
@@ -489,20 +581,30 @@ def ordered_group_for_layer_split(candidate: Candidate, gpus: list[GPU]) -> list
     return [slowest] + rest
 
 
-def plan(models: list[str], gpus: list[GPU], context: int) -> dict:
-    rm = role_map(models)
-    unique: list[str] = []
-    for role in ROLES:
-        model = rm[role]
-        if model not in unique:
-            unique.append(model)
-
-    if len(unique) == 1:
-        picked = single_model_choice(unique[0], gpus, context)
+def plan(models: list[str], gpus: list[GPU], context: int, slots: int = 1,
+         defaults: dict | None = None, client_context: int | None = None,
+         agents: int | None = None) -> dict:
+    # Lazy import keeps the existing coder -> base API import cycle harmless.
+    from coder_local_plan import (parse_model_spec, candidates_for_request,
+                                  request_capacity, apply_client_context, expand_workers)
+    capacity.resolve_options({}, context, slots)
+    requests = expand_workers([parse_model_spec(m, defaults) for m in capacity.model_bits_specs(models)], agents)
+    requests = apply_client_context(requests, context, client_context)
+    rm = role_map([r.model for r in requests])
+    if not gpus and cpu_fallback_enabled():
+        return cpu_plan(requests, context, slots, rm)
+    instances = list(range(len(requests)))
+    candidate_map = {i: candidates_for_request(requests[i], gpus, context, slots,
+                                              quality_filter=False) for i in instances}
+    if len(instances) == 1:
+        candidates = candidate_map[0]
+        picked = min(candidates, key=lambda c: (c.card_count, -c.free_mib, -c.link_score,
+                     -c.profile.quality, -c.speed_score,
+                     tuple(gpus[p].index for p in c.gpu_positions))) if candidates else None
         choices = [picked] if picked else None
         policy = "freest-then-link"
     else:
-        choices = joint_model_choices(unique, gpus, context, rm["sonnet"])
+        choices = joint_model_choices(instances, gpus, context, rm["sonnet"], candidate_map)
         policy = "joint-global-plan"
 
     if not choices or any(c is None for c in choices):
@@ -514,13 +616,17 @@ def plan(models: list[str], gpus: list[GPU], context: int) -> dict:
 
     servers = []
     used_mask = 0
-    for c in choices:
+    for i, (request, c) in enumerate(zip(requests, choices)):
         assert c is not None
         used_mask |= c.mask
         group = ordered_group_for_layer_split(c, gpus)
+        settings = request_capacity(request, c.profile, context, slots)
+        server_id = f"local-{c.model.replace(':', '-').replace('.', '').replace('_', '-')}"
+        if sum(r.model == request.model for r in requests) > 1:
+            server_id += f"-{i + 1}"
         servers.append(
             {
-                "id": f"local-{c.model.replace(':', '-').replace('.', '').replace('_', '-')}",
+                "id": server_id,
                 "model": c.model,
                 "profile": {
                     **asdict(c.profile),
@@ -534,12 +640,16 @@ def plan(models: list[str], gpus: list[GPU], context: int) -> dict:
                 "required_mib": c.required_mib,
                 "headroom_mib": c.headroom_mib,
                 "placement_policy": policy,
+                "capacity": settings,
+                "requested_gpus": list(request.gpu_indices) if request.gpu_indices is not None else None,
+                "vram_limit_mib_per_gpu": request.vram_limit_mib,
+                "placement_source": request.source,
             }
         )
 
     role_ids = {
-        role: next(s["id"] for s in servers if s["model"] == model)
-        for role, model in rm.items()
+        role: servers[min(i, len(servers) - 1)]["id"]
+        for i, role in enumerate(ROLES)
     }
     return {
         "context": context,
@@ -562,6 +672,11 @@ def main() -> int:
     lp = sub.add_parser("plan")
     lp.add_argument("models", nargs="*")
     lp.add_argument("--context", type=int, default=262144)
+    lp.add_argument("--slots", type=int, default=1)
+    lp.add_argument("--agents", type=int)
+    lp.add_argument("--client-context", type=int)
+    lp.add_argument("--placement-config", default=os.path.expanduser(
+        os.environ.get("PUSHBUTTON_PLACEMENT_CONFIG", "~/.config/pushbutton-local/placement.json")))
     lp.add_argument("--smart", action="store_true")
     sub.add_parser("catalogue")
     args = ap.parse_args()
@@ -580,10 +695,22 @@ def main() -> int:
             print(json.dumps(data, indent=2))
             return 0
         gpus = inventory()
+        selected = os.environ.get("PUSHBUTTON_SELECTOR_GPU_INDICES")
+        if selected is not None:
+            try:
+                indices = {int(x) for x in selected.split(",") if x}
+            except ValueError as exc:
+                raise ValueError("invalid selector GPU pool") from exc
+            if not indices or not indices <= {g.index for g in gpus}:
+                raise ValueError("selector GPU pool is empty or no longer visible")
+            gpus = [g for g in gpus if g.index in indices]
         models = args.models
         if args.smart or not models:
-            models = smart_defaults(gpus)
-        print(json.dumps(plan(models, gpus, args.context), indent=2))
+            models = smart_defaults(gpus, args.context)
+        from coder_local_plan import load_placement_config
+        defaults = load_placement_config(args.placement_config)
+        print(json.dumps(plan(models, gpus, args.context, args.slots, defaults,
+                              args.client_context, args.agents), indent=2))
         return 0
     except ValueError as exc:
         print(f"claude-local planner: {exc}", file=sys.stderr)

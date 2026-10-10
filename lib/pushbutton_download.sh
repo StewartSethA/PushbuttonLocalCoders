@@ -30,7 +30,7 @@ _pushbutton_prepare_download() {
         python3 "$PUSHBUTTON_DOWNLOAD_PY" prepare "$1" "$2" "$3" || return
     # Allow the folder-management layer to impose additional storage policy.
     if declare -F validate_download_space >/dev/null; then
-        validate_download_space "$1" "$2" || return
+        validate_download_space "$2" "$1" || return
     fi
 }
 
@@ -108,9 +108,12 @@ download_model_fast() {
     local hf_spec="$1" cache_dir="$2" output_var="$3" work result status=0 mode=sequential started
     [[ "$output_var" =~ ^[a-zA-Z_][a-zA-Z_0-9]*$ ]] || return 1
     work="$(mktemp -d)" || return
-    if ! _pushbutton_prepare_download "$hf_spec" "$cache_dir" "$work"; then
+    if _pushbutton_prepare_download "$hf_spec" "$cache_dir" "$work"; then
+        :
+    else
+        status=$?
         rm -rf -- "$work"
-        return 1
+        return "$status"
     fi
     started="$SECONDS"
     if [[ -s "$work/files" ]]; then

@@ -5,6 +5,8 @@ import unittest
 ROOT=pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'lib'))
 import pushbutton_pool as pool
+import pushbutton_capacity as capacity
+import pushbutton_request_budget as request_budget
 
 
 class PoolTests(unittest.TestCase):
@@ -37,6 +39,38 @@ class PoolTests(unittest.TestCase):
     def test_auto_prefers_non_slow(self):
         slow=self.inst(id='slow',tg=12.0);unknown=self.inst(id='unknown',tg=None,tg_measured=False)
         self.assertEqual(pool.auto_candidates([slow,unknown],8192)[0].id,'unknown')
+
+    def test_route_capacity_and_admission_limit_are_authoritative(self):
+        x=self.inst(request_capacity={'context':8192,'admission_limit':2,'min_tps':40},
+                    measured_envelopes=[{'concurrency':4,'max_context':65536,'tg_per_client_p10':45}])
+        self.assertEqual(x.capacity(8192),2)
+        self.assertEqual(x.context_limit(),8192)
+        x.request_capacity['min_tps']=50
+        x.tg=45
+        self.assertEqual(x.capacity(8192),1)
+        self.assertEqual(x.speed()[0],'SLOW')
+        self.assertIn('50',x.speed()[1])
+        self.assertIn('not an SLA guarantee',x.speed()[1])
+        x.request_capacity.update(min_tps=None,admission_limit=None)
+        self.assertEqual(x.capacity(8192),4)
+
+    def test_full_resolved_capacity_default_min_tps_is_none(self):
+        resolved=capacity.resolve_options({},8192,slots=4)
+        self.assertIsNone(resolved['min_tps'])
+        x=self.inst(request_capacity=resolved,measured_envelopes=[
+            {'concurrency':4,'max_context':8192,'tg_per_client_p10':30}])
+        self.assertEqual(x.context_limit(),8192)
+        self.assertFalse(resolved['admission_explicit'])
+        self.assertEqual(x.capacity(8192),4)
+        self.assertEqual(request_budget.direct_admission_limit(resolved),1)
+        self.assertEqual(x.speed()[0],'OK')
+        explicit=capacity.resolve_options({'admission_limit':1},8192,slots=4)
+        self.assertTrue(explicit['admission_explicit'])
+        x.request_capacity=explicit
+        self.assertEqual(x.capacity(8192),1)
+        self.assertEqual(request_budget.direct_admission_limit(explicit),1)
+        with self.assertRaises(ValueError):
+            capacity.parse_options({'admission_explicit':True})
 
 
 if __name__=='__main__':unittest.main()

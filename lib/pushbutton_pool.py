@@ -24,24 +24,37 @@ class Instance:
     active: int = 0
     queued: int = 0
     healthy: bool = True
+    request_capacity: dict[str, Any] = field(default_factory=dict)
+    telemetry_device: dict[str, Any] = field(default_factory=dict)
 
     def accepts_model(self, requested: str) -> bool:
         q=requested.lower()
         return q in {self.model.lower(),self.id.lower(),*(x.lower() for x in self.aliases)}
 
     def capacity(self, context: int) -> int:
-        return policy.proven_concurrency(
+        proven = policy.proven_concurrency(
             backend=self.backend,
             requested_context=context,
             framework_max=self.framework_max_concurrency,
             measured_envelopes=self.measured_envelopes,
+            min_client_tg=float(self.request_capacity.get("min_tps") or policy.MIN_DECODE_TOK_S),
         )
+        limit = self.request_capacity.get("admission_limit")
+        if limit is None or self.request_capacity.get("admission_explicit") is False:
+            return proven
+        return min(proven, int(limit))
 
     def context_limit(self) -> int:
-        return policy.backend_limits(self.backend,declared_context=self.max_context).max_context
+        limit = policy.backend_limits(self.backend,declared_context=self.max_context).max_context
+        return min(limit, int(self.request_capacity.get("context", limit)))
+
+    def budget(self) -> dict:
+        return {"output_tokens": 4096,
+                **self.request_capacity, "context": self.context_limit()}
 
     def speed(self) -> tuple[str,str|None]:
-        return policy.speed_label(self.tg,measured=self.tg_measured)
+        return policy.speed_label(self.tg,measured=self.tg_measured,
+                                  min_client_tg=float(self.request_capacity.get("min_tps") or policy.MIN_DECODE_TOK_S))
 
 
 def instance_from_dict(x: dict) -> Instance:
@@ -55,6 +68,8 @@ def instance_from_dict(x: dict) -> Instance:
         measured_envelopes=list(x.get('measured_envelopes') or []),tg=x.get('tg'),
         tg_measured=bool(x.get('tg_measured')),active=int(x.get('active') or 0),
         queued=int(x.get('queued') or 0),healthy=bool(x.get('healthy',True)),
+        request_capacity=dict(x.get('capacity') or {}),
+        telemetry_device=dict(x.get('telemetry_device') or {}),
     )
 
 

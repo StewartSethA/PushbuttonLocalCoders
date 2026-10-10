@@ -6,18 +6,28 @@ command -v readlink >/dev/null 2>&1 && SELF="$(readlink -f "$SELF" 2>/dev/null |
 ROOT="$(cd "$(dirname "$SELF")" && pwd)"
 PLAN_PY="$ROOT/lib/coder_local_plan.py"
 HOSTCC_SH="$ROOT/lib/claude_local_hostcc.sh"
-source "$ROOT/lib/pushbutton_download.sh"
 STATE_DIR="${CLAUDE_LOCAL_STATE:-$HOME/.local/share/pushbutton/claude-local}"
 CACHE_DIR="${CLAUDE_LOCAL_CACHE:-$HOME/.cache/pushbutton/llama}"
 LOCK_FILE="${CLAUDE_LOCAL_LOCK_FILE:-$STATE_DIR/startup.lock}"
 CTX="${CLAUDE_LOCAL_CONTEXT:-262144}"
+SLOTS=1
 CLIENT_CTX="${CLAUDE_LOCAL_CLIENT_CONTEXT:-200000}"
+CLIENT_CTX_EXPLICIT=0
+[[ -z "${CLAUDE_LOCAL_CLIENT_CONTEXT+x}" ]] || CLIENT_CTX_EXPLICIT=1
 PORT_BASE="${CODER_LOCAL_PORT_BASE:-20180}"
-PLACEMENT_CONFIG="${PUSHBUTTON_PLACEMENT_CONFIG:-$HOME/.config/pushbutton-local/placement.json}"
+PLACEMENT_CONFIG="${PUSHBUTTON_PLACEMENT_CONFIG:-}"
+PLACEMENT_CONFIG_EXPLICIT=0
 FRONTEND="${CODER_LOCAL_FRONTEND:-}"
 AGENTS=""
 RESUME=0
 PLAN_ONLY=0
+QUIET=0
+FOLDERS_ONLY=0
+SELECT=0
+NO_TELEMETRY=0
+SELECT_ARGS=()
+MENU_FRONTEND=coder-local
+SELECT_PLACEMENT=0
 MODELS=()
 FRONTEND_ARGS=()
 PIDS=()
@@ -36,6 +46,8 @@ Usage:
 Per-model placement syntax:
   MODEL@gpu=INDEX,vram=SIZE
   MODEL@gpu=INDEX+INDEX,vram=SIZE
+  MODEL@context=N,slots=N,output=N,client_context=N,compact=N,quant=Q,bits=N,kv_k=K,kv_v=V,min_tps=N,admission=N
+  bits=N                        restrict all models to this weight bitness; @bits overrides
 
 `gpu=` pins that worker to exactly those physical NVIDIA GPU indices.
 `vram=` is a per-selected-GPU hard planning lease; the best quant that fits is
@@ -60,14 +72,19 @@ Worker semantics:
   N models + --agents N   -> explicit N-worker heterogeneous team
 
 Options:
+  --select                      choose models interactively before provisioning
   --frontend qwen
   --agents N
   --resume
   --placement-config FILE       default: ~/.config/pushbutton-local/placement.json
   --plan-only                   print placement/quant and exit before provisioning
-  --local-context N
+  --local-context N              fallback hard context per slot
+  --slots N                     fallback parallel slots per model
   --local-client-context N
   --local-cache DIR
+  --folders, --system-info       show storage paths and disk usage, then exit
+  --quiet                       suppress the startup folder banner
+  --no-telemetry                disable framework telemetry and error reporting
   --no-parallel              Force sequential Hugging Face downloads
   --local-port-base N
   --self-test
@@ -165,7 +182,8 @@ sep='\x1f'
 for w in json.load(open(sys.argv[1]))['workers']:
  x=w['profile']; env=';'.join(f'{k}={v}' for k,v in x.get('extra_env',{}).items())
  cap=w.get('vram_limit_mib_per_gpu') or ''
- print(sep.join(map(str,[w['worker'],w['id'],x['hf_spec'],w['cuda_visible_devices'],int(w['multi_gpu']),x['kv_k'],x['kv_v'],x['batch'],x['ubatch'],x['flash_attn'],x['template'],env,x.get('note',''),cap])))
+ c=w['capacity']
+ print(sep.join(map(str,[w['worker'],w['id'],x['hf_spec'],w['cuda_visible_devices'],int(w['multi_gpu']),x['kv_k'],x['kv_v'],x['batch'],x['ubatch'],x['flash_attn'],x['template'],env,x.get('note',''),cap,c['context'],c['slots'],json.dumps(c,separators=(',',':'))])))
 PY
 }
 print_plan(){ python3 - "$PLAN_FILE" <<'PY'
@@ -175,7 +193,15 @@ for w in p['workers']:
  x=w['profile']; gs=','.join(str(g['index']) for g in w['gpus'])
  cap=w.get('vram_limit_mib_per_gpu')
  lease=f"  lease={cap/1024:.1f} GiB/GPU" if cap else ""
- print(f"  agent {w['worker']}: {w['model']} / {x['quant']} -> GPU[{gs}] ({len(w['gpus'])} GPU{'s' if len(w['gpus'])!=1 else ''}){lease}")
+ if w.get('device')=='cpu':
+  st=w['cpu']['strategy']; h=w['cpu']['host']; e=w['cpu']['estimate']['depths'][0]
+  print(f"  agent {w['worker']}: {w['model']} / {x['quant']} -> CPU {h['model_name']} [{h['tier']}] strategy={st['name']} threads={st['threads']}/{st['threads_batch']} memory={st['memory_tier']} est. TG~{e['tg_tps']} PP~{e['pp_tps']} tok/s")
+ else:
+  print(f"  agent {w['worker']}: {w['model']} / {x['quant']} -> GPU[{gs}] ({len(w['gpus'])} GPU{'s' if len(w['gpus'])!=1 else ''}){lease}")
+ c=w['capacity']
+ print(f"    slots={c['slots']} hard={c['context']} input={c['input_tokens']} output={c['output_tokens']} client={c['client_context']} compact={c['compact_trigger']} estimated-memory={w['required_mib']/1024:.2f} GiB")
+ if c.get('min_tps') is not None:
+  print(f"    WARNING: min_tps={c['min_tps']} is requested, not proven; no matching runtime throughput SLA evidence is verified by this launcher.")
 print(f"  spare GPUs: {[g['index'] for g in p['unused_gpus']]}")
 PY
 }
@@ -212,21 +238,44 @@ print("VRAM lease actual: "+", ".join(f"GPU{i}={m/1024:.2f}GiB/{cap/1024:.2f}GiB
 if over: raise SystemExit(1)
 PY
 }
+verify_capacity(){
+python3 - "$ROOT/lib" "$1" "$2" <<'PY'
+import json,sys
+sys.path.insert(0,sys.argv[1])
+from pushbutton_request_budget import verify_backend_capacity
+try:
+ verify_backend_capacity(f'http://127.0.0.1:{sys.argv[2]}',json.loads(sys.argv[3]))
+except Exception as error:
+ print(f'Capacity readiness failed: {error}',file=sys.stderr)
+ raise SystemExit(1)
+PY
+}
+
 start_backends(){
  mkdir -p "$STATE_DIR/logs" "$CACHE_DIR"; BACKENDS="$STATE_DIR/coder-backends.$$.tsv"; : >"$BACKENDS"
  export LLAMA_CACHE="$CACHE_DIR" GGML_CUDA_ENABLE_UNIFIED_MEMORY=0 CUDA_SCALE_LAUNCH_QUEUES=4x
  local next=$((PORT_BASE+1))
- while IFS=$'\x1f' read -r worker id hf gpus multi kvk kvv batch ubatch fa template envpairs note vramcap; do
+ while IFS=$'\x1f' read -r worker id hf gpus multi kvk kvv batch ubatch fa template envpairs note vramcap context slots capacity; do
    local port log pid model_path waited=0 failed=0
-   download_model_fast "$hf" "$CACHE_DIR" model_path || die "failed to download $hf"
+   validate_download_space "$CACHE_DIR" "$hf" "${hf##*:}" || exit 2
+   download_model_fast "$hf" "$CACHE_DIR" model_path || { rc=$?; [[ $rc != 2 ]] || exit 2; die "failed to download $hf"; }
    port="$(free_port "$next")"; next=$((port+1)); log="$STATE_DIR/logs/coder-$id.log"; : >"$log"
-   local -a cmd=("$LLAMA_SERVER" -m "$model_path" --alias "$id" --no-mmproj -ngl 999 -c "$CTX" -np 1 --cache-type-k "$kvk" --cache-type-v "$kvv" -b "$batch" -ub "$ubatch" -fa "$fa" --jinja --no-context-shift --host 127.0.0.1 --port "$port")
+   local -a cmd=("$LLAMA_SERVER" -m "$model_path" --alias "$id" --no-mmproj -ngl 999 -c "$((context * slots))" -np "$slots" --cache-type-k "$kvk" --cache-type-v "$kvv" -b "$batch" -ub "$ubatch" -fa "$fa" --jinja --no-context-shift --host 127.0.0.1 --port "$port")
    [[ "$multi" == 1 ]] && cmd+=(--split-mode layer)
    [[ "$template" == qwen-fixed ]] && cmd+=(--chat-template-file "$QWEN_TEMPLATE")
+   local -a cpu_prefix=() cpu_args=()
+   if [[ -z "$gpus" ]]; then
+     mapfile -d '' -t cpu_prefix < <(python3 "$ROOT/lib/cpu_platform.py" launch-args --plan "$PLAN_FILE" --id "$id" prefix)
+     mapfile -d '' -t cpu_args < <(python3 "$ROOT/lib/cpu_platform.py" launch-args --plan "$PLAN_FILE" --id "$id" --server "$LLAMA_SERVER" args)
+     if ((${#cpu_prefix[@]})) && ! have "${cpu_prefix[0]}"; then say "${cpu_prefix[0]} not installed; starting agent $worker without NUMA/MCDRAM binding"; cpu_prefix=(); fi
+     cmd+=("${cpu_args[@]}"); vramcap=""
+   fi
    local -a envcmd=(env "CUDA_VISIBLE_DEVICES=$gpus" "LLAMA_CACHE=$CACHE_DIR" "GGML_CUDA_ENABLE_UNIFIED_MEMORY=0")
    if [[ -n "$envpairs" ]]; then local -a pairs; IFS=';' read -ra pairs<<<"$envpairs"; local pair; for pair in "${pairs[@]}";do envcmd+=("$pair");done;fi
-   say "Starting agent $worker: $hf on GPU(s) [$gpus]${vramcap:+ with ${vramcap} MiB/GPU lease}${note:+ — $note}"
-   "${envcmd[@]}" "${cmd[@]}" > >(tee -a "$log" >&2) 2>&1 & pid=$!; PIDS+=("$pid")
+   if [[ -z "$gpus" ]]; then say "Starting agent $worker: $hf on CPU (${cpu_args[*]}${cpu_prefix:+ via ${cpu_prefix[*]}})"
+   else say "Starting agent $worker: $hf on GPU(s) [$gpus]${vramcap:+ with ${vramcap} MiB/GPU lease}${note:+ — $note}"; fi
+   printf '[coder-local] Follow agent %s logs in another terminal:\n  tail -n 50 -F -- %q\n' "$worker" "$log" >&2
+   "${envcmd[@]}" "${cpu_prefix[@]}" "${cmd[@]}" > >(tee -a "$log" >&2) 2>&1 & pid=$!; PIDS+=("$pid")
    until curl -fsS "http://127.0.0.1:$port/health" >/dev/null 2>&1; do
      kill -0 "$pid" 2>/dev/null || { failed=1;break;}; sleep 1; waited=$((waited+1)); ((waited%30==0))&&say "Still loading agent $worker (${waited}s)..."
    done
@@ -235,10 +284,33 @@ start_backends(){
      kill "$pid" 2>/dev/null || true
      die "agent $worker exceeded its ${vramcap} MiB/GPU VRAM lease; choose a lower cap/context/model or update the model profile"
    fi
+   verify_capacity "$port" "$capacity" || die "agent $worker effective per-slot capacity is unsafe"
    say "Agent $worker backend ready: http://127.0.0.1:$port/v1"
-   printf '%s\t%s\t%s\t%s\n' "$worker" "$id" "$port" "$hf" >>"$BACKENDS"
+   printf '%s\t%s\t%s\t%s\t%s\n' "$worker" "$id" "$port" "$hf" "$capacity" >>"$BACKENDS"
  done < <(worker_rows)
 }
+start_capacity_proxy(){
+  CAPACITY_PROXY_CONFIG="$STATE_DIR/coder-capacity.$$.json"
+  export PUSHBUTTON_CAPACITY_CONFIG="$CAPACITY_PROXY_CONFIG"
+  CAPACITY_PROXY_PORT="$(free_port "$PORT_BASE")"
+  python3 - "$BACKENDS" "$CAPACITY_PROXY_CONFIG" <<'PY'
+import json,sys
+routes={}
+for line in open(sys.argv[1]):
+ worker,mid,port,hf,raw=line.rstrip('\n').split('\t')
+ routes[mid]={'model_id':mid,'backend_alias':mid,'url':f'http://127.0.0.1:{port}','capacity':{**json.loads(raw),'no_context_shift':True}}
+json.dump({'routes':routes},open(sys.argv[2],'w'),indent=2)
+PY
+  local pid log="$STATE_DIR/logs/coder-capacity.log"
+  python3 "$ROOT/lib/pushbutton_capacity_proxy.py" --config "$CAPACITY_PROXY_CONFIG" --port "$CAPACITY_PROXY_PORT" >"$log" 2>&1 &
+  pid=$!; PIDS+=("$pid")
+  until curl -fsS "http://127.0.0.1:$CAPACITY_PROXY_PORT/health" >/dev/null 2>&1; do
+    kill -0 "$pid" 2>/dev/null || { tail -80 "$log" >&2 || true; die "capacity guard failed"; }
+    sleep 1
+  done
+  say "Guarded OpenAI endpoint ready: http://127.0.0.1:$CAPACITY_PROXY_PORT/v1"
+}
+
 ensure_qwen(){
  if have qwen; then return; fi
  say "Installing official Qwen Code standalone CLI..."
@@ -250,15 +322,15 @@ configure_qwen(){
  local qhome="$STATE_DIR/frontends/qwen" runtime="$STATE_DIR/frontends/qwen-runtime"
  mkdir -p "$qhome/agents" "$runtime"; export QWEN_HOME="$qhome" QWEN_RUNTIME_DIR="$runtime"
  export PUSHBUTTON_LOCAL_API_KEY=pushbutton-local QWEN_CODE_ENABLE_AGENT_TEAM=1 QWEN_USAGE_STATISTICS_ENABLED=0 QWEN_TELEMETRY_ENABLED=0
- python3 - "$BACKENDS" "$qhome/settings.json" "$CLIENT_CTX" <<'PY'
+ python3 - "$BACKENDS" "$qhome/settings.json" "$CAPACITY_PROXY_PORT" <<'PY'
 import json,sys
 rows=[]
 for line in open(sys.argv[1]):
- w,mid,port,hf=line.rstrip('\n').split('\t'); rows.append((int(w),mid,int(port),hf))
+ w,mid,port,hf,capacity=line.rstrip('\n').split('\t'); rows.append((int(w),mid,int(port),hf,json.loads(capacity)))
 models=[]
-for w,mid,port,hf in rows:
- models.append({"id":mid,"name":f"Pushbutton agent {w}: {hf}","envKey":"PUSHBUTTON_LOCAL_API_KEY","baseUrl":f"http://127.0.0.1:{port}/v1","streamIdleTimeoutMs":0,"generationConfig":{"contextWindowSize":int(sys.argv[3]),"maxRetries":1}})
-obj={"modelProviders":{"openai":models},"security":{"auth":{"selectedType":"openai"}},"model":{"name":rows[0][1]},"experimental":{"agentTeam":True},"privacy":{"usageStatisticsEnabled":False},"telemetry":{"enabled":False}}
+for w,mid,port,hf,c in rows:
+ models.append({"id":mid,"name":f"Pushbutton agent {w}: {hf}","envKey":"PUSHBUTTON_LOCAL_API_KEY","baseUrl":f"http://127.0.0.1:{sys.argv[3]}/v1","streamIdleTimeoutMs":0,"generationConfig":{"contextWindowSize":c['client_context'],"samplingParams":{"max_tokens":c['output_tokens']},"maxRetries":1}})
+obj={"modelProviders":{"openai":models},"security":{"auth":{"selectedType":"openai"}},"model":{"name":rows[0][1]},"context":{"autoCompactThreshold":min(c['compact_trigger']/c['client_context'] for w,mid,port,hf,c in rows)},"experimental":{"agentTeam":True},"privacy":{"usageStatisticsEnabled":False},"telemetry":{"enabled":False}}
 open(sys.argv[2],'w').write(json.dumps(obj,indent=2)+'\n')
 PY
  local n; n="$(wc -l <"$BACKENDS")"
@@ -293,35 +365,99 @@ self_test(){ python3 "$PLAN_PY" --self-test; bash -n "$0"; echo "coder-local she
 while (($#));do
  case "$1" in
   -h|--help) usage;exit 0;;
-  --frontend) [[ $# -ge 2 ]]||die "--frontend needs a value";FRONTEND="$2";shift 2;;
+  --select) SELECT=1;shift;;
+  --frontend) [[ $# -ge 2 ]]||die "--frontend needs a value";FRONTEND="$2";MENU_FRONTEND="$2-local";shift 2;;
   --agents) [[ $# -ge 2 ]]||die "--agents needs a value";AGENTS="$2";shift 2;;
-  --resume) RESUME=1;shift;;
-  --placement-config) [[ $# -ge 2 ]]||die "--placement-config needs a file";PLACEMENT_CONFIG="$2";shift 2;;
+  --resume) RESUME=1;SELECT_ARGS+=("$1");shift;;
+  --placement-config) [[ $# -ge 2 ]]||die "--placement-config needs a file";PLACEMENT_CONFIG="$2";PLACEMENT_CONFIG_EXPLICIT=1;SELECT_PLACEMENT=1;shift 2;;
   --plan-only) PLAN_ONLY=1;shift;;
-  --local-context) CTX="$2";shift 2;; --local-client-context) CLIENT_CTX="$2";shift 2;;
-  --local-cache) CACHE_DIR="$2";shift 2;; --local-port-base) PORT_BASE="$2";shift 2;;
-  --no-parallel) PUSHBUTTON_NO_PARALLEL=1;shift;;
+  --local-context) CTX="$2";shift 2;; --local-client-context) CLIENT_CTX="$2";CLIENT_CTX_EXPLICIT=1;shift 2;;
+  --slots) [[ $# -ge 2 ]]||die "--slots needs a value";SLOTS="$2";shift 2;;
+  --local-cache) [[ $# -ge 2 ]]||die "--local-cache needs a directory";export CLAUDE_LOCAL_CACHE="$2";SELECT_ARGS+=("$1" "$2");shift 2;; --local-port-base) PORT_BASE="$2";SELECT_ARGS+=("$1" "$2");shift 2;;
+  --folders|--system-info) FOLDERS_ONLY=1;shift;;
+  --quiet) QUIET=1;SELECT_ARGS+=("$1");shift;;
+  --no-telemetry) NO_TELEMETRY=1;SELECT_ARGS+=("$1");shift;;
+  --no-parallel) PUSHBUTTON_NO_PARALLEL=1;SELECT_ARGS+=("$1");shift;;
   --self-test) self_test;exit 0;;
   --) shift;FRONTEND_ARGS+=("$@");break;;
   -*) die "unknown coder-local option '$1'; put frontend-specific args after --";;
   *) MODELS+=("$1");shift;;
  esac
 done
+if ((NO_TELEMETRY)); then
+  export DISABLE_TELEMETRY=1 DISABLE_ERROR_REPORTING=1 DO_NOT_TRACK=1
+  export OTEL_SDK_DISABLED=true LITELLM_TELEMETRY=false
+fi
+if ((FOLDERS_ONLY)); then
+  source "$ROOT/lib/pushbutton_folders.sh"
+  load_folder_config
+  check_folders_exist
+  print_folder_summary 1
+  exit 0
+fi
 [[ "$FRONTEND" == qwen ]] || die "frontend '$FRONTEND' is not installed in this revision"
-((${#MODELS[@]}>=1))||die "supply at least one model"
+if ((SELECT)) || ((${#MODELS[@]} == 0)); then
+  if [[ ! -t 0 || ! -t 1 ]]; then
+    usage >&2
+    die "supply a MODEL, or run coder-local --select in an interactive terminal"
+  fi
+  have python3 || die "python3 is required for the interactive selector"
+  [[ -f "$ROOT/pushbutton-select" ]] || die "missing $ROOT/pushbutton-select; reinstall coder-local"
+  selector_frontend="$MENU_FRONTEND"
+  [[ "$(basename "$0")" == qwen-local ]] && selector_frontend=qwen-local
+  [[ -z "${CODER_LOCAL_MENU_FRONTEND:-}" ]] || selector_frontend="$CODER_LOCAL_MENU_FRONTEND"
+  selector_args=(--frontend "$selector_frontend" --menu --context "$CTX")
+  [[ "$SLOTS" == 1 ]] || selector_args+=(--slots "$SLOTS")
+  ((CLIENT_CTX_EXPLICIT == 0)) || selector_args+=(--client-context "$CLIENT_CTX")
+  ((PLAN_ONLY == 0)) || selector_args+=(--plan-only)
+  [[ -z "$AGENTS" ]] || selector_args+=(--agents "$AGENTS")
+  if ((SELECT_PLACEMENT == 0)) && [[ -f "$ROOT/lib/pushbutton_folders.sh" ]]; then
+    source "$ROOT/lib/pushbutton_folders.sh"
+    load_folder_config
+    if [[ -z "$PLACEMENT_CONFIG" && "$CONFIG_DIR" != "$HOME/.config/pushbutton-local" ]]; then
+      PLACEMENT_CONFIG="$CONFIG_DIR/placement.json"
+      SELECT_PLACEMENT=1
+    fi
+  fi
+  ((SELECT_PLACEMENT == 0)) || selector_args+=(--placement-config "$PLACEMENT_CONFIG")
+  selector_args+=("${MODELS[@]}")
+  if ((${#FRONTEND_ARGS[@]})); then SELECT_ARGS+=(-- "${FRONTEND_ARGS[@]}"); fi
+  for arg in "${SELECT_ARGS[@]}"; do selector_args+=("--launch-arg=$arg"); done
+  unset CODER_LOCAL_STARTUP_ONLY CODER_LOCAL_MENU_FRONTEND
+  exec python3 "$ROOT/pushbutton-select" "${selector_args[@]}"
+fi
+# Wrapper frontends use this preflight before installing their own clients.
+[[ "${CODER_LOCAL_STARTUP_ONLY:-0}" != 1 || $PLAN_ONLY -eq 1 ]] || exit 125
 [[ -z "$AGENTS" ]]||[[ "$AGENTS" =~ ^[1-8]$ ]]||die "--agents must be 1..8"
 [[ "$CTX" =~ ^[0-9]+$ && "$CLIENT_CTX" =~ ^[0-9]+$ ]]||die "context values must be integers"
-((CLIENT_CTX<=CTX))||die "client context exceeds physical context"
-for c in git cmake ninja python3 curl tar flock nvidia-smi;do have "$c"||die "$c is required";done
+for c in git cmake python3 curl tar flock;do have "$c"||die "$c is required";done
+# Without a working NVIDIA GPU every agent is deployed on the CPU automatically.
+if have nvidia-smi && nvidia-smi >/dev/null 2>&1; then have ninja || die "ninja is required"
+elif [[ "${PUSHBUTTON_DISABLE_CPU_FALLBACK:-0}" == 1 ]]; then die "nvidia-smi is required"
+else ((QUIET)) || say "No NVIDIA GPU detected; deploying agents on the CPU with host-specific llama.cpp optimizations."; fi
+source "$ROOT/lib/pushbutton_folders.sh"
+initialize_folders "$QUIET"
+LOCK_FILE="${CLAUDE_LOCAL_LOCK_FILE:-$STATE_DIR/startup.lock}"
+[[ -n "$PLACEMENT_CONFIG" || $PLACEMENT_CONFIG_EXPLICIT == 1 ]] || PLACEMENT_CONFIG="$CONFIG_DIR/placement.json"
 mkdir -p "$STATE_DIR" "$CACHE_DIR" "$(dirname "$LOCK_FILE")"
 exec {STARTUP_LOCK_FD}>"$LOCK_FILE"; flock "$STARTUP_LOCK_FD"
 PLAN_FILE="$STATE_DIR/coder-plan.$$.json"
-pa=(--context "$CTX" --placement-config "$PLACEMENT_CONFIG"); [[ -n "$AGENTS" ]]&&pa+=(--agents "$AGENTS"); pa+=("${MODELS[@]}")
+pa=(--context "$CTX" --slots "$SLOTS" --placement-config "$PLACEMENT_CONFIG")
+((CLIENT_CTX_EXPLICIT == 0)) || pa+=(--client-context "$CLIENT_CTX")
+[[ -n "$AGENTS" ]]&&pa+=(--agents "$AGENTS"); pa+=("${MODELS[@]}")
 python3 "$PLAN_PY" "${pa[@]}" >"$PLAN_FILE"; print_plan
 if ((PLAN_ONLY)); then
   flock -u "$STARTUP_LOCK_FD"; eval "exec ${STARTUP_LOCK_FD}>&-"; STARTUP_LOCK_FD=""
   exit 0
 fi
-source "$HOSTCC_SH"; claude_local_prepare_hostcc; activate_cuda; ensure_llamacpp; grep -q '"template": "qwen-fixed"' "$PLAN_FILE" && fetch_qwen_template || true; start_backends
+validate_plan_download_space "$PLAN_FILE" "$CACHE_DIR" || exit 2
+source "$ROOT/lib/pushbutton_download.sh"
+if python3 "$ROOT/lib/cpu_platform.py" plan-is-cpu "$PLAN_FILE"; then
+  LLAMA_SERVER="$(PUSHBUTTON_RUNTIME_STATE="$STATE_DIR/runtime" python3 "$ROOT/pushbutton-instance" --prepare-only --cpu | tail -1)"
+  [[ -x "$LLAMA_SERVER" ]] || die "CPU llama.cpp build failed"
+else source "$HOSTCC_SH"; claude_local_prepare_hostcc; activate_cuda; ensure_llamacpp; fi
+grep -q '"template": "qwen-fixed"' "$PLAN_FILE" && fetch_qwen_template || true; start_backends
+start_capacity_proxy
+say "Qwen uses per-model client/output budgets and the earliest configured global auto-compaction threshold."
 flock -u "$STARTUP_LOCK_FD"; eval "exec ${STARTUP_LOCK_FD}>&-"; STARTUP_LOCK_FD=""
 launch_qwen
