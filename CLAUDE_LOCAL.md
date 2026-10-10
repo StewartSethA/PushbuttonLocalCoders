@@ -142,6 +142,14 @@ Unless `--local-no-teams` is supplied, the harness enables Claude Code's agent-t
 
 Claude Code remains the orchestrator. When it fans out, all agent API traffic returns to the same local gateway and therefore to the planned local GPUs.
 
+The local gateway and model backends cannot run Anthropic's server-side auto-mode
+classifier. `claude-local` therefore sets `CLAUDE_CODE_AUTO_MODE_SERVER=0` for
+the launched Claude Code process by default. Auto mode remains available and uses
+Claude Code's own classifier requests; this avoids the eligibility warning but
+does not provide the new no-charge server-side checks. To override the default,
+set `CLAUDE_CODE_AUTO_MODE_SERVER=1` before launching. This setting is scoped to
+`claude-local` and is not written to persistent Claude Code configuration.
+
 ## Useful commands
 
 ```bash

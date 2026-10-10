@@ -329,6 +329,13 @@ remember that auto mode itself uses model-classified background safety checks.
 `default` or `acceptEdits` avoids adding that classifier traffic when you do not
 need it.
 
+`claude-local` sets `CLAUDE_CODE_AUTO_MODE_SERVER=0` by default because its local
+gateway cannot run Anthropic's server-side classifier. Auto mode still works
+using Claude Code's own classifier requests, but does not get the no-charge
+server-side checks. Set `CLAUDE_CODE_AUTO_MODE_SERVER=1` to override this for a
+gateway that implements those checks; the setting is scoped to the `claude-local`
+launch and is not saved in Claude Code configuration.
+
 For a single RTX 3090, a smaller context is often a better responsiveness/reliability
 tradeoff than allocating 262K merely because it fits:
 
