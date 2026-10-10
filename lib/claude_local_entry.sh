@@ -38,7 +38,7 @@ while (($#)); do
     --agents)
       # Numeric values are harness replica counts; JSON belongs to Claude Code.
       if [[ "${2:-}" =~ ^[0-9]+$ ]]; then ARGS+=("$1" "$2"); shift 2; else ARGS+=("$@"); break; fi;;
-    --select|--quiet|--no-parallel|--local-no-teams|--local-keep-servers|--local-allow-offload|--local-dry-run|--local-verbose)
+    --select|--quiet|--no-parallel|--no-telemetry|--local-no-teams|--local-keep-servers|--local-allow-offload|--local-dry-run|--local-verbose)
       ARGS+=("$1"); shift;;
     -*)
       ARGS+=("$@"); break;;

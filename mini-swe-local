@@ -35,6 +35,7 @@ cat >"$shim/qwen" <<'INNER'
 #!/usr/bin/env bash
 set -euo pipefail
 state="${CLAUDE_LOCAL_STATE:-$HOME/.local/share/pushbutton/claude-local}"
+if [[ "${DISABLE_TELEMETRY:-}" == 1 ]]; then export LITELLM_TELEMETRY=false; fi
 root="$state/frontends/mini-swe"; mkdir -p "$root/configs" "$root/runs"
 mapfile -t rows < <(python3 - "$QWEN_HOME/settings.json" <<'PY'
 import json,sys

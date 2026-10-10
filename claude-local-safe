@@ -50,7 +50,7 @@ has_model_selector() {
       --) return 1;;
       --local-cache|--local-context|--local-client-context|--local-port-base|--slots) shift 2 || return 1;;
       --agents) [[ "${2:-}" =~ ^[0-9]+$ ]] || return 1; shift 2;;
-      --slots=*|--agents=[0-9]*|--select|--folders|--system-info|--quiet|--no-parallel|--local-no-teams|--local-keep-servers|--local-allow-offload|--local-dry-run|--local-verbose) shift;;
+      --slots=*|--agents=[0-9]*|--select|--folders|--system-info|--quiet|--no-parallel|--no-telemetry|--local-no-teams|--local-keep-servers|--local-allow-offload|--local-dry-run|--local-verbose) shift;;
       -*) return 1;;
       *) return 0;;
     esac

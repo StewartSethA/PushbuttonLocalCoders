@@ -375,7 +375,7 @@ def show_status(cfg):
     print(json.dumps(x,indent=2))
 
 def main():
-    ap=argparse.ArgumentParser(prog='pushbutton');ap.add_argument('model',nargs='?');ap.add_argument('--context',type=int);ap.add_argument('--frontend',choices=['qwen','opencode','none']);ap.add_argument('--status',action='store_true');ap.add_argument('--allow-slow',action='store_true');ap.add_argument('--reconfigure',action='store_true');ap.add_argument('--telemetry-on',action='store_true');ap.add_argument('--telemetry-off',action='store_true');ap.add_argument('--telemetry-url')
+    ap=argparse.ArgumentParser(prog='pushbutton');ap.add_argument('model',nargs='?');ap.add_argument('--context',type=int);ap.add_argument('--frontend',choices=['qwen','opencode','none']);ap.add_argument('--status',action='store_true');ap.add_argument('--allow-slow',action='store_true');ap.add_argument('--reconfigure',action='store_true');ap.add_argument('--telemetry-on',action='store_true');ap.add_argument('--telemetry-off','--no-telemetry',dest='telemetry_off',action='store_true');ap.add_argument('--telemetry-url')
     for name in ('slots','output','client-context','compact','quant','bits','kv-k','kv-v','min-tps','admission'):
         ap.add_argument('--'+name)
     ap.add_argument('--plan-only',action='store_true')
@@ -390,6 +390,11 @@ def main():
         runtime_argv.append('--'+arg if arg.startswith('bits=') else arg)
     a,extra=ap.parse_known_args(runtime_argv)
     a.frontend_args=extra+argv[separator+1:]
+    if a.telemetry_off:
+        if a.telemetry_on:ap.error('--no-telemetry conflicts with --telemetry-on')
+        os.environ.update(DISABLE_TELEMETRY='1',DISABLE_ERROR_REPORTING='1',
+                          DO_NOT_TRACK='1',OTEL_SDK_DISABLED='true',
+                          LITELLM_TELEMETRY='false',OPENCODE_DISABLE_TELEMETRY='1')
     cfg={} if a.reconfigure else read_json(CONFIG,{})
     if a.status:return show_status(cfg)
     try:

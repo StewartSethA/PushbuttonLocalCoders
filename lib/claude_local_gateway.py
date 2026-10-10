@@ -464,8 +464,7 @@ class Handler(BaseHTTPRequestHandler):
         if path.endswith("/count_tokens"):
             return self._dispatch(route, body, path)
         gate = self.router.gates[(route["url"], route["backend_alias"])]
-        if not gate.acquire(timeout=60):
-            return self._json(429, {"type": "error", "error": {"type": "rate_limit_error", "message": "route admission limit reached; retry later"}})
+        gate.acquire()
         try:
             return self._dispatch(route, body, path)
         finally:

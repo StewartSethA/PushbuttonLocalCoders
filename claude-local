@@ -29,6 +29,7 @@ VERBOSE=0
 QUIET=0
 FOLDERS_ONLY=0
 SELECT=0
+NO_TELEMETRY=0
 SELECT_ARGS=()
 MODELS=()
 CLAUDE_ARGS=()
@@ -68,6 +69,7 @@ Harness options (put before ordinary Claude Code flags):
   --local-cache DIR          llama.cpp/Hugging Face model cache
   --folders, --system-info   show storage paths and disk usage, then exit
   --quiet                    suppress the startup folder banner
+  --no-telemetry             disable framework telemetry and error reporting
   --no-parallel              Force sequential Hugging Face downloads
   --local-context N          fallback hard context per slot (default 262144)
   --slots N                  fallback parallel slots per model
@@ -497,6 +499,10 @@ PY
 )
     export ANTHROPIC_BASE_URL="http://127.0.0.1:$GATEWAY_PORT" ANTHROPIC_AUTH_TOKEN="$key" ANTHROPIC_API_KEY="$key"
     export CLAUDE_CODE_MAX_CONTEXT_TOKENS="$CLIENT_CTX" CLAUDE_CODE_AUTO_COMPACT_WINDOW="$compact" CLAUDE_CODE_MAX_OUTPUT_TOKENS="$output"
+    if ((NO_TELEMETRY)); then
+        export DISABLE_TELEMETRY=1 DISABLE_ERROR_REPORTING=1 DO_NOT_TRACK=1
+        export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 OTEL_SDK_DISABLED=true
+    fi
     [[ -z "${CLAUDE_CONFIG_DIR:-}" || "$CLAUDE_CONFIG_DIR" == "$STATE_DIR/claude-config" ]] || warn "Ignoring inherited CLAUDE_CONFIG_DIR; using isolated local settings/session storage."
     export CLAUDE_CONFIG_DIR="$STATE_DIR/claude-config"
     mkdir -p "$CLAUDE_CONFIG_DIR"
@@ -566,6 +572,7 @@ while (($#)); do
       --local-cache) [[ $# -ge 2 ]] || die "--local-cache needs a directory"; export CLAUDE_LOCAL_CACHE="$2"; SELECT_ARGS+=("$1" "$2"); shift 2;;
       --folders|--system-info) FOLDERS_ONLY=1; shift;;
       --quiet) QUIET=1; SELECT_ARGS+=("$1"); shift;;
+      --no-telemetry) NO_TELEMETRY=1; SELECT_ARGS+=("$1"); shift;;
       --no-parallel) PUSHBUTTON_NO_PARALLEL=1; SELECT_ARGS+=("$1"); shift;;
       --local-context) [[ $# -ge 2 ]] || die "--local-context needs an integer"; CTX="$2"; shift 2;;
       --slots) [[ $# -ge 2 ]] || die "--slots needs a value"; SLOTS="$2"; shift 2;;
@@ -592,6 +599,11 @@ while (($#)); do
       *) MODELS+=("$1"); shift;;
     esac
 done
+
+if ((NO_TELEMETRY)); then
+    export DISABLE_TELEMETRY=1 DISABLE_ERROR_REPORTING=1 DO_NOT_TRACK=1
+    export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 OTEL_SDK_DISABLED=true
+fi
 
 if ((FOLDERS_ONLY)); then
     source "$LIB/pushbutton_folders.sh"

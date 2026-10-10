@@ -66,8 +66,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(400, {"error": {"message": str(exc), "type": "invalid_request_error"}})
         except (ValueError, TypeError):
             return self.reply(400, {"error": {"message": "invalid JSON or output budget; output must be a positive integer including reasoning"}})
-        if not route["gate"].acquire(timeout=60):
-            return self.reply(429, {"error": {"message": "route admission limit reached; retry later"}})
+        route["gate"].acquire()
         try:
             try:
                 headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP}
