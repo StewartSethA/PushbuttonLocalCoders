@@ -586,7 +586,8 @@ def unplaceable_detail(request, gpus: list[GPU], context: int, slots: int = 1) -
     settings = capacity.resolve_options(request.capacity, context, slots)
     allowed = [g for g in gpus if request.gpu_indices is None or g.index in request.gpu_indices]
     limit = request.vram_limit_mib
-    free_mib = sum(min(g.free_mib, limit) if limit else g.free_mib for g in allowed)
+    per_gpu = [min(g.free_mib, limit) if limit else g.free_mib for g in allowed]
+    free_mib = sum(per_gpu)
     where = (f"GPU(s) {[g.index for g in allowed]}" if request.gpu_indices is not None
              else f"all {len(allowed)} GPU(s)")
     if limit:
@@ -603,7 +604,10 @@ def unplaceable_detail(request, gpus: list[GPU], context: int, slots: int = 1) -
         text += (f" (weights {est['weights_mib'] / MIB_PER_GIB:.1f} + KV {est['kv_mib'] / MIB_PER_GIB:.1f} "
                  f"for {settings['slots']} slot(s) x {settings['context']:,} tokens at "
                  f"{est['kv_k']}/{est['kv_v']} + runtime {est['overhead_mib'] / MIB_PER_GIB:.1f})")
-    return text + f"; {where} have {free_mib / MIB_PER_GIB:.1f} GiB free"
+    text += f"; {where} have {free_mib / MIB_PER_GIB:.1f} GiB free"
+    if len(per_gpu) > 1:
+        text += f" (largest single GPU {max(per_gpu) / MIB_PER_GIB:.1f} GiB)"
+    return text
 
 
 def plan(models: list[str], gpus: list[GPU], context: int, slots: int = 1,

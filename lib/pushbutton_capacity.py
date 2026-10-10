@@ -200,25 +200,28 @@ def memory_estimate(profile, capacity: dict) -> dict:
     v = capacity.get("kv_v", profile.kv_v)
     tokens = context * capacity["slots"]
     per_token = kv_bytes_per_token(profile.model, k, v)
-    if per_token is None:
+    native_per_token = kv_bytes_per_token(profile.model, profile.kv_k, profile.kv_v)
+    weights = catalog_weight_mib(profile.model, profile.quant)
+    native_kv = profile.native_context * native_per_token / 2**20 if per_token is not None else 0
+    if per_token is None or (weights is None
+                             and profile.required_mib - native_kv <= GPU_RUNTIME_OVERHEAD_MIB):
+        # No architecture data, or a single-slot envelope too small to contain its
+        # own architecture KV: keep the conservative envelope heuristic.
         ratio = max(1.0, KV_TYPES[k] / KV_TYPES[profile.kv_k], KV_TYPES[v] / KV_TYPES[profile.kv_v])
         scale = tokens / profile.native_context * ratio
         required = math.ceil(profile.required_mib * (0.85 + 0.15 * scale))
         return {"status": "ESTIMATED", "method": "15% context-dependent envelope heuristic",
                 "architecture_exact": False, "required_mib": required,
                 "context_tokens_total": tokens, "kv_precision_multiplier": ratio,
-                "note": "No architecture data; validate actual allocation at startup."}
+                "note": "No usable architecture data; validate actual allocation at startup."}
     kv_mib = tokens * per_token / 2**20
-    weights = catalog_weight_mib(profile.model, profile.quant)
+    overhead_mib = GPU_RUNTIME_OVERHEAD_MIB
     if weights is not None:
         weights_mib, source = weights, "catalog"
-        overhead_mib = GPU_RUNTIME_OVERHEAD_MIB + weights * (WEIGHT_MARGIN - 1)
-        base_mib = weights_mib + overhead_mib
+        overhead_mib += weights * (WEIGHT_MARGIN - 1)
     else:
-        native_kv = profile.native_context * kv_bytes_per_token(profile.model, profile.kv_k, profile.kv_v) / 2**20
-        base_mib = max(profile.required_mib - native_kv, GPU_RUNTIME_OVERHEAD_MIB)
-        overhead_mib = GPU_RUNTIME_OVERHEAD_MIB
-        weights_mib, source = base_mib - overhead_mib, "profile-envelope"
+        weights_mib, source = profile.required_mib - native_kv - overhead_mib, "profile-envelope"
+    base_mib = weights_mib + overhead_mib
     required = math.ceil(base_mib + kv_mib)
     return {"status": "ESTIMATED", "method": "weights + architecture KV x context x slots + runtime overhead",
             "architecture_exact": False, "required_mib": required,
@@ -226,5 +229,5 @@ def memory_estimate(profile, capacity: dict) -> dict:
             "kv_mib": math.ceil(kv_mib), "kv_bytes_per_token": per_token,
             "overhead_mib": math.ceil(overhead_mib), "context_tokens_total": tokens,
             "kv_k": k, "kv_v": v,
-            "kv_precision_multiplier": round(per_token / kv_bytes_per_token(profile.model, profile.kv_k, profile.kv_v), 4),
+            "kv_precision_multiplier": round(per_token / native_per_token, 4),
             "note": "Planning architecture assumptions; validate actual allocation at startup."}
