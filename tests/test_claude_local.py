@@ -44,6 +44,18 @@ class PlannerTests(unittest.TestCase):
                                 p.native_context == meta["context"] and
                                 p.template == "embedded" for p in profiles))
 
+    def test_ornith_35b_short_selector(self):
+        model = "ornith-1.5:35b-a3b"
+        catalog = json.loads((ROOT / "configs/model-catalog.json").read_text())["models"]
+        self.assertIn("ornith-1.5:35b", catalog[model]["aliases"])
+        for selector in ("ornith-1.5:35b", " ORNITH-1.5:35B "):
+            with self.subTest(selector=selector):
+                self.assertEqual(planmod.canonical_model(selector), model)
+        gpus = [planmod.GPU(0, "Tesla V100", 32768, 32000, "7.0"),
+                planmod.GPU(1, "RTX 3090", 24576, 24000, "8.6")]
+        self.assertEqual(planmod.plan(["ornith-1.5:35b"], gpus, 262144),
+                         planmod.plan([model], gpus, 262144))
+
     def test_ornith_mixed_role_placement(self):
         gpus = [
             planmod.GPU(0, "Tesla V100", 32768, 32000, "7.0"),

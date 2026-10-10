@@ -104,6 +104,7 @@ ALIASES = {
     "ornith-1.5": "ornith-1.5:9b", "ornith-9b": "ornith-1.5:9b",
     "ornith-1.5-9b": "ornith-1.5:9b",
     "ornith-1.5:35b-a3b": "ornith-1.5:35b-a3b", "ornith-35b": "ornith-1.5:35b-a3b",
+    "ornith-1.5:35b": "ornith-1.5:35b-a3b",
     "ornith-1.5-35b": "ornith-1.5:35b-a3b", "ornith-1.5-35b-a3b": "ornith-1.5:35b-a3b",
     "qwen3.8:27b": "qwen3.8:27b", "qwen3.8-27b": "qwen3.8:27b", "q38": "qwen3.8:27b",
     "qwen3.8": "qwen3.8:27b", "qwen38": "qwen3.8:27b",
