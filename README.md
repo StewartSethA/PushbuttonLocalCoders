@@ -142,9 +142,13 @@ its trigger must remain strictly below that budget. `safety` is a positive
 token reserve.
 
 The plan reports each server's hard context, input limit, output reserve,
-compaction trigger, slots, memory envelope, and headroom. Memory estimates use
-the profiles' conservative context-dependent envelope, **not an architecture-
-exact KV allocation or a measured throughput guarantee**. Admission remains
+compaction trigger, slots, memory envelope, and headroom. Memory estimates are
+weights + KV + runtime overhead: weights use the catalogued GGUF size for the
+selected quant when known (otherwise the profile's calibrated envelope), and KV
+is derived from the model's attention layers/KV width × context × slots at the
+chosen `kv_k`/`kv_v` precision. When a model cannot be placed, the error shows
+this breakdown against the free VRAM of the allowed GPUs. These are planning
+assumptions, **not an exact allocation or a measured throughput guarantee**. Admission remains
 calibration-based; allocating slots does not automatically prove they are fast.
 
 Input budgets reserve output and a safety margin. Compaction triggers leave

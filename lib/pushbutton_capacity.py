@@ -1,6 +1,7 @@
 """Validated per-instance capacity settings and conservative planning budgets."""
 from __future__ import annotations
 
+import functools
 import math
 import re
 
@@ -160,20 +161,70 @@ def resolve_options(options: dict, context: int, slots: int = 1) -> dict:
             "min_tps": settings.get("min_tps")}
 
 
+# llama.cpp CUDA context, compute/graph buffers and recurrent state that do not
+# scale with KV context, plus a small allocator margin on catalog weight sizes.
+GPU_RUNTIME_OVERHEAD_MIB = 1536
+WEIGHT_MARGIN = 1.03
+
+
+@functools.lru_cache(maxsize=None)
+def catalog_weight_mib(model, quant):
+    """Real GGUF weight size from configs/model-catalog.json, if catalogued."""
+    import cpu_platform
+    for q in cpu_platform._catalog().get(model, {}).get("quants", []) or []:
+        if str(q.get("name", "")).upper() == str(quant).upper():
+            return float(q["weight_gib"]) * 1024
+    return None
+
+
+def kv_bytes_per_token(model, kv_k, kv_v):
+    """K+V bytes per context token from the model's attention architecture."""
+    import cpu_platform
+    arch = cpu_platform.MODEL_ARCH.get(model)
+    if not arch:
+        return None
+    return arch["attn_layers"] * arch["kv_dim"] * (KV_TYPES[kv_k] + KV_TYPES[kv_v])
+
+
 def memory_estimate(profile, capacity: dict) -> dict:
-    """A heuristic envelope, not architecture-derived KV byte accounting."""
+    """Weights + architecture-derived KV for every slot + runtime overhead.
+
+    Weights use the catalogued GGUF size when known. Otherwise the profile's
+    calibrated full-native-context envelope minus its own native KV share is
+    kept as the weights+runtime base, so only the KV term is re-derived.
+    """
     context = capacity["context"]
     if context > profile.native_context:
         raise ValueError(f"context {context} exceeds supported native context {profile.native_context}")
     k = capacity.get("kv_k", profile.kv_k)
     v = capacity.get("kv_v", profile.kv_v)
-    ratio = max(KV_TYPES[k] / KV_TYPES[profile.kv_k], KV_TYPES[v] / KV_TYPES[profile.kv_v])
-    # Never credit a precision reduction without architecture-specific evidence.
-    ratio = max(1.0, ratio)
-    scale = context * capacity["slots"] / profile.native_context * ratio
-    required = math.ceil(profile.required_mib * (0.85 + 0.15 * scale))
-    return {"status": "ESTIMATED", "method": "15% context-dependent envelope heuristic",
+    tokens = context * capacity["slots"]
+    per_token = kv_bytes_per_token(profile.model, k, v)
+    if per_token is None:
+        ratio = max(1.0, KV_TYPES[k] / KV_TYPES[profile.kv_k], KV_TYPES[v] / KV_TYPES[profile.kv_v])
+        scale = tokens / profile.native_context * ratio
+        required = math.ceil(profile.required_mib * (0.85 + 0.15 * scale))
+        return {"status": "ESTIMATED", "method": "15% context-dependent envelope heuristic",
+                "architecture_exact": False, "required_mib": required,
+                "context_tokens_total": tokens, "kv_precision_multiplier": ratio,
+                "note": "No architecture data; validate actual allocation at startup."}
+    kv_mib = tokens * per_token / 2**20
+    weights = catalog_weight_mib(profile.model, profile.quant)
+    if weights is not None:
+        weights_mib, source = weights, "catalog"
+        overhead_mib = GPU_RUNTIME_OVERHEAD_MIB + weights * (WEIGHT_MARGIN - 1)
+        base_mib = weights_mib + overhead_mib
+    else:
+        native_kv = profile.native_context * kv_bytes_per_token(profile.model, profile.kv_k, profile.kv_v) / 2**20
+        base_mib = max(profile.required_mib - native_kv, GPU_RUNTIME_OVERHEAD_MIB)
+        overhead_mib = GPU_RUNTIME_OVERHEAD_MIB
+        weights_mib, source = base_mib - overhead_mib, "profile-envelope"
+    required = math.ceil(base_mib + kv_mib)
+    return {"status": "ESTIMATED", "method": "weights + architecture KV x context x slots + runtime overhead",
             "architecture_exact": False, "required_mib": required,
-            "context_tokens_total": context * capacity["slots"],
-            "kv_precision_multiplier": ratio,
-            "note": "Not exact KV accounting; validate actual allocation and throughput at startup."}
+            "weights_mib": math.ceil(weights_mib), "weights_source": source,
+            "kv_mib": math.ceil(kv_mib), "kv_bytes_per_token": per_token,
+            "overhead_mib": math.ceil(overhead_mib), "context_tokens_total": tokens,
+            "kv_k": k, "kv_v": v,
+            "kv_precision_multiplier": round(per_token / kv_bytes_per_token(profile.model, profile.kv_k, profile.kv_v), 4),
+            "note": "Planning architecture assumptions; validate actual allocation at startup."}
