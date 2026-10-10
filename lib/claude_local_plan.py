@@ -273,9 +273,59 @@ def inventory() -> list[GPU]:
     return out
 
 
-def smart_defaults(gpus: list[GPU]) -> list[str]:
+def cpu_fallback_enabled() -> bool:
+    return os.environ.get("PUSHBUTTON_DISABLE_CPU_FALLBACK", "0") != "1"
+
+
+def cpu_plan(requests, context: int, slots: int, rm: dict) -> dict:
+    """Plan every requested instance on the CPU when no GPU is visible."""
+    import cpu_platform
+    from coder_local_plan import request_capacity
+    info = cpu_platform.detect()
+    items = [(r.model, capacity.resolve_options(r.capacity, context, slots)) for r in requests]
+    choices = cpu_platform.place_requests(items, info, [r.vram_limit_mib for r in requests])
+    servers = []
+    for i, (request, c) in enumerate(zip(requests, choices)):
+        settings = request_capacity(request, c.profile, context, slots)
+        server_id = f"local-{c.model.replace(':', '-').replace('.', '').replace('_', '-')}"
+        if sum(r.model == request.model for r in requests) > 1:
+            server_id += f"-{i + 1}"
+        servers.append({
+            "id": server_id,
+            "model": c.model,
+            "profile": {**asdict(c.profile), "extra_env": dict(c.profile.extra_env),
+                        "hf_spec": c.profile.hf_spec},
+            "gpus": [],
+            "cuda_visible_devices": "",
+            "multi_gpu": False,
+            "allocated_mib": c.memory_cap_mib,
+            "required_mib": c.required_mib,
+            "headroom_mib": c.memory_cap_mib - c.required_mib,
+            "placement_policy": "cpu",
+            "capacity": settings,
+            "requested_gpus": None,
+            "vram_limit_mib_per_gpu": request.vram_limit_mib,
+            "placement_source": request.source,
+            **cpu_platform.server_fields(c, info),
+        })
+    role_ids = {role: servers[min(i, len(servers) - 1)]["id"] for i, role in enumerate(ROLES)}
+    return {"context": context, "roles": rm, "role_ids": role_ids, "servers": servers,
+            "unused_gpus": [], "placement_policy": "cpu", "device": "cpu"}
+
+
+def smart_defaults(gpus: list[GPU], context: int = 262144) -> list[str]:
     if not gpus:
-        raise ValueError("no NVIDIA GPU detected")
+        if not cpu_fallback_enabled():
+            raise ValueError("no NVIDIA GPU detected")
+        # Small-active-parameter MoE models decode fastest on CPUs; take the
+        # first preference that fits this host's RAM at the requested context.
+        import cpu_platform
+        info = cpu_platform.detect()
+        for model in ("qwen3.6:35b", "ornith-1.5:35b-a3b", "nemotron-3.5-lightning", "ornith-1.5:9b"):
+            settings = capacity.resolve_options({}, min(context, PROFILES[model][0].native_context))
+            if cpu_platform.choose_profile(model, settings, info) is not None:
+                return [model]
+        raise ValueError("no model fits the available host RAM at this context; lower --context")
     max_free = max(g.free_mib for g in gpus)
     total_free = sum(g.free_mib for g in gpus)
     if max_free >= 15800:
@@ -541,6 +591,8 @@ def plan(models: list[str], gpus: list[GPU], context: int, slots: int = 1,
     requests = expand_workers([parse_model_spec(m, defaults) for m in capacity.model_bits_specs(models)], agents)
     requests = apply_client_context(requests, context, client_context)
     rm = role_map([r.model for r in requests])
+    if not gpus and cpu_fallback_enabled():
+        return cpu_plan(requests, context, slots, rm)
     instances = list(range(len(requests)))
     candidate_map = {i: candidates_for_request(requests[i], gpus, context, slots,
                                               quality_filter=False) for i in instances}
@@ -654,7 +706,7 @@ def main() -> int:
             gpus = [g for g in gpus if g.index in indices]
         models = args.models
         if args.smart or not models:
-            models = smart_defaults(gpus)
+            models = smart_defaults(gpus, args.context)
         from coder_local_plan import load_placement_config
         defaults = load_placement_config(args.placement_config)
         print(json.dumps(plan(models, gpus, args.context, args.slots, defaults,
