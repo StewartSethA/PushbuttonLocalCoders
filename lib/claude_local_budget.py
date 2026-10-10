@@ -315,10 +315,10 @@ def main() -> int:
                 plan = json.load(f)
         elif args.model_spec:
             from coder_local_plan import parse_model_spec
-            from pushbutton_capacity import resolve_options
+            from pushbutton_capacity import resolve_options, model_bits_specs
             capacities = [resolve_options(parse_model_spec(spec).capacity, requested,
                                           positive_integer(args.slots, "--slots"))
-                          for spec in args.model_spec]
+                          for spec in model_bits_specs(args.model_spec)]
             plan = {"servers":[{"id":str(i), "capacity":capacity}
                                for i, capacity in enumerate(capacities)],
                     "role_ids":{str(i):str(i) for i in range(len(capacities))}}

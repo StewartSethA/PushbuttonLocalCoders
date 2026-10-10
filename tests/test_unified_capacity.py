@@ -18,6 +18,23 @@ loader.exec_module(runtime)
 
 
 class UnifiedCapacityTests(unittest.TestCase):
+    def test_standalone_bits_reaches_planner_before_or_after_model(self):
+        for args in (["bits=3", "q38"], ["q38", "bits=3"], ["q38", "--bits", "3"]):
+            with self.subTest(args=args), patch.object(sys, "argv", ["pushbutton", *args, "--plan-only"]), patch.object(sys.stdin, "isatty", return_value=False), patch.object(runtime, "read_json", return_value={}), patch.object(runtime, "capacity_candidate", return_value=({"workers": []}, {})) as candidate, patch("builtins.print"):
+                runtime.main()
+                self.assertEqual(candidate.call_args.args[0].capacity["bits"], 3)
+
+    def test_resident_reuse_checks_actual_artifact_bitness(self):
+        expected = runtime.capacity.resolve_options({"bits": 3}, 32768)
+        instance = dict(model="qwen3.8:27b", healthy=True, max_context=32768,
+                        endpoint="http://127.0.0.1:1234/v1", artifact="Q4_K_M",
+                        capacity=expected)
+        with patch.object(runtime, "registry", return_value={"instances": [instance]}), patch.object(runtime, "endpoint_ok", return_value=True):
+            self.assertIsNone(runtime.healthy_resident("qwen3.8:27b", 32768, expected))
+            instance["artifact"] = "IQ3_XXS"
+            instance["capacity"] = {k: v for k, v in expected.items() if k != "bits"}
+            self.assertIs(runtime.healthy_resident("qwen3.8:27b", 32768, expected), instance)
+
     def args(self, **overrides):
         values = dict(model="qwen3.8:27b", context=65536, frontend="none",
                       telemetry_on=False, telemetry_off=False, telemetry_url=None,

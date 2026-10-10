@@ -327,7 +327,7 @@ def best_profile_for_capacity(
     if settings["context"] > max(p.native_context for p in PROFILES[model]):
         raise ValueError(f"context exceeds supported native context for {model}")
     for profile in PROFILES[model]:
-        if settings.get("quant") and profile.quant.upper() != settings["quant"]:
+        if not capacity.matches_quant(profile.quant, settings):
             continue
         if settings["context"] > profile.native_context:
             continue
@@ -537,7 +537,7 @@ def plan(models: list[str], gpus: list[GPU], context: int, slots: int = 1,
     from coder_local_plan import (parse_model_spec, candidates_for_request,
                                   request_capacity, apply_client_context, expand_workers)
     capacity.resolve_options({}, context, slots)
-    requests = expand_workers([parse_model_spec(m, defaults) for m in models], agents)
+    requests = expand_workers([parse_model_spec(m, defaults) for m in capacity.model_bits_specs(models)], agents)
     requests = apply_client_context(requests, context, client_context)
     rm = role_map([r.model for r in requests])
     instances = list(range(len(requests)))

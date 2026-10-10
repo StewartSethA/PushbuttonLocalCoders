@@ -8,6 +8,23 @@ With an explicit model:
 pushbutton-select qwen3.8:27b --gpu 0 --vram-limit 16G --ram-limit 32G
 ```
 
+Use `bits=N` to restrict selection to a quantization bitness:
+
+```bash
+pushbutton qwen3.8:27b bits=4 --plan-only
+pushbutton-select qwen3.8:27b bits=3 --plan-only
+qwen-local 'qwen3.8:27b@gpu=0,vram=16G,bits=3' --plan-only
+```
+
+Standalone `bits=N` applies to all supplied models; per-model `@bits=N`
+overrides that fallback. `pushbutton` also accepts `--bits N`. The value is a
+positive integer (for example 2, 3, 4, or 6), matching the nominal weight
+quantization in Q/IQ/FP profile names, not KV-cache precision. Selection still
+chooses the best fitting profile **within that bitness**; it never falls back
+to another bitness. Unsupported bitness or conflicting `quant=` constraints
+fail before provisioning. Fixed/native adapters without a matching supported
+planner profile are unavailable when bitness is constrained.
+
 With no model, an interactive terminal shows the welcome/action menu **before**
 hardware inspection or provisioning: choose model(s) and launch, inspect
 hardware/models/backends, preview a plan, show help, or quit. Installed coder,

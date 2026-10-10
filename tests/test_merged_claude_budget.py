@@ -16,6 +16,13 @@ SPEC.loader.exec_module(budget)
 
 
 class MergedBudgetTests(unittest.TestCase):
+    def test_standalone_bits_passes_launcher_budget_preflight(self):
+        argv = ["claude_local_budget.py", "--requested", "262144",
+                "--model-spec=q38", "--model-spec=bits=3"]
+        with patch.object(sys, "argv", argv), patch.object(budget, "validate_managed_settings"), patch.object(budget, "shared_policy") as policy, patch("builtins.print"):
+            self.assertEqual(budget.main(), 0)
+        self.assertEqual(policy.call_args.args[0]["0"]["capacity"]["bits"], 3)
+
     def setUp(self):
         self.small = dict(context=131072, slots=3, output_tokens=4096,
                           client_context=120000, compact_trigger=105000,

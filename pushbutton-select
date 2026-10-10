@@ -158,8 +158,8 @@ def rows_for(model,gpu,cap,ram_cap,context,gpus=None,request=None,slots=1):
     status=('FIT' if p.quant in fitting_quants else 'BLOCK') if baseline_gpus else ('UNAVAILABLE' if effective else 'UNKNOWN')
    except ValueError as error:
     resolved=settings;req=None;status='UNAVAILABLE';note+='; '+str(error)
-   if settings.get('quant') and settings['quant']!=p.quant.upper():
-    status='UNAVAILABLE';note+='; excluded by requested quant'
+   if not capacity_settings.matches_quant(p.quant,settings):
+    status='UNAVAILABLE';note+='; excluded by requested quant/bits'
    obs,sm=measured_summary(model,'llama.cpp',gpu_name,context,p.quant)
    if settings['slots']!=1 or settings.get('kv_k',p.kv_k)!=p.kv_k or settings.get('kv_v',p.kv_v)!=p.kv_v:
     obs=[];sm={};note+='; no matching slot/cache throughput evidence'
@@ -187,10 +187,10 @@ def rows_for(model,gpu,cap,ram_cap,context,gpus=None,request=None,slots=1):
   rows.append({'model':model,'backend':backend,'artifact':d.get('artifact','recipe-specific'),'req':None,'ram_req':None,'quality':'n/a','pp':(sm.get('pp') or {}).get('median'),'tg':(sm.get('tg') or {}).get('median'),'status':status,'note':f"experimental; {note}; {d['notes']} Source: {d['source']}",'evidence':evidence_label(obs,sm),'spread':sm})
  for r in rows:
   r.setdefault('capacity',settings)
-  if r['backend']=='llama.cpp' and model not in plan.PROFILES and (settings['slots']!=1 or any(k in settings for k in ('kv_k','kv_v','quant'))):
+  if r['backend']=='llama.cpp' and model not in plan.PROFILES and (settings['slots']!=1 or any(k in settings for k in ('kv_k','kv_v','quant','bits'))):
    r.update(status='UNAVAILABLE',req=None,pp=None,tg=None,evidence='UNKNOWN',spread={})
    r['note']+='; no planner capacity profile for requested slots/quant/cache overrides'
-  if r['backend']!='llama.cpp' and (settings['slots']!=1 or any(k in settings for k in ('kv_k','kv_v','quant'))):
+  if r['backend']!='llama.cpp' and (settings['slots']!=1 or any(k in settings for k in ('kv_k','kv_v','quant','bits'))):
    r.update(status='UNAVAILABLE',pp=None,tg=None,evidence='UNKNOWN',spread={})
    r['note']+='; requested slots/quant/cache overrides are unsupported by this adapter'
   metadata=registry.get(r['backend'],{})
@@ -290,6 +290,7 @@ def joint_preview(models,frontend,agents,gpus,context,cap=None,gpu_indices=None,
    spec+=f",context={c['context']},slots={c['slots']},output={c['output_tokens']},client_context={c['client_context']},compact={c['compact_trigger']},safety={c['safety_tokens']},kv_k={w['profile']['kv_k']},kv_v={w['profile']['kv_v']}"
    if c.get('min_tps') is not None:spec+=f",min_tps={c['min_tps']}"
    if c.get('admission_explicit',True):spec+=f",admission={c['admission_limit']}"
+   if c.get('bits') is not None:spec+=f",bits={c['bits']}"
    spec+=f",quant={w['profile']['quant']}"
    launch_models.append(spec)
  else:
@@ -339,7 +340,7 @@ def positive_input(prompt,default,maximum=None):
 
 def main():
  ap=argparse.ArgumentParser(prog='pushbutton-select')
- ap.add_argument('models',nargs='*',help='model names or coder model@gpu=0+1,vram=30G selectors')
+ ap.add_argument('models',nargs='*',help='model names or model@gpu=0+1,vram=30G,bits=4 selectors; bits=N sets a fallback for all models')
  ap.add_argument('--gpu',type=int)
  ap.add_argument('--gpus',help='exact GPU set for each coder worker; prefer per-model pins for multiple workers')
  ap.add_argument('--frontend',choices=FRONTENDS,default='qwen-local')
@@ -355,6 +356,8 @@ def main():
  ap.add_argument('--plan-only','--print-only',action='store_true',help='preview only; never launch')
  ap.add_argument('--telemetry-opt-in',action='store_true'); ap.add_argument('--telemetry-off',action='store_true'); ap.add_argument('--telemetry-upload-url')
  a=ap.parse_args()
+ bits_specifiers=[m for m in a.models if m.startswith('bits=')]
+ a.models=capacity_settings.model_bits_specs(a.models)
  for arg in a.launch_arg:
   if arg=='--':break
   if arg.split('=',1)[0] in ('--local-context','--local-client-context','--slots','--agents','--frontend','--placement-config','--select','--smart'):
@@ -379,7 +382,7 @@ def main():
  if cap is not None and cap<=0:raise ValueError('VRAM lease must be positive')
  for g in inv:print_hw(g,ram_cap,cap) if not a.json else None
  if not inv and not a.json:print('No supported NVIDIA GPUs detected. Hardware fit and speed are unknown.')
- models=a.models or model_menu()
+ models=a.models or capacity_settings.model_bits_specs(model_menu()+bits_specifiers)
  if interactive and action in ('1','3'):
   a.context=positive_input('Physical context',a.context)
   if a.frontend in CODER_FRONTENDS:
@@ -394,6 +397,8 @@ def main():
  requests=[]
  for model_spec in models:
   model=selector_model(model_spec)
+  if model not in plan.PROFILES and '@' in model_spec and any(field.strip().startswith('bits=') for field in model_spec.split('@',1)[1].split(',')):
+   raise ValueError('bits requires a supported llama.cpp planner profile')
   request=workers.parse_model_spec(model_spec,defaults) if model in plan.PROFILES else workers.WorkerRequest(model)
   request=replace(request,gpu_indices=request.gpu_indices if request.gpu_indices is not None else indices,
                   vram_limit_mib=request.vram_limit_mib if request.vram_limit_mib is not None else cap)
