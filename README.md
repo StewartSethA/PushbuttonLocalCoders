@@ -726,6 +726,28 @@ an unhealthy backend.
 
 ## General / legacy installer
 
+### Normal-use PP/TG visibility
+
+Requests through `pushbutton-broker` record the backend's actual
+`timings.prompt_per_second` and `timings.predicted_per_second` when supplied,
+including the final event of streaming responses. Rates can also be derived from
+backend token counts and phase durations. This performs no extra inference or depth sweep.
+
+Each request produces a `performance` line in the broker log and a sanitized record in
+`~/.local/share/pushbutton/runtime/observations/YYYY-MM-DD.jsonl`
+(`PUSHBUTTON_RUNTIME_DIR` overrides the metrics directory). Records include `pp`, `tg`,
+`pp_method`, `tg_method`, `prompt_ms`, `predicted_ms`, `prompt_processed_tokens`,
+`cached_tokens` when reported, prompt depth and concurrency at admission.
+Prompt depth is the full input token count, not the uncached suffix processed by PP;
+concurrency is not a continuous trace of backend occupancy.
+
+Backends without phase timings retain explicitly labeled `broker-ttft` /
+`broker-stream` estimates for streaming requests. Non-streaming responses without
+timings have unavailable rates, rather than treating response delivery as token generation.
+No prompt or output text is persisted in these observations. With telemetry enabled,
+the same numeric metadata is queued for upload; the deployed community dashboard
+keeps depth, concurrency and measurement methods separate.
+
 The original all-in-one installer remains available for Ollama, Apple Silicon,
 ROCm, CPU, Docker, benchmarking and network-node workflows:
 
