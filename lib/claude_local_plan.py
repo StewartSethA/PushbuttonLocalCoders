@@ -581,6 +581,35 @@ def ordered_group_for_layer_split(candidate: Candidate, gpus: list[GPU]) -> list
     return [slowest] + rest
 
 
+def unplaceable_detail(request, gpus: list[GPU], context: int, slots: int = 1) -> str:
+    """Explain why one request has no placement: smallest fitting need vs. free VRAM."""
+    settings = capacity.resolve_options(request.capacity, context, slots)
+    allowed = [g for g in gpus if request.gpu_indices is None or g.index in request.gpu_indices]
+    limit = request.vram_limit_mib
+    per_gpu = [min(g.free_mib, limit) if limit else g.free_mib for g in allowed]
+    free_mib = sum(per_gpu)
+    where = (f"GPU(s) {[g.index for g in allowed]}" if request.gpu_indices is not None
+             else f"all {len(allowed)} GPU(s)")
+    if limit:
+        where += f" capped at {limit / MIB_PER_GIB:.1f} GiB each"
+    label = request.model + (f"@gpu={'+'.join(map(str, request.gpu_indices))}"
+                             if request.gpu_indices is not None else "")
+    estimates = [(capacity.memory_estimate(p, settings), p) for p in PROFILES[request.model]
+                 if capacity.matches_quant(p.quant, settings) and settings["context"] <= p.native_context]
+    if not estimates:
+        return f"{label}: no profile matches the requested quant/bits/context"
+    est, profile = min(estimates, key=lambda x: x[0]["required_mib"])
+    text = f"{label}: smallest matching quant {profile.quant} needs {est['required_mib'] / MIB_PER_GIB:.1f} GiB"
+    if "weights_mib" in est:
+        text += (f" (weights {est['weights_mib'] / MIB_PER_GIB:.1f} + KV {est['kv_mib'] / MIB_PER_GIB:.1f} "
+                 f"for {settings['slots']} slot(s) x {settings['context']:,} tokens at "
+                 f"{est['kv_k']}/{est['kv_v']} + runtime {est['overhead_mib'] / MIB_PER_GIB:.1f})")
+    text += f"; {where} have {free_mib / MIB_PER_GIB:.1f} GiB free"
+    if len(per_gpu) > 1:
+        text += f" (largest single GPU {max(per_gpu) / MIB_PER_GIB:.1f} GiB)"
+    return text
+
+
 def plan(models: list[str], gpus: list[GPU], context: int, slots: int = 1,
          defaults: dict | None = None, client_context: int | None = None,
          agents: int | None = None) -> dict:
@@ -608,6 +637,13 @@ def plan(models: list[str], gpus: list[GPU], context: int, slots: int = 1,
         policy = "joint-global-plan"
 
     if not choices or any(c is None for c in choices):
+        unplaceable = [i for i in instances if not candidate_map[i]]
+        if unplaceable:
+            raise ValueError(
+                "cannot place requested model set: "
+                + "; ".join(unplaceable_detail(requests[i], gpus, context, slots) for i in unplaceable)
+                + ". Lower context/slots, use smaller KV types (kv_k/kv_v), fewer bits, or more GPUs"
+            )
         raise ValueError(
             f"cannot place requested model set at context {context:,} without "
             f"sharing/overcommitting GPUs; free VRAM is "

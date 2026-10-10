@@ -69,8 +69,10 @@ class PlannerTests(unittest.TestCase):
                             p["servers"][1]["cuda_visible_devices"])
         large = planmod.plan(["ornith-35b"], gpus, 262144)["servers"][0]
         self.assertEqual(large["model"], "ornith-1.5:35b-a3b")
-        self.assertEqual(large["profile"]["quant"], "Q8_0")
-        self.assertEqual(len(large["gpus"]), 2)
+        # Real catalog weights (Q5_K_M 25.3 GiB) fit one 32 GB card at full
+        # context, so the planner does not split across GPUs for Q8_0.
+        self.assertEqual(large["profile"]["quant"], "Q5_K_M")
+        self.assertEqual(len(large["gpus"]), 1)
 
     def test_role_mapping(self):
         self.assertEqual(planmod.role_map(["q38"])["fable"], "qwen3.8:27b")

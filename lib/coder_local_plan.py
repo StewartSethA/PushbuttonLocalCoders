@@ -252,12 +252,8 @@ def apply_client_context(requests: list[WorkerRequest], context: int,
 def choose_workers(requests: list[WorkerRequest], gpus: list[base.GPU], context: int, slots: int = 1) -> list[base.Candidate]:
     candidates = [candidates_for_request(r, gpus, context, slots) for r in requests]
     if any(not x for x in candidates):
-        details = []
-        for r, cs in zip(requests, candidates):
-            if not cs:
-                pin = f" GPUs={list(r.gpu_indices)}" if r.gpu_indices is not None else ""
-                cap = f" cap={r.vram_limit_mib/1024:.1f}GiB/GPU" if r.vram_limit_mib else ""
-                details.append(f"{r.model}{pin}{cap}")
+        details = [base.unplaceable_detail(r, gpus, context, slots)
+                   for r, cs in zip(requests, candidates) if not cs]
         raise ValueError("no fitting quant/placement for: " + "; ".join(details))
 
     @lru_cache(maxsize=None)

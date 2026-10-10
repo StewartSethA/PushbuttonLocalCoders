@@ -1,3 +1,4 @@
+import math
 import pathlib
 import sys
 import unittest
@@ -123,6 +124,42 @@ class CapacityBudgetTests(unittest.TestCase):
         self.assertEqual(two["context_tokens_total"], 524288)
         self.assertEqual(two["status"], "ESTIMATED")
         self.assertFalse(two["architecture_exact"])
+
+    def test_memory_estimate_uses_real_weights_and_architecture_kv(self):
+        q4 = next(p for p in base.PROFILES["ornith-1.5:35b-a3b"] if p.quant == "Q4_K_M")
+        one = capacity.memory_estimate(q4, capacity.resolve_options({}, 262144))
+        two = capacity.memory_estimate(q4, capacity.resolve_options({"slots": 2}, 262144))
+        self.assertEqual(one["weights_source"], "catalog")
+        self.assertEqual(one["weights_mib"], math.ceil(21.7 * 1024))
+        self.assertLess(one["required_mib"], q4.required_mib)
+        # KV grows with total tokens only; weights/runtime are paid once.
+        self.assertAlmostEqual(two["kv_mib"], 2 * one["kv_mib"], delta=1)
+        self.assertAlmostEqual(two["required_mib"] - one["required_mib"], one["kv_mib"], delta=2)
+        f16 = capacity.memory_estimate(q4, capacity.resolve_options({"kv_k": "f16", "kv_v": "f16"}, 262144))
+        q8 = capacity.memory_estimate(q4, capacity.resolve_options({"kv_k": "q8_0", "kv_v": "q8_0"}, 262144))
+        self.assertGreater(f16["required_mib"], q8["required_mib"])
+        self.assertGreater(q8["required_mib"], one["required_mib"])
+        q38 = base.PROFILES["qwen3.8:27b"][0]
+        lowered = capacity.memory_estimate(q38, capacity.resolve_options({"context": 65536}, 262144))
+        self.assertEqual(lowered["weights_source"], "profile-envelope")
+        self.assertLess(lowered["required_mib"], q38.required_mib)
+
+    def test_unplaceable_pinned_models_report_requirement_breakdown(self):
+        free = [31.3, 26.7, 27.0, 27.2, 19.5, 19.3, 25.6, 27.0]
+        gpus = [base.GPU(i, "Tesla V100-SXM2-32GB", 32768, int(f * 1024), "7.0")
+                for i, f in enumerate(free)]
+        with self.assertRaises(ValueError) as ctx:
+            base.plan(["ornith-1.5:35b@gpu=4,slots=2,bits=4",
+                       "qwen3.8:27b@gpu=5,slots=2,bits=4"], gpus, 262144)
+        msg = str(ctx.exception)
+        self.assertIn("ornith-1.5:35b-a3b@gpu=4: smallest matching quant Q4_K_M", msg)
+        self.assertIn("weights 21.7", msg)
+        self.assertIn("GPU(s) [4] have 19.5 GiB free", msg)
+        self.assertIn("qwen3.8:27b@gpu=5", msg)
+        # Unpinned, the same 4-bit two-slot pair fits on single cards.
+        result = base.plan(["ornith-1.5:35b@slots=2,bits=4", "qwen3.8:27b@slots=2,bits=4"],
+                           gpus, 262144)
+        self.assertEqual([len(s["gpus"]) for s in result["servers"]], [1, 1])
 
     def test_native_context_cannot_be_exceeded(self):
         profile = base.PROFILES["qwen3.8:27b"][0]

@@ -523,11 +523,11 @@ class SelectorTests(unittest.TestCase):
         self.assertEqual(code, 0, obj)
         ws = obj['plan']['workers']
         self.assertEqual([w['cuda_visible_devices'] for w in ws], ['0', '1'])
-        self.assertEqual(ws[0]['profile']['quant'], 'Q6_K')
+        self.assertEqual(ws[0]['profile']['quant'], 'Q8_0')
         self.assertEqual(ws[0]['profile']['repo'], 'ornith-ai/Ornith-1.5-9B-GGUF')
         launch.assert_not_called()
         code, out, _, launch, _ = self.run_sel(
-            'ornith-9b', '--vram-limit', '12G', '--json',
+            'ornith-9b', '--vram-limit', '8G', '--json',
             gpus=selector.workers.synthetic_3090(1))
         self.assertEqual(code, 2)
         self.assertIsNone(json.loads(out)['launch_argv'])

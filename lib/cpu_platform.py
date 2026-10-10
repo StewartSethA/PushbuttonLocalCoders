@@ -76,7 +76,7 @@ QUANT_BPW = {
 # (linear attention / Mamba) only pay KV for their attention layers. These are
 # planning assumptions; measured strategy benchmarks supersede them.
 MODEL_ARCH = {
-    "ornith-1.5:9b": dict(total_b=9.0, active_b=9.0, attn_layers=36, q_dim=4096, kv_dim=1024),
+    "ornith-1.5:9b": dict(total_b=9.0, active_b=9.0, attn_layers=8, q_dim=4096, kv_dim=1024),
     "ornith-1.5:35b-a3b": dict(total_b=35.0, active_b=3.0, attn_layers=10, q_dim=4096, kv_dim=512),
     "qwen3.8:27b": dict(total_b=27.0, active_b=27.0, attn_layers=16, q_dim=6144, kv_dim=1024),
     "qwen3.8-flash-next": dict(total_b=235.0, active_b=12.0, attn_layers=15, q_dim=8192, kv_dim=512),
