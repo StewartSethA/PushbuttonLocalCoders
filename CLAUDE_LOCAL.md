@@ -144,6 +144,25 @@ Claude Code remains the orchestrator. When it fans out, all agent API traffic re
 
 ## Context budgeting and auto-compaction
 
+With the default policy, claude-local does **not** select an auto-compaction
+window below Claude Code's supported 100,000-token minimum. It derives the
+client and compaction windows from verified route capacity, reserves room for
+output and the next compacted turn, and rejects smaller unsafe configurations.
+For example, a 131,072-token route defaults to a 106,496-token compaction
+window. A caller can request a lower window only if Claude supports it and the
+launcher accepts it; under this policy values below 100,000 are rejected.
+
+The old `route admission limit reached; retry later` 429 is emitted by
+Pushbutton's **local gateway/capacity proxy**, not by Claude's telemetry or an
+external API. It meant a local generation slot stayed occupied beyond a
+60-second admission wait. Admission now queues until the local route has room,
+so temporary concurrency no longer produces that 429. Requests still undergo
+the same full-payload token/capacity checks before inference.
+
+Use `--no-telemetry` to opt Claude Code and its local frontend integrations out
+of telemetry, error reporting, OpenTelemetry and tracking. This preserves local
+model requests and explicitly configured MCP/web tools.
+
 The earlier `CLIENT_CTX <= CTX` check was **not sufficient**: it compared configured numbers without verifying the server slot or controlling version-dependent Claude compaction behavior. The reported `147023 > 131072` error proves a request/window mismatch of **15,951 tokens**, not a network failure. It does not establish the installed Claude version, environment, or why that server selected 131,072.
 
 The launcher now:

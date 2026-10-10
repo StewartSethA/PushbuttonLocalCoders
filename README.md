@@ -152,6 +152,12 @@ additional headroom for the next turn. Frontend adapters advertise resolved
 budgets per model where supported; a shared session uses the smallest compatible
 budget. Current upstream framework mappings are:
 
+For every resolved worker, the enforced ordering is
+`compact_trigger < input_tokens <= client_context <= context` (where `context`
+is the hard per-slot limit). Adding slots does not silently lower per-slot
+context; it increases the estimated memory requirement. Invalid/out-of-order
+budgets fail before framework configuration is written.
+
 | Frontend | Budget/compaction mapping |
 | --- | --- |
 | Qwen Code | Per-model `contextWindowSize` and `samplingParams.max_tokens`; session `context.autoCompactThreshold` uses the earliest safe model ratio. Its built-in reserves may compact earlier. |
@@ -159,6 +165,13 @@ budget. Current upstream framework mappings are:
 | OpenCode | Per-model `limit.context`, `limit.input`, and `limit.output`; session `compaction.reserved` leaves enough room for every model's trigger. |
 | Claude Code | Shared-role budgets are bounded by verified per-slot capacity; `CLAUDE_CODE_AUTO_COMPACT_WINDOW` and `CLAUDE_CODE_MAX_OUTPUT_TOKENS` are configured explicitly in isolated settings. The supported compact window must be at least 100,000 tokens; smaller configurations fail with guidance rather than clamping upward. |
 | mini-SWE / DeepSeek Harness | Requests use guarded endpoints; mini-SWE receives per-worker output limits. No verified framework autocompact override is assumed for these adapters. |
+
+Pass `--no-telemetry` to any local frontend (or `pushbutton-select`) to set
+framework opt-out switches for telemetry, error reporting, OpenTelemetry, and
+tracking before the client starts. Pushbutton's own opt-in measurement queue is
+also disabled persistently. This does not disable local inference, MCP, or
+explicit web/search integrations. The flag must precede `--` when the frontend
+uses `--` to separate its own options.
 
 These mappings follow current upstream
 [Qwen compression](https://github.com/QwenLM/qwen-code/blob/main/packages/core/src/services/chatCompressionService.ts),
@@ -172,6 +185,10 @@ that bound up to the allocated slots, without proving a throughput SLA.
 The broker may promote default admission after calibration, while an explicit
 admission cap remains binding. `min_tps` is checked against broker calibration
 evidence; direct frontend launches warn when its throughput is unproven.
+The former `route admission limit reached; retry later` HTTP 429 was generated
+locally when the frontend's admission semaphore stayed busy for 60 seconds; it
+was not a telemetry or external-provider request. Local gateway requests now
+wait in the route queue for their admission slot instead of expiring as a 429.
 Large tool results can cross a threshold in one turn: summarize or limit them
 before retrying an oversized request. History is never silently discarded by
 the request guard.

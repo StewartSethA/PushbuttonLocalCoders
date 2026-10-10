@@ -55,6 +55,7 @@ obj={"$schema":"https://opencode.ai/config.json","model":f"pushbutton1/{models[0
 with open(sys.argv[2],'w') as destination: destination.write(json.dumps(obj,indent=2)+'\n')
 PY
 export OPENCODE_CONFIG="$config" OPENCODE_DISABLE_AUTOUPDATE=1
+if [[ "${DISABLE_TELEMETRY:-}" == 1 ]]; then export OPENCODE_DISABLE_TELEMETRY=1; fi
 resume=0; pass=()
 while (($#)); do
   case "$1" in

@@ -167,7 +167,7 @@ wait
 
     def test_qwen_model_context_and_output_are_per_model_and_guarded(self):
         backends = self.root / "backends"
-        second = {**self.capacity, "client_context":12000, "output_tokens":2048}
+        second = {**self.capacity, "context":16384, "client_context":12000, "output_tokens":2048}
         backends.write_text("1\tmodel-a\t18001\trepo:a\t" + json.dumps(self.capacity) + "\n" +
                             "2\tmodel-b\t18002\trepo:b\t" + json.dumps(second) + "\n")
         self.run_functions("coder-local", ["configure_qwen"],
@@ -176,6 +176,9 @@ wait
         models = config["modelProviders"]["openai"]
         self.assertEqual([m["generationConfig"]["contextWindowSize"] for m in models], [7000, 12000])
         self.assertEqual([m["generationConfig"]["samplingParams"]["max_tokens"] for m in models], [1024, 2048])
+        for model, capacity in zip(models, (self.capacity, second)):
+            self.assertLess(capacity["compact_trigger"], model["generationConfig"]["contextWindowSize"])
+            self.assertLess(model["generationConfig"]["contextWindowSize"], capacity["context"])
         self.assertTrue(all(m["baseUrl"] == "http://127.0.0.1:19000/v1" for m in models))
         self.assertEqual(config["context"]["autoCompactThreshold"],
                          min(self.capacity["compact_trigger"]/7000, second["compact_trigger"]/12000))
@@ -186,6 +189,8 @@ wait
                                     'configure_profile fast model-a http://127.0.0.1:19000/v1 low')
         self.assertEqual(result.returncode, 0)
         self.assertIn("config set model.context_length 7000", (self.root / "capture").read_text())
+        self.assertLess(self.capacity["compact_trigger"], self.capacity["client_context"])
+        self.assertLess(self.capacity["client_context"], self.capacity["context"])
         self.assertIn("config set compression.enabled true", (self.root / "capture").read_text())
         self.assertIn("config set compression.threshold_tokens 4500", (self.root / "capture").read_text())
         self.assertIn("config set model.provider custom:pushbutton", (self.root / "capture").read_text())
@@ -368,6 +373,10 @@ class StartupTests(unittest.TestCase):
             "'preflight':os.environ.get('CODER_LOCAL_STARTUP_ONLY'), "
             "'claude_preflight':os.environ.get('CLAUDE_LOCAL_STARTUP_ONLY'), "
             "'web_mcp':os.environ.get('CLAUDE_LOCAL_WEB_MCP'), "
+            "'disable_telemetry':os.environ.get('DISABLE_TELEMETRY'), "
+            "'disable_error_reporting':os.environ.get('DISABLE_ERROR_REPORTING'), "
+            "'do_not_track':os.environ.get('DO_NOT_TRACK'), "
+            "'otel_disabled':os.environ.get('OTEL_SDK_DISABLED'), "
             "'swarm':os.environ.get('MINI_SWE_SWARM_TASK')}))\n")
 
     def recorded(self, name, args=()):
@@ -408,6 +417,17 @@ class StartupTests(unittest.TestCase):
                 self.assertEqual(record["argv"][:3], ["--frontend", name, "--menu"])
                 self.assertIsNone(record["preflight"])
                 self.assertFalse((self.root / "state").exists())
+
+    def test_no_telemetry_flag_reaches_every_frontend_without_disabling_it(self):
+        self.selector_recorder()
+        for name in FRONTENDS + WRAPPERS:
+            with self.subTest(frontend=name):
+                record = self.recorded(name, ["--no-telemetry"])
+                self.assertEqual(record["disable_telemetry"], "1")
+                self.assertEqual(record["disable_error_reporting"], "1")
+                self.assertEqual(record["do_not_track"], "1")
+                self.assertEqual(record["otel_disabled"], "true")
+                self.assertIn("--launch-arg=--no-telemetry", record["argv"])
 
     def test_default_client_context_is_left_to_selector_clamping(self):
         self.selector_recorder()

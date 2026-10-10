@@ -354,8 +354,12 @@ def main():
  ap.add_argument('--slots',type=int,default=1,help='fallback parallel slots per model; per-model @slots overrides')
  ap.add_argument('--json',action='store_true'); ap.add_argument('--no-interactive',action='store_true')
  ap.add_argument('--plan-only','--print-only',action='store_true',help='preview only; never launch')
- ap.add_argument('--telemetry-opt-in',action='store_true'); ap.add_argument('--telemetry-off',action='store_true'); ap.add_argument('--telemetry-upload-url')
+ ap.add_argument('--telemetry-opt-in',action='store_true'); ap.add_argument('--telemetry-off','--no-telemetry',dest='telemetry_off',action='store_true'); ap.add_argument('--telemetry-upload-url')
  a=ap.parse_args()
+ if a.telemetry_off:
+  if a.telemetry_opt_in:ap.error('--no-telemetry conflicts with --telemetry-opt-in')
+  os.environ.update(DISABLE_TELEMETRY='1',DISABLE_ERROR_REPORTING='1',DO_NOT_TRACK='1',
+                    OTEL_SDK_DISABLED='true',LITELLM_TELEMETRY='false',OPENCODE_DISABLE_TELEMETRY='1')
  bits_specifiers=[m for m in a.models if m.startswith('bits=')]
  a.models=capacity_settings.model_bits_specs(a.models)
  for arg in a.launch_arg:

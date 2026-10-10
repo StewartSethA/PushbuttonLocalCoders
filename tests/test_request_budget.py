@@ -294,6 +294,19 @@ class ProxyTests(unittest.TestCase):
         self.assertEqual(status, 422)
         self.assertEqual(json.loads(raw)["error"]["message"], "upstream rejected request")
 
+    def test_busy_route_waits_for_admission_instead_of_returning_429(self):
+        gate = self.guard.slots
+        self.assertTrue(gate.acquire(blocking=False))
+        responses = []
+        request = threading.Thread(target=lambda: responses.append(self.request(stream=True)[0]))
+        request.start()
+        time.sleep(.1)
+        self.assertTrue(request.is_alive())
+        gate.release()
+        request.join(2)
+        self.assertFalse(request.is_alive())
+        self.assertEqual(responses, [200])
+
     def test_capacity_verifier_cli(self):
         self.backend.props = {"default_generation_settings": {"n_ctx": 128}, "total_slots": 2}
         command = [sys.executable, str(ROOT / "lib/pushbutton_request_budget.py"),

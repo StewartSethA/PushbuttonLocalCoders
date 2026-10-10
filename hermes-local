@@ -26,6 +26,7 @@ KEEP_SERVERS=0
 QUIET=0
 FOLDERS_ONLY=0
 SELECT=0
+NO_TELEMETRY=0
 SELECT_ARGS=()
 MODELS=()
 PIDS=()
@@ -71,6 +72,7 @@ Harness options:
   --bot-prefix NAME      Profile prefix (default: pushbutton)
   --web-search-backend NAME   Hermes web_search backend (default: exa)
   --web-extract-backend NAME  Hermes web_extract backend (default: firecrawl)
+  --no-telemetry             disable framework telemetry and error reporting
   --local-keep-servers   Keep llama.cpp servers after Hermes exits
   -h, --help
 
@@ -520,6 +522,7 @@ while (($#)); do
         --local-cache) [[ $# -ge 2 ]] || die "--local-cache needs a directory"; export CLAUDE_LOCAL_CACHE="$2"; SELECT_ARGS+=("$1" "$2"); shift 2 ;;
         --folders|--system-info) FOLDERS_ONLY=1; shift ;;
         --quiet) QUIET=1; SELECT_ARGS+=("$1"); shift ;;
+        --no-telemetry) NO_TELEMETRY=1; SELECT_ARGS+=("$1"); shift ;;
         --no-parallel) PUSHBUTTON_NO_PARALLEL=1; SELECT_ARGS+=("$1"); shift ;;
         --local-context) [[ $# -ge 2 ]] || die "--local-context needs a value"; CTX="$2"; shift 2 ;;
         --slots) [[ $# -ge 2 ]] || die "--slots needs a value"; SLOTS="$2"; shift 2 ;;
@@ -533,6 +536,11 @@ while (($#)); do
         *) MODELS+=("$1"); shift ;;
     esac
 done
+
+if ((NO_TELEMETRY)); then
+    export DISABLE_TELEMETRY=1 DISABLE_ERROR_REPORTING=1 DO_NOT_TRACK=1
+    export OTEL_SDK_DISABLED=true HERMES_DISABLE_TELEMETRY=1
+fi
 
 if ((FOLDERS_ONLY)); then
     source "$ROOT/lib/pushbutton_folders.sh"

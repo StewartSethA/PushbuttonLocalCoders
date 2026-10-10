@@ -53,6 +53,22 @@ class CapacityBudgetTests(unittest.TestCase):
         self.assertEqual(budget["input_tokens"], 228352)
         self.assertEqual(capacity.resolve_budget(8192, compact="2K")["compact_trigger"], 2048)
 
+    def test_compaction_trigger_stays_below_client_and_hard_context(self):
+        for context, slots, compact in (
+            (262144, 1, None), (196608, 2, "80%"), (131072, 2, 100000),
+            (65536, 1, "0.5"),
+        ):
+            with self.subTest(context=context, slots=slots, compact=compact):
+                options = {"context": context, "slots": slots}
+                if compact is not None:
+                    options["compact"] = compact
+                settings = capacity.resolve_options(options, context)
+                self.assertLess(settings["compact_trigger"], settings["input_tokens"])
+                self.assertLess(settings["compact_trigger"], settings["client_context"])
+                self.assertLess(settings["compact_trigger"], settings["context"])
+                self.assertEqual(settings["context"] * settings["slots"],
+                                 context * slots)
+
     def test_admission_defaults_to_one_without_reducing_requested_slots(self):
         settings = capacity.resolve_options({"slots": 4}, 32768)
         self.assertEqual(settings["slots"], 4)

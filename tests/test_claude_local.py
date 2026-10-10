@@ -192,6 +192,8 @@ class ContextPolicyTests(unittest.TestCase):
         self.assertEqual(p["client_context"], 114688)
         self.assertEqual(p["compact_window"], 106496)
         self.assertEqual(p["max_output_tokens"], 8192)
+        self.assertLessEqual(p["compact_window"], p["client_context"])
+        self.assertLess(p["client_context"], p["capacity"])
         self.assertEqual(sum(p[x] for x in ("compact_window", "max_output_tokens", "prompt_reserve", "compact_reserve")), 131072)
         self.assertEqual(budgetmod.context_policy(262144, env={})["client_context"], 200000)
 
@@ -213,6 +215,8 @@ class ContextPolicyTests(unittest.TestCase):
         self.assertEqual(policy["capacity"], 131072)
         self.assertEqual((policy["max_output_tokens"], policy["client_context"], policy["compact_window"]),
                          (4096, 110000, 105000))
+        self.assertLessEqual(policy["compact_window"], policy["client_context"])
+        self.assertLess(policy["client_context"], policy["capacity"])
         for client, env in [
             ("115000", {}), ("", {"CLAUDE_CODE_MAX_CONTEXT_TOKENS": "115000"}),
             ("", {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": "8192"}),
@@ -748,19 +752,35 @@ class GatewayBudgetHTTPTests(unittest.TestCase):
         self.prompt_tokens = 147023
         self.assertEqual(self.request()[0], 400)
         self.assertTrue(released.wait(1))
-        gate.acquire.assert_called_once_with(timeout=60)
+        gate.acquire.assert_called_once_with()
         gate.release.assert_called_once_with()
 
-    def test_count_endpoint_does_not_take_generation_admission_slot(self):
+    def test_generation_request_queues_instead_of_returning_admission_429(self):
         route = self.gateway.router.roles["haiku"]
         gate = mock.Mock()
-        gate.acquire.return_value = False
+        queued = threading.Event()
+        release = threading.Event()
+        released = threading.Event()
+        gate.acquire.side_effect = lambda: (queued.set(), release.wait(2))[1]
+        gate.release.side_effect = released.set
         self.gateway.router.gates[(route["url"], route["backend_alias"])] = gate
-        self.assertEqual(self.request()[0], 429)
-        self.assertEqual(self.requests, [])
+        responses = []
+        request = threading.Thread(target=lambda: responses.append(self.request()))
+        request.start()
+        self.assertTrue(queued.wait(1))
+        self.assertTrue(request.is_alive())
+        gate.acquire.assert_called_once_with()
+        release.set()
+        request.join(2)
+        self.assertFalse(request.is_alive())
+        self.assertEqual(responses[0][0], 200)
+        self.assertEqual([p for p, _ in self.requests], ["/v1/messages/count_tokens", "/v1/messages"])
+        self.assertTrue(released.wait(1))
+        gate.release.assert_called_once_with()
+        gate.acquire.reset_mock()
+        self.requests.clear()
         self.assertEqual(self.request(path="/v1/messages/count_tokens")[0], 200)
-        gate.acquire.assert_called_once_with(timeout=60)
-        gate.release.assert_not_called()
+        gate.acquire.assert_not_called()
 
     def test_identical_count_then_inference_reuses_digest_only_cache(self):
         _, _, body = self.request(path="/v1/messages/count_tokens")

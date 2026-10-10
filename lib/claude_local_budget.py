@@ -62,6 +62,11 @@ def context_policy(capacity: int, client: str = "", env: dict | None = None) -> 
     compact = positive_integer(env.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW", str(compact_limit)), "CLAUDE_CODE_AUTO_COMPACT_WINDOW")
     if not MIN_COMPACT_WINDOW <= compact <= compact_limit:
         raise BudgetError(f"CLAUDE_CODE_AUTO_COMPACT_WINDOW={compact} is unsafe/unsupported; use {MIN_COMPACT_WINDOW}..{compact_limit} for effective context {capacity}")
+    if not compact <= assumed < capacity:
+        raise BudgetError(
+            f"auto-compaction window {compact} must not exceed the client window "
+            f"{assumed} and must remain below backend hard context {capacity}"
+        )
     return {"capacity": capacity, "client_context": assumed, "compact_window": compact,
             "max_output_tokens": output, "prompt_reserve": PROMPT_RESERVE,
             "compact_reserve": COMPACT_RESERVE}
@@ -228,6 +233,11 @@ def shared_policy(routes: dict, client: str, env: dict) -> dict:
             raise BudgetError(f"CLAUDE_CODE_AUTO_COMPACT_WINDOW={compact} exceeds the smallest model compact limit {compact_limit}; lower it")
     else:
         compact = compact_limit
+    if not 0 < compact <= policy["client_context"] < policy["capacity"]:
+        raise BudgetError(
+            f"auto-compaction window {compact} must not exceed the shared client window "
+            f"{policy['client_context']} and must remain below smallest hard context {policy['capacity']}"
+        )
     policy["compact_window"] = compact
     return policy
 
