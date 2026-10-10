@@ -137,8 +137,12 @@ def aggregate(records, min_contributors: int = metrics.PUBLIC_MIN_CONTRIBUTORS) 
         rec = metrics._sanitize_observation(raw)
         base = (safe(rec.get("model")), safe(rec.get("artifact")), safe(rec.get("backend")), safe(hardware(rec)),
                 safe(rec.get("strategy")) if rec.get("strategy") else "")
+        concurrency=rec.get("concurrency")
+        concurrency=concurrency if isinstance(concurrency,int) and not isinstance(concurrency,bool) and concurrency>0 else 0
+        pp_method=safe(rec.get("pp_method") or rec.get("method") or "unspecified")
+        tg_method=safe(rec.get("tg_method") or rec.get("method") or "unspecified")
         for depth, pp, tg in samples(rec):
-            g = perf[base + (depth_bucket(depth),)]
+            g = perf[base + (depth_bucket(depth),concurrency,pp_method,tg_method)]
             g["senders"].add(sender)
             if pp is not None:
                 g["pp"].append(pp)
@@ -157,13 +161,14 @@ def aggregate(records, min_contributors: int = metrics.PUBLIC_MIN_CONTRIBUTORS) 
             suppressed += 1
             continue
         perf_rows.append({**dict(zip(names, key[:5])), "depth": key[5], "contributors": len(g["senders"]),
+                          "concurrency":key[6] or None,"pp_method":key[7],"tg_method":key[8],
                           "pp_tps": stats(g["pp"]), "tg_tps": stats(g["tg"])})
     for key, g in load.items():
         if len(g["senders"]) < min_contributors:
             suppressed += 1
             continue
         load_rows.append({**dict(zip(names, key)), "contributors": len(g["senders"]), "load_time_s": stats(g["load"])})
-    perf_rows.sort(key=lambda r: (r["model"], r["quant"], r["hardware"], r["strategy"], bucket_order(r["depth"])))
+    perf_rows.sort(key=lambda r: (r["model"], r["quant"], r["hardware"], r["strategy"], bucket_order(r["depth"]),r["concurrency"] or 0,r["pp_method"],r["tg_method"]))
     load_rows.sort(key=lambda r: (r["model"], r["quant"], r["hardware"], r["strategy"]))
     return {
         "schema": 1,

@@ -24,10 +24,12 @@ export const SANITIZED_FIELDS = [
   "event", "device", "cpu_model", "cpu_family", "cpu_tier", "cpu_sockets", "cpu_cores",
   "fast_mem_kind", "fast_mem_mode", "strategy", "threads", "threads_batch", "memory_tier",
   "load_time_s",
+  "pp_method", "tg_method", "prompt_processed_tokens", "cached_tokens", "prompt_ms", "predicted_ms",
 ];
 export const STRING_FIELDS = [
   "model", "backend", "artifact", "device", "cpu_model", "cpu_family", "cpu_tier", "strategy",
   "memory_tier", "event", "source", "method", "fast_mem_kind", "fast_mem_mode", "backend_commit",
+  "pp_method", "tg_method",
 ];
 export const DEPTH_FIELDS = ["depth", "pp_tps", "tg_tps", "pp_tps_estimate", "tg_tps_estimate"];
 

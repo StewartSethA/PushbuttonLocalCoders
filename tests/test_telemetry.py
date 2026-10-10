@@ -221,6 +221,22 @@ class AggregateTests(unittest.TestCase):
         self.assertEqual(s['performance'][0]['model'], 'other')
         self.assertEqual(s['performance'][0]['contributors'], 3)
 
+    def test_concurrency_and_measurement_methods_are_not_mixed(self):
+        recs=[]
+        for concurrency,method,tg in ((1,'backend-timings',20),(2,'backend-timings',10),(2,'broker-stream',7)):
+            recs.extend(self.rec(f's{i}',tg=tg,concurrency=concurrency,pp_method=method,tg_method=method) for i in range(3))
+        recs.extend(self.rec('lonely',concurrency=3,pp_method='backend-timings',tg_method='backend-timings') for _ in range(4))
+        rows=aggregate_mod.aggregate(recs,3)['performance']
+        self.assertEqual([(r['concurrency'],r['tg_method'],r['tg_tps']['median']) for r in rows],
+                         [(1,'backend-timings',20),(2,'backend-timings',10),(2,'broker-stream',7)])
+
+    def test_actual_timings_survive_sanitization_without_payload_text(self):
+        rec=m._sanitize_observation({'pp':100,'tg':20,'pp_method':'backend-timings','tg_method':'backend-timings',
+                                    'prompt_processed_tokens':2,'cached_tokens':8,'prompt_ms':20,'predicted_ms':200,
+                                    'concurrency':2,'prompt':'PRIVATE','timings':{'prompt':'PRIVATE'}})
+        self.assertEqual((rec['prompt_ms'],rec['predicted_ms'],rec['cached_tokens']),(20,200,8))
+        self.assertNotIn('PRIVATE',json.dumps(rec))
+
     def test_cli_writes_dashboard_with_escaped_data(self):
         with tempfile.TemporaryDirectory() as td:
             d = pathlib.Path(td) / 'records' / '2026' / '10'

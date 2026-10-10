@@ -38,7 +38,7 @@ PUBLIC_MIN_CONTRIBUTORS = 3
 CONSENT_TEXT = f"""\
 Pushbutton performance telemetry (on by default; answer n, or use --telemetry-off at any time)
   Sent: model, quant, backend, hardware type (CPU/GPU model, sockets/cores, memory size),
-    launch strategy, model load time, and prompt/decode tok/s at each context depth.
+    launch strategy, model load time, and prompt/decode tok/s at each context depth and concurrency.
   Never sent: prompts, outputs, code, file names, paths, usernames or hostnames.
   Stored: the collector adds the receive time and a keyed hash of your IP address. The raw IP
     is used only for rate limiting and is not stored. Records go to a private repository
@@ -59,9 +59,10 @@ SANITIZED_FIELDS = (
     "event","device","cpu_model","cpu_family","cpu_tier","cpu_sockets","cpu_cores",
     "fast_mem_kind","fast_mem_mode","strategy","threads","threads_batch","memory_tier",
     "load_time_s",
+    "pp_method","tg_method","prompt_processed_tokens","cached_tokens","prompt_ms","predicted_ms",
 )
 STRING_FIELDS = ("model","backend","artifact","device","cpu_model","cpu_family","cpu_tier","strategy",
-                 "memory_tier","event","source","method","fast_mem_kind","fast_mem_mode","backend_commit")
+                 "memory_tier","event","source","method","fast_mem_kind","fast_mem_mode","backend_commit","pp_method","tg_method")
 DEPTH_FIELDS = ("depth","pp_tps","tg_tps","pp_tps_estimate","tg_tps_estimate")
 
 

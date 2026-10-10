@@ -69,6 +69,8 @@ pushbutton client ──POST gzip NDJSON──▶ relay (Cloudflare Worker, alwa
 - Keeps only model, quant, backend, a normalized hardware class, the strategy and a
   context-depth bucket.
 - Publishes median and p25–p75 of PP/TG tok/s and load time.
+- Separates throughput by admission concurrency and PP/TG measurement methods;
+  missing concurrency is shown as unknown, not assumed to be one.
 - Never publishes hashes, IPs, timestamps or individual records.
 - k-anonymity: a group is published only when at least 3 distinct senders
   (`PUBLIC_MIN_CONTRIBUTORS`) contributed. Smaller groups are counted as withheld.
