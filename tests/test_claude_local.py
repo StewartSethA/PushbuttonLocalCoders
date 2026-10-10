@@ -401,13 +401,15 @@ class ContextPolicyTests(unittest.TestCase):
             (tmp / "lib" / "pushbutton_folders.sh").write_text("initialize_folders() { :; }\n")
             core = tmp / "claude-local"
             core.write_text('#!/bin/bash\n'
-                            '[[ "${CLAUDE_LOCAL_STARTUP_ONLY:-}" != 1 ]] || exit 125\n'
+                            'if [[ "${CLAUDE_LOCAL_STARTUP_ONLY:-}" == 1 ]]; then\n'
+                            '  printf "%s" "${CLAUDE_LOCAL_WEB_CONFIG:-}" > "$WEB_HANDOFF"\n'
+                            '  exit 125\nfi\n'
                             'printf "%s\\n" "$@"\n')
             core.chmod(0o755)
             state = tmp / "state"
             env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE_LOCAL")}
             env.update(CLAUDE_LOCAL_STATE=str(state), CLAUDE_LOCAL_WEB_MCP="1",
-                       CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY="1")
+                       CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY="1", WEB_HANDOFF=str(tmp / "handoff"))
 
             def run(*args):
                 return subprocess.run(["bash", str(entry), "q38", *args],
@@ -440,6 +442,7 @@ class ContextPolicyTests(unittest.TestCase):
             result = run("--local-web-config", str(alternate))
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn(str(alternate), result.stdout)
+            self.assertEqual((tmp / "handoff").read_text(), str(alternate))
             self.assertNotIn("--local-web-config\n", result.stdout)
             env["CLAUDE_LOCAL_WEB_CONFIG"] = str(alternate)
             self.assertIn(str(alternate), run().stdout)

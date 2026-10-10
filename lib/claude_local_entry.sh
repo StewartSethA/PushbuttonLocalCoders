@@ -42,6 +42,7 @@ while (($#)); do
 done
 
 ((INFO_ONLY == 0)) || exec "$ROOT/claude-local" "${ARGS[@]}"
+export CLAUDE_LOCAL_WEB_CONFIG="$WEB_CONFIG"
 if CLAUDE_LOCAL_STARTUP_ONLY=1 CLAUDE_LOCAL_WEB_MCP="$WEB_MCP" "$ROOT/claude-local" "${ARGS[@]}"; then
   exit 0
 else
