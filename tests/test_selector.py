@@ -24,6 +24,17 @@ runtime = importlib.util.module_from_spec(runtime_spec)
 runtime_loader.exec_module(runtime)
 
 class SelectorTests(unittest.TestCase):
+    def test_launch_keeps_inline_bits_over_config_default(self):
+        defaults = {"qwen3.8:27b": {"bits": 4}}
+        with mock.patch.object(selector.workers, "load_placement_config", return_value=defaults):
+            result, models = selector.joint_preview(
+                ["q38@bits=3"], "qwen-local", None,
+                selector.workers.synthetic_3090(1), 65536)
+        self.assertIn("bits=3", models[0])
+        request = selector.workers.parse_model_spec(models[0], defaults)
+        self.assertEqual(request.capacity["bits"], 3)
+        self.assertEqual(request.capacity["quant"], result["workers"][0]["profile"]["quant"])
+
     def test_bits_only_interactive_selection_preserves_constraint(self):
         code, out, _, launch, _ = self.run_sel(
             "bits=3", tty=True, inputs=("1", "q38", "", "", "", "", "n"),

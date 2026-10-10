@@ -290,6 +290,7 @@ def joint_preview(models,frontend,agents,gpus,context,cap=None,gpu_indices=None,
    spec+=f",context={c['context']},slots={c['slots']},output={c['output_tokens']},client_context={c['client_context']},compact={c['compact_trigger']},safety={c['safety_tokens']},kv_k={w['profile']['kv_k']},kv_v={w['profile']['kv_v']}"
    if c.get('min_tps') is not None:spec+=f",min_tps={c['min_tps']}"
    if c.get('admission_explicit',True):spec+=f",admission={c['admission_limit']}"
+   if c.get('bits') is not None:spec+=f",bits={c['bits']}"
    spec+=f",quant={w['profile']['quant']}"
    launch_models.append(spec)
  else:
