@@ -553,13 +553,15 @@ PY
 )"
     local -a args=(--setting-sources "" --settings '{"autoCompactEnabled":true,"permissions":{"deny":["WebSearch","WebFetch"]}}'
         --disallowedTools "WebSearch,WebFetch"
-        --append-system-prompt "Local web policy: built-in WebSearch/WebFetch are unavailable on this local endpoint. Use the connected MCP search/fetch tools (pushbutton-web by default), using their exact advertised names. If no MCP web tool is connected, explain that web access is unavailable rather than calling web_search or web_fetch."
+        --append-system-prompt "Local web policy: built-in WebSearch/WebFetch are unavailable on this local endpoint. Use the connected MCP search/fetch tools (pushbutton-web by default), using their exact advertised names. If no MCP web tool is connected, explain that web access is unavailable rather than calling web_search or web_fetch.
+Local context policy: keep incoming tool content bounded. Read files in small line ranges and constrain search results to relevant paths and limited matches. Avoid dumping full logs, generated files, or dependency directories; inspect targeted excerpts instead. If more content is needed, retrieve additional small chunks rather than repeating large outputs. Keep handoffs concise: goal, completed changes, decisions, relevant paths, remaining work, and verification. If auto-compaction repeatedly refills within a few turns, suggest preserving a short handoff and using /clear or starting a new session without --continue or --resume. Do not clear history automatically, disable compaction, or increase context without verified backend capacity."
         "${CLAUDE_ARGS[@]}")
     contains_claude_flag --model || args=(--model "$sonnet_id" "${args[@]}")
     contains_claude_flag --agents || args=(--agents "$(agents_json)" "${args[@]}")
     good "All local services ready. Launching Claude Code from $PWD"
     say "Claude Code -> local gateway http://127.0.0.1:$GATEWAY_PORT (no cloud fallback)"
     say "Web policy: built-in WebSearch/WebFetch disabled; use connected MCP tools. Check /mcp if search is unavailable."
+    say "Context policy: bounded file/search/log excerpts. If compaction thrashes, save a short handoff, then /clear or start fresh without --continue/--resume."
     if [[ "${VERBOSE:-0}" == 1 ]]; then
         debug "Claude executable: $(command -v claude || true)"
         debug "Runtime logs: $STATE_DIR/logs"

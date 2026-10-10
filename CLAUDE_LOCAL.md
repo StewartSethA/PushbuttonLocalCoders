@@ -227,6 +227,44 @@ Preflight adds template rendering/tokenization, not a second inference. A bounde
 
 **Auto-compaction alone cannot guarantee safety** for an arbitrary huge tool result, system/tool definition, tokenizer mismatch, or already oversized transcript. Such requests are rejected intact.
 
+### Recovering repeated auto-compaction thrashing
+
+The warning that context refilled within three turns of compaction, three times
+in a row, describes conversation growth, not proof of GPU memory exhaustion.
+Large tool results or an ineffective compacted summary can cause it. The
+launcher appends bounded-content guidance to Claude's system prompt: read small
+line ranges, constrain searches, and inspect targeted log excerpts rather than
+dumping generated files or dependency directories. This is model guidance, not
+a hard tool-output limit; the gateway still rejects oversized requests intact.
+
+1. Preserve a short handoff (goal, completed changes, decisions, relevant paths,
+   remaining work, verification), then use `/clear` in the interactive session
+   or launch without `--continue`/`--resume`. The harness never clears history
+   automatically. If the model cannot process the current history, recover the
+   handoff from notes rather than asking it to read that history again.
+2. Compare the Qwen models **sequentially**, using the same short handoff and
+   task in separate fresh sessions:
+   ```bash
+   claude-local qwen3.8:27b
+   # Exit the first session before launching the second.
+   claude-local qwen3.6:35b
+   ```
+   Record which tools and output sizes precede the warning. Single-model
+   placement/quantization can differ from the two-model run, so record those too;
+   this comparison is diagnostic, not a controlled model-quality benchmark.
+3. Inspect the startup placement and budget diagnostics: model/GPU assignment,
+   slots, requested and effective per-slot capacity, client assumed window, and
+   auto-compaction window. `--local-dry-run` shows a planned placement only;
+   `doctor` does not prove a live backend's capacity. Two 16GB V100s do not
+   automatically provide one shared context window. For
+   `claude-local qwen3.8:27b qwen3.6:35b`, Haiku uses the first model and
+   Sonnet/Opus/Fable use the second; the shared budget uses the smallest routed
+   backend, not the sum of GPU memory or context capacities.
+4. Only after verifying live capacity, consider a lower fitting compaction
+   window using the budget options above. Windows below 100,000 tokens are
+   rejected. Do not disable compaction or blindly increase context; lowering a
+   window cannot repair an already oversized transcript.
+
 ### Recovering an already oversized session
 
 Lowering the threshold does **not** retroactively compact a saved transcript. Resuming/continuing a transcript that already exceeds the smaller backend may fail even for `/compact`, since compaction itself needs to read that history.
