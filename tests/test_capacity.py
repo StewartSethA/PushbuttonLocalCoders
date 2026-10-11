@@ -12,6 +12,68 @@ import coder_local_plan as coder
 
 
 class CapacityBudgetTests(unittest.TestCase):
+    def test_six_small_presets_resolve_metadata_without_guessed_sizes(self):
+        self.assertEqual(len(base.SMALL_MODELS), 6)
+        for model, preset in base.SMALL_MODELS.items():
+            metadata = dict(repo=preset["repo"], quant="Q4_K_M", context=131072,
+                            download_spec=preset["repo"] + ":Q4_K_M",
+                            weight_bytes=4 * 2**30, attn_layers=8, kv_dim=512)
+            with self.subTest(model=model), patch("gguf_source.resolve_source", return_value=metadata) as resolve:
+                try:
+                    request = coder.parse_model_spec(model + "@slots=2,bits=4")
+                    self.assertEqual(request.model, model)
+                    resolve.assert_called_once_with(preset["repo"] + ":Q4_K_M")
+                    profile = base.PROFILES[model][0]
+                    self.assertEqual(profile.weight_mib, 4096)
+                    self.assertEqual(profile.template, "embedded")
+                    self.assertEqual(coder.resolve_request_options(request, 262144)["context"], 131072)
+                finally:
+                    base.PROFILES.pop(model, None)
+
+    def test_source_kv_distinguishes_key_value_width_and_precision(self):
+        from dataclasses import replace
+        profile = replace(base.PROFILES["qwen3.8:27b"][3],
+                          weight_mib=2048, attention_layers=4, kv_width=384,
+                          kv_key_width=256, kv_value_width=512)
+        settings = capacity.resolve_options(
+            {"context": 32768, "kv_k": "q4_0", "kv_v": "f16"}, 262144)
+        estimate = capacity.memory_estimate(profile, settings)
+        expected = 4 * (256 * capacity.KV_TYPES["q4_0"] + 512 * capacity.KV_TYPES["f16"])
+        self.assertEqual(estimate["kv_bytes_per_token"], expected)
+
+    def test_recurrent_source_keeps_per_slot_runtime_budget(self):
+        from dataclasses import replace
+        profile = replace(base.PROFILES["qwen3.8:27b"][3],
+                          weight_mib=2048, attention_layers=0, kv_width=0)
+        one = capacity.memory_estimate(profile, capacity.resolve_options({}, 32768))
+        four = capacity.memory_estimate(profile, capacity.resolve_options({"slots": 4}, 32768))
+        self.assertEqual(four["kv_mib"], 0)
+        self.assertEqual(four["required_mib"] - one["required_mib"], 3 * capacity.GPU_RUNTIME_OVERHEAD_MIB)
+
+    def test_custom_source_registers_actual_weights_and_safe_instance_ids(self):
+        source = "hf:Example/Small-GGUF:Q4_K_M"
+        metadata = dict(repo="Example/Small-GGUF", quant="Q4_K_M", context=32768,
+                        download_spec=source, weight_bytes=3 * 2**30,
+                        attn_layers=24, kv_dim=256)
+        with patch("gguf_source.resolve_source", return_value=metadata):
+            try:
+                request = coder.parse_model_spec(source + "@gpu=0,slots=2")
+                result = base.plan([source + "@gpu=0,slots=2"], coder.synthetic_3090(1), 262144)
+                server = result["servers"][0]
+                self.assertEqual(server["profile"]["hf_spec"], source)
+                self.assertEqual(server["capacity"]["context"], 32768)
+                self.assertRegex(server["id"], r"^local-gguf-[a-f0-9]{16}$")
+                estimate = server["capacity"]["memory_estimate"]
+                self.assertEqual(estimate["weights_mib"], 3072)
+                self.assertEqual(estimate["weights_source"], "gguf-metadata")
+                self.assertEqual(estimate["kv_mib"], 432)
+                with self.assertRaisesRegex(ValueError, "native context"):
+                    coder.candidates_for_request(
+                        coder.parse_model_spec(source + "@context=65536"),
+                        coder.synthetic_3090(1), 262144)
+            finally:
+                base.PROFILES.pop(source, None)
+
     def test_bits_validation_and_quant_names(self):
         for bits in (1, 2, 3, 4, 5, 6, 8, 16):
             self.assertEqual(capacity.parse_options({"bits": str(bits)})["bits"], bits)

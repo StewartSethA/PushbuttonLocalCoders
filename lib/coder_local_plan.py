@@ -202,7 +202,7 @@ def _near_best(candidates: list[base.Candidate], quality_slack: int = 3) -> list
 
 def candidates_for_request(req: WorkerRequest, gpus: list[base.GPU], context: int,
                            slots: int = 1, quality_filter: bool = True) -> list[base.Candidate]:
-    settings = capacity.resolve_options(req.capacity, context, slots)
+    settings = resolve_request_options(req, context, slots)
     physical = {g.index for g in gpus}
     if req.gpu_indices is not None:
         missing = [x for x in req.gpu_indices if x not in physical]
@@ -228,12 +228,19 @@ def candidates_for_request(req: WorkerRequest, gpus: list[base.GPU], context: in
 def request_capacity(req: WorkerRequest, profile: base.Profile, context: int,
                      slots: int = 1) -> dict:
     """Resolve a selected instance's capacity; WorkerRequest.capacity holds options."""
-    settings = capacity.resolve_options(req.capacity, context, slots)
+    settings = resolve_request_options(req, context, slots)
     settings.update(quant=profile.quant, kv_k=settings.get("kv_k", profile.kv_k),
                     kv_v=settings.get("kv_v", profile.kv_v))
     original = next((p for p in base.PROFILES[req.model] if p.quant == profile.quant), profile)
     settings["memory_estimate"] = capacity.memory_estimate(original, settings)
     return settings
+
+
+def resolve_request_options(req: WorkerRequest, context: int, slots: int = 1) -> dict:
+    profiles = base.PROFILES[req.model]
+    if any(p.source_spec for p in profiles):
+        context = min(context, max(p.native_context for p in profiles))
+    return capacity.resolve_options(req.capacity, context, slots)
 
 
 def apply_client_context(requests: list[WorkerRequest], context: int,
@@ -295,7 +302,7 @@ def build_plan(requests: list[WorkerRequest], agents: int | None, gpus: list[bas
     for i, (req, c) in enumerate(zip(workers, choices), 1):
         used |= c.mask
         group = base.ordered_group_for_layer_split(c, gpus)
-        alias = f"local-coder-{i}-{req.model.replace(':','-').replace('.','').replace('_','-')}"
+        alias = f"local-coder-{i}-{base.model_slug(req.model)}"
         settings = request_capacity(req, c.profile, context, slots)
         out.append({
             "worker": i,
@@ -328,11 +335,11 @@ def build_cpu_plan(workers: list[WorkerRequest], context: int, slots: int = 1) -
         if req.gpu_indices is not None:
             raise ValueError(f"{req.model} requests GPU(s) {list(req.gpu_indices)}, which are not visible")
     info = cpu_platform.detect()
-    items = [(r.model, capacity.resolve_options(r.capacity, context, slots)) for r in workers]
+    items = [(r.model, resolve_request_options(r, context, slots)) for r in workers]
     choices = cpu_platform.place_requests(items, info, [r.vram_limit_mib for r in workers])
     out = []
     for i, (req, c) in enumerate(zip(workers, choices), 1):
-        alias = f"local-coder-{i}-{req.model.replace(':','-').replace('.','').replace('_','-')}"
+        alias = f"local-coder-{i}-{base.model_slug(req.model)}"
         out.append({
             "worker": i, "id": alias, "model": req.model,
             "profile": {**asdict(c.profile), "extra_env": dict(c.profile.extra_env), "hf_spec": c.profile.hf_spec},

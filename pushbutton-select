@@ -19,6 +19,7 @@ def catalog():
 
 def aliases():
  a={'qwen38':'qwen3.8:27b','qwen3.8-27b':'qwen3.8:27b','q38':'qwen3.8:27b'}
+ a.update(plan.ALIASES)
  for mid,m in catalog().items():
   a[mid.lower()]=mid
   for x in m.get('aliases',[]):a[str(x).lower()]=mid
@@ -32,8 +33,14 @@ UPSTREAM={
 RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; BOLD='\033[1m'; CYAN='\033[36m'; RESET='\033[0m'
 def color(s,c):return f'{c}{s}{RESET}' if sys.stdout.isatty() else s
 def canon(x:str)->str:
- k=x.lower().strip()
- if k in aliases():return aliases()[k]
+ raw=x.strip()
+ from gguf_source import is_source
+ if is_source(raw):return plan.canonical_model(raw)
+ k=raw.lower()
+ if k in aliases():
+  name=aliases()[k]
+  if name in plan.ALIASES or name in getattr(plan,'SMALL_MODELS',{}):return plan.canonical_model(name)
+  return name
  try:return plan.canonical_model(k)
  except Exception:return k
 
@@ -66,13 +73,13 @@ def benchmark_hint(model,short=False):
 
 def model_menu():
  names=[]
- for m in list(plan.PROFILES)+list(catalog()):
+ for m in list(plan.PROFILES)+list(getattr(plan,'SMALL_MODELS',{}))+list(catalog()):
   if m not in names:names.append(m)
  pref=['qwen3.8:27b','ornith-1.5:35b-a3b','ornith-1.5:9b','deepseek-v4.1-flash','ornith-1.5:397b']
  names=sorted(names,key=lambda x:(pref.index(x) if x in pref else 100+names.index(x)))
  print('\nAvailable model families:')
  for i,m in enumerate(names,1):
-  c=catalog().get(m,{});h=benchmark_hint(m,True);desc=c.get('display') or m
+  c=catalog().get(m,{}) or getattr(plan,'SMALL_MODELS',{}).get(m,{});h=benchmark_hint(m,True);desc=c.get('display') or m
   if m in plan.PROFILES:desc=f'{desc}  [GGUF planner]'
   print(f' {i:>2}. {desc:<43}'+(f'  {h}' if h else ''))
  print('Benchmark hints are upstream/vendor harness results, not local speed measurements.')
@@ -112,7 +119,7 @@ def evidence_label(obs,sm):
  return 'LOCAL MEASURED' if obs and all(r.get('evidence_origin')=='local' for r in obs) else 'UPSTREAM REFERENCE'
 
 def selector_model(text):
- name=canon(text)
+ name=canon(text.partition('@')[0])
  if name in catalog():return name
  return workers.parse_model_spec(text).model
 
@@ -139,7 +146,7 @@ def rows_for(model,gpu,cap,ram_cap,context,gpus=None,request=None,slots=1):
  rows=[]; gpu_name=gpu.name if gpu else None
  gpus=gpus if gpus is not None else ([gpu] if gpu else [])
  request=request or workers.WorkerRequest(model)
- settings=capacity_settings.resolve_options(request.capacity,context,slots)
+ settings=workers.resolve_request_options(request,context,slots) if model in plan.PROFILES else capacity_settings.resolve_options(request.capacity,context,slots)
  context=settings['context']
  if request.vram_limit_mib is not None:cap=request.vram_limit_mib
  if request.gpu_indices is not None:gpus=[g for g in gpus if g.index in request.gpu_indices]
@@ -350,12 +357,14 @@ def main():
  ap.add_argument('--launch-arg',action='append',default=[],help='frontend argument to preserve; use --launch-arg=VALUE')
  ap.add_argument('--menu',action='store_true')
  ap.add_argument('--vram-limit'); ap.add_argument('--ram-limit')
- ap.add_argument('--context',type=int,default=262144)
+ ap.add_argument('--context',type=int)
  ap.add_argument('--slots',type=int,default=1,help='fallback parallel slots per model; per-model @slots overrides')
  ap.add_argument('--json',action='store_true'); ap.add_argument('--no-interactive',action='store_true')
  ap.add_argument('--plan-only','--print-only',action='store_true',help='preview only; never launch')
  ap.add_argument('--telemetry-opt-in',action='store_true'); ap.add_argument('--telemetry-off','--no-telemetry',dest='telemetry_off',action='store_true'); ap.add_argument('--telemetry-upload-url')
  a=ap.parse_args()
+ explicit_context=a.context is not None
+ if a.context is None:a.context=262144
  if a.telemetry_off:
   if a.telemetry_opt_in:ap.error('--no-telemetry conflicts with --telemetry-opt-in')
   os.environ.update(DISABLE_TELEMETRY='1',DISABLE_ERROR_REPORTING='1',DO_NOT_TRACK='1',
@@ -401,9 +410,13 @@ def main():
  requests=[]
  for model_spec in models:
   model=selector_model(model_spec)
-  if model not in plan.PROFILES and '@' in model_spec and any(field.strip().startswith('bits=') for field in model_spec.split('@',1)[1].split(',')):
-   raise ValueError('bits requires a supported llama.cpp planner profile')
+  if model not in plan.PROFILES and '@' in model_spec:
+   raise ValueError('per-model capacity options require a supported llama.cpp planner profile')
   request=workers.parse_model_spec(model_spec,defaults) if model in plan.PROFILES else workers.WorkerRequest(model)
+  if explicit_context and model in plan.PROFILES and 'context' not in request.capacity:
+   request=replace(request,capacity={**request.capacity,'context':a.context})
+   model_spec+=(',' if '@' in model_spec else '@')+f'context={a.context}'
+   models[len(requests)]=model_spec
   request=replace(request,gpu_indices=request.gpu_indices if request.gpu_indices is not None else indices,
                   vram_limit_mib=request.vram_limit_mib if request.vram_limit_mib is not None else cap)
   requests.append(request)
@@ -412,7 +425,7 @@ def main():
   try:
    request=workers.apply_client_context([request],a.context,a.client_context)[0]
    rs=rows_for(request.model,gpu,cap,ram_cap,a.context,inv,request,a.slots)
-   resolved=capacity_settings.resolve_options(request.capacity,a.context,a.slots)
+   resolved=workers.resolve_request_options(request,a.context,a.slots) if request.model in plan.PROFILES else capacity_settings.resolve_options(request.capacity,a.context,a.slots)
    instance={'instance':index,'model':request.model,'capacity':resolved,'rows':rs,'error':None}
   except ValueError as exc:
    rs=[];instance={'instance':index,'model':request.model,'capacity':None,'rows':rs,'error':str(exc)}

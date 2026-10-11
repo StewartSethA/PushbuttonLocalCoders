@@ -1,4 +1,5 @@
 import json, os, pathlib, subprocess, sys, tempfile, unittest
+from dataclasses import replace
 from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -204,6 +205,124 @@ class EstimateTests(unittest.TestCase):
     def test_estimates_markdown_is_in_sync(self):
         self.assertEqual((ROOT / "benchmarks/cpu/ESTIMATES.md").read_text(), cp.estimates_markdown(),
                          "regenerate with: python3 lib/cpu_platform.py estimates --markdown > benchmarks/cpu/ESTIMATES.md")
+
+
+class MetadataProfileTests(unittest.TestCase):
+    def setUp(self):
+        self.model = "hf:example/Small-GGUF:Q4_K_M"
+        self.profile = base.Profile(
+            self.model, "Small", "example/Small-GGUF", "Q4_K_M", 8192, 100,
+            native_context=32768, source_spec="example/Small-GGUF:Q4_K_M",
+            weight_mib=2048.5, attention_layers=24, kv_width=512)
+        self.profiles = mock.patch.dict(base.PROFILES, {self.model: [self.profile]})
+        self.profiles.start()
+        self.addCleanup(self.profiles.stop)
+        self.settings = capacity.resolve_options({}, 8192)
+
+    def test_metadata_weights_kv_slots_and_runtime_size_cpu_ram(self):
+        tokens = 8192 * 3
+        kv = tokens * 24 * 512 * (cp.KV_BYTES["q4_0"] + cp.KV_BYTES["f16"])
+        expected = int(((2048.5 * 2**20 + kv + 768 * 2**20 + tokens * 4096) * 1.05) / 2**20) + 1
+        required = cp.cpu_required_mib(self.model, "Q4_K_M", tokens, "q4_0", "f16", profile=self.profile)
+        self.assertEqual(required, expected)
+        settings = capacity.resolve_options({"slots": "3", "kv_v": "f16"}, 8192)
+        choice = cp.choose_profile(self.model, settings, cascade_lake_2s())
+        self.assertEqual(choice.required_mib, expected)
+        self.assertEqual(choice.profile.kv_v, "f16")
+
+    def test_metadata_cpu_choice_has_unknown_speed_and_serializable_fields(self):
+        with mock.patch.object(cp, "weight_gib", side_effect=AssertionError("fabricated parameters")):
+            choice = cp.choose_profile(self.model, self.settings, cascade_lake_2s())
+        self.assertNotIn(self.model, cp.MODEL_ARCH)
+        self.assertEqual(choice.profile.hf_spec, self.profile.source_spec)
+        self.assertEqual(choice.as_row(), {"tg": None, "pp": None, "evidence": "UNKNOWN"})
+        self.assertEqual(choice.estimate["weight_gib"], round(2048.5 / 1024, 2))
+        self.assertIsNone(choice.estimate["load_time_s"])
+        self.assertEqual([d["depth"] for d in choice.estimate["depths"]], [0, 8192])
+        json.dumps(cp.server_fields(choice, cascade_lake_2s()), allow_nan=False)
+
+    def test_separate_key_value_widths_with_mixed_precision(self):
+        profile = replace(self.profile, kv_width=384, kv_key_width=512, kv_value_width=256)
+        base.PROFILES[self.model] = [profile]
+        settings = capacity.resolve_options({"kv_k": "q4_0", "kv_v": "f16"}, 8192)
+        kv = 8192 * 24 * (512 * cp.KV_BYTES["q4_0"] + 256 * cp.KV_BYTES["f16"])
+        expected = int((2048.5 * 2**20 + kv + 768 * 2**20 + 8192 * 4096) * 1.05 / 2**20) + 1
+        choice = cp.choose_profile(self.model, settings, cascade_lake_2s())
+        self.assertEqual(choice.required_mib, expected)
+
+    def test_metadata_uses_fast_memory_and_numa_placement(self):
+        with mock.patch.dict(os.environ, {"PUSHBUTTON_ASSUME_NUMACTL": "1"}):
+            choice = cp.choose_profile(self.model, self.settings, knl())
+            self.assertEqual(choice.strategy.name, "mcdram-bind")
+            choices = cp.place_requests([(self.model, self.settings)] * 2, cascade_lake_2s())
+        self.assertTrue(all(c.strategy.name == "numa-partition" for c in choices))
+        self.assertNotEqual(choices[0].strategy.numactl, choices[1].strategy.numactl)
+
+    def test_metadata_respects_ram_native_context_and_quant_constraints(self):
+        required = cp.cpu_required_mib(self.model, "Q4_K_M", 8192, profile=self.profile)
+        self.assertIsNone(cp.choose_profile(self.model, self.settings, cascade_lake_2s(), required - 1))
+        self.assertIsNotNone(cp.choose_profile(self.model, self.settings, cascade_lake_2s(), required))
+        self.assertIsNone(cp.choose_profile(self.model, capacity.resolve_options({}, 65536), cascade_lake_2s()))
+        self.assertIsNone(cp.choose_profile(
+            self.model, capacity.resolve_options({"quant": "Q8_0"}, 8192), cascade_lake_2s()))
+
+    def test_metadata_selects_quality_without_claiming_decode_target(self):
+        base.PROFILES[self.model] = [replace(self.profile, quality=90), replace(self.profile, quant="Q8_0",
+                                                                             weight_mib=4096, quality=110)]
+        settings = {**self.settings, "min_tps": 1000000}
+        choice = cp.choose_profile(self.model, settings, cascade_lake_2s())
+        self.assertEqual(choice.profile.quant, "Q8_0")
+        self.assertIsNone(choice.as_row()["tg"])
+        self.assertTrue(all(c["tg_estimate"] is None for c in choice.alternatives))
+
+    def test_invalid_metadata_is_not_treated_as_zero_memory(self):
+        for fields in ({"weight_mib": None}, {"weight_mib": float("nan")}, {"weight_mib": -1},
+                       {"attention_layers": None}, {"attention_layers": -1}, {"kv_width": 0},
+                       {"kv_key_width": -1}, {"kv_value_width": 0}):
+            with self.subTest(fields=fields):
+                base.PROFILES[self.model] = [replace(self.profile, **fields)]
+                with self.assertRaisesRegex(ValueError, "valid GGUF"):
+                    cp.choose_profile(self.model, self.settings, cascade_lake_2s())
+
+    def test_pure_recurrent_metadata_has_zero_kv_without_division(self):
+        profile = replace(self.profile, attention_layers=0, kv_width=0)
+        base.PROFILES[self.model] = [profile]
+        required = cp.cpu_required_mib(self.model, profile.quant, 8192, profile=profile)
+        expected = int((2048.5 + 768 + 8192 * 4096 / 2**20) * 1.05) + 1
+        self.assertEqual(required, expected)
+        with mock.patch.object(cp, "detect", return_value=cascade_lake_2s()):
+            choice = cp.choose_profile(self.model, self.settings, cascade_lake_2s())
+            server = base.plan([self.model], [], 8192)["servers"][0]
+            worker = workers.build_plan([workers.WorkerRequest(self.model)], 1, [], 8192)["workers"][0]
+        self.assertEqual(choice.required_mib, expected)
+        for item in (server, worker):
+            self.assertEqual(item["capacity"]["memory_estimate"]["kv_mib"], 0)
+            self.assertIsNone(item["cpu"]["estimate"]["depths"][0]["tg_tps"])
+
+    def test_source_metadata_overrides_known_model_architecture(self):
+        model = "ornith-1.5:9b"
+        with mock.patch.dict(base.PROFILES, {model: [replace(self.profile, model=model)]}):
+            choice = cp.choose_profile(model, self.settings, cascade_lake_2s())
+        self.assertEqual(choice.estimate["weights_source"], "gguf-metadata")
+        self.assertEqual(choice.estimate["weight_gib"], round(2048.5 / 1024, 2))
+
+    def test_local_measurement_can_supply_metadata_speed_and_strategy(self):
+        measurement = {"strategy": {"name": "physical-cores"},
+                       "depths": [{"depth": 0, "pp_tps": 120, "tg_tps": 30}]}
+        with mock.patch.object(cp, "best_measured", return_value=measurement):
+            choice = cp.choose_profile(self.model, self.settings, cascade_lake_2s())
+        self.assertEqual(choice.strategy.name, "physical-cores")
+        self.assertEqual(choice.as_row(), {"tg": 30, "pp": 120, "evidence": "LOCAL MEASURED"})
+
+    def test_source_profiles_work_in_claude_and_worker_cpu_plans(self):
+        with mock.patch.object(cp, "detect", return_value=cascade_lake_2s()):
+            server = base.plan([self.model], [], 8192)["servers"][0]
+            worker = workers.build_plan([workers.WorkerRequest(self.model)], 1, [], 8192)["workers"][0]
+        for item in (server, worker):
+            self.assertEqual(item["device"], "cpu")
+            self.assertEqual(item["profile"]["hf_spec"], self.profile.source_spec)
+            self.assertGreater(item["headroom_mib"], 0)
+            self.assertEqual(item["cpu"]["estimate"]["status"], "UNKNOWN")
 
 
 class PlannerFallbackTests(unittest.TestCase):

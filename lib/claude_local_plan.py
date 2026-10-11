@@ -11,6 +11,7 @@ strand a later model.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import itertools
 import json
 import os
@@ -93,10 +94,16 @@ class Profile:
     build: str = "upstream"     # upstream | glm53
     extra_env: tuple[tuple[str, str], ...] = ()
     note: str = ""
+    source_spec: str = ""
+    weight_mib: float | None = None
+    attention_layers: int | None = None
+    kv_width: int | None = None
+    kv_key_width: int | None = None
+    kv_value_width: int | None = None
 
     @property
     def hf_spec(self) -> str:
-        return f"{self.repo}:{self.quant}"
+        return self.source_spec or f"{self.repo}:{self.quant}"
 
 
 ALIASES = {
@@ -182,12 +189,94 @@ PROFILES: dict[str, tuple[Profile, ...]] = {
 
 ROLES = ("haiku", "sonnet", "opus", "fable")
 
+SMALL_MODELS = {
+    "qwen3.5:9b": {
+        "display": "Qwen3.5 9B",
+        "repo": "unsloth/Qwen3.5-9B-GGUF",
+        "parameters_b": 9, "active_b": 9,
+        "note": "Hybrid attention; general coding/reasoning/agents"},
+    "granite4.2:8b": {
+        "display": "Granite 4.2 8B",
+        "repo": "ibm-granite/granite-4.2-8b-GGUF",
+        "parameters_b": 8, "active_b": 8,
+        "note": "Dense attention; tool calling/coding assistants"},
+    "mellum2": {
+        "display": "JetBrains Mellum2 12B-A2.5B Instruct",
+        "repo": "JetBrains/Mellum2-12B-A2.5B-Instruct-GGUF-Q4_K_M",
+        "parameters_b": 12, "active_b": 2.5,
+        "note": "MoE coding model; all experts occupy memory; agent tool support requires probe"},
+    "qwen3:8b": {
+        "display": "Qwen3 8B",
+        "repo": "Qwen/Qwen3-8B-GGUF",
+        "parameters_b": 8, "active_b": 8,
+        "note": "Reasoning/code generation; native context from selected GGUF"},
+    "qwen2.5-coder:7b": {
+        "display": "Qwen2.5-Coder 7B Instruct",
+        "repo": "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
+        "parameters_b": 7, "active_b": 7,
+        "note": "Code editing/completion; short native context may be unsuitable for Claude Code"},
+    "granite4.2:3b": {
+        "display": "Granite 4.2 3B",
+        "repo": "ibm-granite/granite-4.2-3b-GGUF",
+        "parameters_b": 3, "active_b": 3,
+        "note": "Lightweight speed-first assistant"},
+}
+ALIASES.update({name: name for name in SMALL_MODELS})
+ALIASES.update({
+    "qwen3.5-9b": "qwen3.5:9b", "qwen35": "qwen3.5:9b",
+    "granite-4.2-8b": "granite4.2:8b", "granite4.2-8b": "granite4.2:8b",
+    "granite-4.2:8b": "granite4.2:8b",
+    "jetbrains-mellum2": "mellum2", "mellum2:12b": "mellum2",
+    "qwen3-8b": "qwen3:8b",
+    "qwen2.5-coder-7b-instruct": "qwen2.5-coder:7b",
+    "qwen2.5-coder:7b-instruct": "qwen2.5-coder:7b",
+    "granite-4.2-3b": "granite4.2:3b", "granite4.2-3b": "granite4.2:3b",
+    "granite-4.2:3b": "granite4.2:3b",
+})
+
 
 def canonical_model(name: str) -> str:
     key = name.strip().lower()
     if key not in ALIASES:
+        from gguf_source import is_source
+        if is_source(name.strip()):
+            model = name.strip()
+            register_source(model, model)
+            return model
         raise ValueError(f"unknown model '{name}'")
-    return ALIASES[key]
+    model = ALIASES[key]
+    if model in SMALL_MODELS:
+        register_source(model, SMALL_MODELS[model]["repo"] + ":Q4_K_M")
+    return model
+
+
+def register_source(model: str, source: str) -> None:
+    """Register a GGUF only after resolving its actual size and architecture."""
+    if model in PROFILES:
+        return
+    from gguf_source import resolve_source
+    resolved = resolve_source(source)
+    if (not isinstance(resolved.get("weight_bytes"), (int, float))
+            or resolved["weight_bytes"] <= 0
+            or not isinstance(resolved.get("context"), int) or resolved["context"] <= 0
+            or not isinstance(resolved.get("attn_layers"), int) or resolved["attn_layers"] < 0
+            or not isinstance(resolved.get("kv_dim"), (int, float)) or resolved["kv_dim"] < 0
+            or (resolved["attn_layers"] > 0 and resolved["kv_dim"] == 0)):
+        raise ValueError("GGUF metadata lacks usable size/context/attention geometry")
+    preset = SMALL_MODELS.get(model, {})
+    PROFILES[model] = (Profile(
+        model, preset.get("display", model), resolved.get("repo") or "", resolved["quant"], 0, 95,
+        native_context=resolved["context"], source_spec=resolved["download_spec"],
+        weight_mib=resolved["weight_bytes"] / 2**20,
+        attention_layers=resolved["attn_layers"], kv_width=resolved["kv_dim"],
+        kv_key_width=resolved.get("kv_key_dim"), kv_value_width=resolved.get("kv_value_dim"),
+        note=preset.get("note", "") + "; GGUF metadata resolved; embedded template/tool support must pass startup probes"),)
+
+
+def model_slug(model: str) -> str:
+    if "/" in model or "://" in model:
+        return "gguf-" + hashlib.sha256(model.encode()).hexdigest()[:16]
+    return model.replace(':', '-').replace('.', '').replace('_', '-')
 
 
 def role_map(models: list[str]) -> dict[str, str]:
@@ -282,12 +371,13 @@ def cpu_plan(requests, context: int, slots: int, rm: dict) -> dict:
     import cpu_platform
     from coder_local_plan import request_capacity
     info = cpu_platform.detect()
-    items = [(r.model, capacity.resolve_options(r.capacity, context, slots)) for r in requests]
+    from coder_local_plan import resolve_request_options
+    items = [(r.model, resolve_request_options(r, context, slots)) for r in requests]
     choices = cpu_platform.place_requests(items, info, [r.vram_limit_mib for r in requests])
     servers = []
     for i, (request, c) in enumerate(zip(requests, choices)):
         settings = request_capacity(request, c.profile, context, slots)
-        server_id = f"local-{c.model.replace(':', '-').replace('.', '').replace('_', '-')}"
+        server_id = f"local-{model_slug(c.model)}"
         if sum(r.model == request.model for r in requests) > 1:
             server_id += f"-{i + 1}"
         servers.append({
@@ -583,7 +673,8 @@ def ordered_group_for_layer_split(candidate: Candidate, gpus: list[GPU]) -> list
 
 def unplaceable_detail(request, gpus: list[GPU], context: int, slots: int = 1) -> str:
     """Explain why one request has no placement: smallest fitting need vs. free VRAM."""
-    settings = capacity.resolve_options(request.capacity, context, slots)
+    from coder_local_plan import resolve_request_options
+    settings = resolve_request_options(request, context, slots)
     allowed = [g for g in gpus if request.gpu_indices is None or g.index in request.gpu_indices]
     limit = request.vram_limit_mib
     per_gpu = [min(g.free_mib, limit) if limit else g.free_mib for g in allowed]
@@ -658,7 +749,7 @@ def plan(models: list[str], gpus: list[GPU], context: int, slots: int = 1,
         used_mask |= c.mask
         group = ordered_group_for_layer_split(c, gpus)
         settings = request_capacity(request, c.profile, context, slots)
-        server_id = f"local-{c.model.replace(':', '-').replace('.', '').replace('_', '-')}"
+        server_id = f"local-{model_slug(c.model)}"
         if sum(r.model == request.model for r in requests) > 1:
             server_id += f"-{i + 1}"
         servers.append(
@@ -729,6 +820,12 @@ def main() -> int:
                 ]
                 for m, ps in PROFILES.items()
             }
+            data.update({
+                model: [{**spec, "model": model, "quant": "Q4_K_M",
+                         "hf_spec": spec["repo"] + ":Q4_K_M", "native_context": None,
+                         "metadata_required": True}]
+                for model, spec in SMALL_MODELS.items() if model not in data
+            })
             print(json.dumps(data, indent=2))
             return 0
         gpus = inventory()

@@ -1,5 +1,4 @@
 """Folder helper integration tests."""
-import http.server
 import json
 import os
 import pathlib
@@ -8,7 +7,6 @@ import select
 import shutil
 import subprocess
 import tempfile
-import threading
 import time
 import unittest
 
@@ -807,38 +805,46 @@ elif args[0] != "-C":
         stale = {"sha": "c" * 40, "siblings": [
             {"rfilename": "model-Q4_K_M.gguf", "size": GIB}]}
         cached_metadata.write_text(json.dumps(stale))
-        requested = []
+        online_metadata = self.work / "online-metadata.json"
+        online_metadata.write_text(json.dumps(data))
+        requested = self.work / "metadata-requests.jsonl"
+        mock_dir = self.work / "transport-mock"
+        mock_dir.mkdir()
+        (mock_dir / "sitecustomize.py").write_text("""
+import io
+import json
+import os
+import pathlib
+import gguf_source
 
-        class Handler(http.server.BaseHTTPRequestHandler):
-            def do_GET(self):
-                requested.append(self.path)
-                self.send_response(200)
-                self.end_headers()
-                self.wfile.write(json.dumps(data).encode())
+def safe_open(request, timeout=30):
+    url = request.full_url
+    gguf_source.validate_url(url, dns=False)
+    assert url == "https://huggingface.co/api/models/owner/repo/revision/main?blobs=true", url
+    assert timeout == 2, timeout
+    assert os.environ.get("HF_HUB_OFFLINE") != "1", "offline reuse requested transport"
+    with open(os.environ["MOCK_METADATA_REQUESTS"], "a") as stream:
+        stream.write(json.dumps(url) + "\\n")
+    return io.BytesIO(pathlib.Path(os.environ["MOCK_ONLINE_METADATA"]).read_bytes())
 
-            def log_message(self, *args):
-                pass
-
-        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        try:
-            env = self.mock_space(12)
-            env["HF_ENDPOINT"] = f"http://127.0.0.1:{server.server_port}"
-            cp = self.run_bash("load_folder_config; validate_download_space owner/repo:Q4_K_M",
-                               env, check=False)
-            self.assertEqual(cp.returncode, 2)
-            self.assertIn("13.00 GiB required", cp.stderr)
-            self.assertEqual(json.loads(cached_metadata.read_text()), data)
-            self.assertEqual(cached_metadata.stat().st_mode & 0o777, 0o600)
-            self.assertFalse(list(root.glob(".metadata-*.json")))
-            env.update(self.mock_space(13), HF_HUB_OFFLINE="1")
-            self.run_bash("load_folder_config; validate_download_space owner/repo:Q4_K_M", env)
-        finally:
-            server.shutdown()
-            server.server_close()
-            thread.join()
-        self.assertEqual(requested, ["/api/models/owner/repo?blobs=true"])
+gguf_source.safe_open = safe_open
+""")
+        env = dict(self.mock_space(12),
+                   HF_ENDPOINT="https://huggingface.co",
+                   PYTHONPATH=os.pathsep.join((str(mock_dir), str(ROOT / "lib"))),
+                   MOCK_METADATA_REQUESTS=str(requested),
+                   MOCK_ONLINE_METADATA=str(online_metadata))
+        cp = self.run_bash("load_folder_config; validate_download_space owner/repo:Q4_K_M",
+                           env, check=False)
+        self.assertEqual(cp.returncode, 2)
+        self.assertIn("13.00 GiB required", cp.stderr)
+        self.assertEqual(json.loads(cached_metadata.read_text()), data)
+        self.assertEqual(cached_metadata.stat().st_mode & 0o777, 0o600)
+        self.assertFalse(list(root.glob(".metadata-*.json")))
+        env.update(self.mock_space(13), HF_HUB_OFFLINE="1")
+        self.run_bash("load_folder_config; validate_download_space owner/repo:Q4_K_M", env)
+        self.assertEqual([json.loads(line) for line in requested.read_text().splitlines()],
+                         ["https://huggingface.co/api/models/owner/repo/revision/main?blobs=true"])
 
     def test_explicit_offline_requires_complete_local_inventory(self):
         env = dict(self.mock_space(100), PUSHBUTTON_HF_OFFLINE="1")

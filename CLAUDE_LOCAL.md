@@ -89,25 +89,72 @@ slot** times slots; weights are loaded once. For `qwen3.8:27b` at `UD-Q4_K_M`,
 the fallback weight estimate is about **15.25 GiB** (27 billion parameters at
 4.85 effective bits), not 35.5 GiB of weights. Four 262,144-token slots add
 an estimated **18 GiB** of q4_0 KV plus runtime/margin, so the total still exceeds
-31.3 GiB. Four 131,072-token slots halve that KV estimate. Dynamic GGUF sizes
-and architecture metadata are not currently resolved by this planner.
+31.3 GiB. Four 131,072-token slots halve that KV estimate. Existing curated
+profiles retain these planning assumptions; small-model presets and custom
+sources resolve GGUF sizes and architecture metadata as described below.
 
 ### Low-memory GPUs
 
-The smallest built-in model is **`ornith-1.5:9b`** (`ornith` / `ornith-9b`).
+One compact built-in model is **`ornith-1.5:9b`** (`ornith` / `ornith-9b`).
 Its catalogued Q4_K_M weights are **5.78 GiB**; KV and runtime require additional
 VRAM. One 131,072-token q4_0 slot is estimated at roughly **8.6 GiB total**,
 so this is a more realistic 12–16 GiB target than assuming an 8 GiB card fits.
 Use `claude-local models` and `--local-dry-run` to check current profiles.
 
-Outside this curated launcher, smaller GGUF candidates include
-**Qwen2.5-Coder-3B/7B-Instruct**, **Qwen3-4B/8B**, and
+Additional built-in small-model selectors resolve their actual GGUF size and
+attention/context metadata before placement, rather than guessing from their
+parameter labels:
+
+| Selector | Default GGUF repository | Intended use |
+|---|---|---|
+| `qwen3.5:9b` | `unsloth/Qwen3.5-9B-GGUF` | General coding, reasoning, agents |
+| `granite4.2:8b` | `ibm-granite/granite-4.2-8b-GGUF` | Tool calling, coding assistants |
+| `mellum2` | `JetBrains/Mellum2-12B-A2.5B-Instruct-GGUF-Q4_K_M` | Dedicated coding; 12B total, 2.5B active |
+| `qwen3:8b` | `Qwen/Qwen3-8B-GGUF` | Reasoning and code generation |
+| `qwen2.5-coder:7b` | `Qwen/Qwen2.5-Coder-7B-Instruct-GGUF` | Code editing and completion |
+| `granite4.2:3b` | `ibm-granite/granite-4.2-3b-GGUF` | Lightweight, speed-first assistants |
+
+These selectors default to **Q4_K_M**, using the embedded chat template and a
+recent llama.cpp build. Mellum2 selects **Instruct**, not the completion-oriented
+Base checkpoint. Active parameters affect compute, not the memory needed for
+all expert weights. Selecting a model is not a claim that its agent tool
+behavior has been validated on your machine: startup probes still apply.
+
+Outside these built-ins, smaller GGUF candidates include
+**Qwen2.5-Coder-3B-Instruct**, **Qwen3-4B**, and
 **Llama-3.2-3B-Instruct**. Approximate Q4 weights are 2–3 GiB for 3–4B
 models and 4–5 GiB for 7–8B models; check the actual chosen GGUF size and leave
 room for KV/buffers. These names are **not built-in selectors** here, and tool
 compatibility must be verified before using them as agent backends. For small
 contexts, prefer a coder frontend: Claude Code's supported compaction policy
 requires at least a 100,000-token window and additional reserves.
+
+### Custom GGUF sources
+
+The planners also accept Hugging Face identifiers, exact GGUF paths, HF resolve
+URLs, and public HTTPS GGUF URLs. Examples:
+
+```bash
+qwen-local 'qwen2.5-coder:7b@context=32768,slots=1'
+claude-local 'qwen3.5:9b@gpu=0,slots=1' --local-dry-run
+qwen-local 'hf:Qwen/Qwen3-8B-GGUF:Q4_K_M@context=32768'
+qwen-local 'Qwen/Qwen3-8B-GGUF/Qwen3-8B-Q4_K_M.gguf@context=32768'
+qwen-local 'https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf@context=32768'
+qwen-local 'https://models.example.org/model-Q4_K_M.gguf@context=32768'
+```
+
+Repository and filename case is preserved. Metadata resolution checks artifact
+size, native context and attention geometry; unavailable or unsupported metadata
+fails rather than inventing a fit. HF revisions are pinned for downloads and
+complete shard sets are checked. An omitted context is bounded by the selected
+GGUF's native context; an explicit unsupported context is rejected. Smaller
+contexts may work with coder frontends but fail Claude Code's compaction policy.
+
+Only model data is downloaded; no repository Python code is executed. Custom
+URLs must be public HTTPS, without embedded credentials or credential query
+parameters. Local/private-network targets and unsafe paths are rejected.
+HF credentials are not sent to other hosts. Embedded templates and tool probes
+remain in force; an arbitrary GGUF is not necessarily a chat/tool model.
 
 ## Built-in model selectors
 
@@ -120,7 +167,9 @@ glm-5.3-flash
 
 Aliases such as `q36`, `q38`, `nemotron`, and `glm53` are accepted. `claude-local models` prints the registered repositories, quant tiers, KV formats, and memory envelopes.
 
-The model catalogue is intentionally curated rather than accepting arbitrary names: each profile has a known repository, quant hierarchy, context/KV configuration, compatibility template, and conservative VRAM envelope. Users choose a model family; the harness chooses the quant.
+Curated profiles retain their quant hierarchy and compatibility settings.
+The six small-model presets and custom sources resolve GGUF metadata on demand;
+use an explicit repository/quant identifier to choose another artifact.
 
 For Qwen 3.6/3.8, the harness downloads the current fixed Qwen Jinja template and supplies it to llama-server for agent/tool compatibility.
 

@@ -429,6 +429,12 @@ The hardware-aware local planner currently knows these selectors:
 | Selector | Intended use |
 |---|---|
 | `ornith-1.5:9b` | Small dense coder; GGUF joint placement |
+| `qwen3.5:9b` | Small hybrid coding/reasoning model; GGUF metadata-resolved Q4 |
+| `granite4.2:8b` | Tool-calling/coding assistant; GGUF metadata-resolved Q4 |
+| `mellum2` | JetBrains Mellum2 Instruct, 12B total / 2.5B active MoE |
+| `qwen3:8b` | Reasoning/code generation; GGUF metadata-resolved Q4 |
+| `qwen2.5-coder:7b` | Instruct code editing/completion; shorter native context |
+| `granite4.2:3b` | Lightweight assistant; GGUF metadata-resolved Q4 |
 | `ornith-1.5:35b-a3b` | MoE coder; GGUF joint placement |
 | `qwen3.8-flash-next` | Highest-end local coding agent; multi-GPU |
 | `qwen3.8:27b` | Strong dense coder; excellent single 24/32 GB GPU target |

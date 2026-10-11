@@ -8,6 +8,7 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -24,6 +25,72 @@ runtime = importlib.util.module_from_spec(runtime_spec)
 runtime_loader.exec_module(runtime)
 
 class SelectorTests(unittest.TestCase):
+    def test_short_native_source_defaults_fit_and_explicit_overrides_reject(self):
+        source = "TestOrg/ShortNative-GGUF:Q4_K_M"
+        profile = selector.replace(selector.plan.PROFILES["qwen3.8:27b"][3],
+                                   model=source, source_spec=source, required_mib=4096,
+                                   native_context=32768)
+        with mock.patch.dict(selector.plan.PROFILES, {source: (profile,)}):
+            code, out, err, _, _ = self.run_sel(source, "--json", gpus=selector.workers.synthetic_3090(1))
+            self.assertEqual(code, 0, err)
+            obj = json.loads(out)
+            self.assertEqual(obj["instances"][0]["capacity"]["context"], 32768)
+            self.assertTrue(any(row["status"] == "FIT" for row in obj["rows"][source]))
+            self.assertEqual(obj["plan"]["workers"][0]["capacity"]["context"], 32768)
+            for options in (("--context", "65536"), ("--client-context", "65536")):
+                code, out, _, _, _ = self.run_sel(source, *options, "--json", gpus=selector.workers.synthetic_3090(1))
+                self.assertEqual(code, 2)
+                self.assertIsNotNone(json.loads(out)["error"])
+
+    def test_small_model_alias_registers_even_on_alias_match(self):
+        preset = "qwen3.5:9b"
+        with mock.patch.dict(selector.plan.ALIASES, {"small-test": preset, preset: preset}), mock.patch.object(selector.plan, "canonical_model", return_value=preset) as canonical:
+            self.assertEqual(selector.canon("SMALL-TEST"), preset)
+        canonical.assert_called_once_with(preset)
+
+    def test_small_model_menu_does_not_resolve_unselected_presets(self):
+        preset = "menu-small-test"
+        definitions = {preset: {"display": "Small model fixture"}}
+        out = io.StringIO()
+        with mock.patch.object(selector.plan, "SMALL_MODELS", definitions, create=True), mock.patch.object(selector.plan, "canonical_model", wraps=selector.plan.canonical_model) as canonical, mock.patch("builtins.input", return_value="1"), contextlib.redirect_stdout(out):
+            selector.model_menu()
+        self.assertIn("Small model fixture", out.getvalue())
+        self.assertNotIn(mock.call(preset), canonical.call_args_list)
+
+    def test_catalog_only_model_does_not_silently_drop_capacity_suffix(self):
+        with mock.patch.object(selector, "catalog", return_value={"catalog-only": {"context": 65536}}):
+            code, _, err, launch, _ = self.run_sel(
+                "catalog-only@slots=2", "--json",
+                gpus=selector.workers.synthetic_3090(1))
+        self.assertEqual(code, 2)
+        self.assertIn("per-model capacity options", err)
+        launch.assert_not_called()
+
+    def test_custom_source_preserves_case_suffixes_and_uses_dynamic_profile(self):
+        source = "hf:ExampleOrg/CaseSensitive-GGUF/Model-Q4_K_M.gguf"
+        profile = selector.replace(selector.plan.PROFILES["qwen3.8:27b"][3], model=source, source_spec=source, required_mib=4096)
+        original = selector.plan.canonical_model
+        def canonical(text):
+            return text if text == source else original(text)
+        module = types.SimpleNamespace(is_source=lambda text: text == source)
+        with mock.patch.dict(sys.modules, {"gguf_source": module}), mock.patch.dict(selector.plan.PROFILES, {source: (profile,)}), mock.patch.object(selector.plan, "canonical_model", side_effect=canonical):
+            self.assertEqual(selector.canon(source), source)
+            self.assertEqual(selector.selector_model(source + "@slots=2"), source)
+            code, out, _, launch, _ = self.run_sel(
+                source + "@slots=2,context=32768", "--context", "32768", "--json",
+                gpus=selector.workers.synthetic_3090(1))
+            self.assertEqual(code, 0, out)
+            obj = json.loads(out)
+            worker = obj["plan"]["workers"][0]
+            self.assertEqual(worker["model"], source)
+            self.assertEqual(worker["profile"]["hf_spec"], source)
+            self.assertEqual(worker["capacity"]["slots"], 2)
+            self.assertTrue(all(row["backend"] == "llama.cpp" for row in obj["rows"][source]))
+            launch_spec = next(arg for arg in obj["launch_argv"] if arg.startswith(source + "@"))
+            request = selector.workers.parse_model_spec(launch_spec)
+            self.assertEqual(request.capacity["slots"], 2)
+            launch.assert_not_called()
+
     def test_launch_keeps_inline_bits_over_config_default(self):
         defaults = {"qwen3.8:27b": {"bits": 4}}
         with mock.patch.object(selector.workers, "load_placement_config", return_value=defaults):

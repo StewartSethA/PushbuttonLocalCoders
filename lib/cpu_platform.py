@@ -24,6 +24,7 @@ import functools
 import glob
 import hashlib
 import json
+import math
 import os
 import pathlib
 import platform
@@ -726,17 +727,46 @@ def weight_gib(model: str, quant: str) -> float:
     return arch["total_b"] * 1e9 * quant_bpw(quant) / 8 / 2**30
 
 
+def _metadata_weights(profile) -> float:
+    weights = getattr(profile, "weight_mib", None)
+    layers = getattr(profile, "attention_layers", None)
+    width = getattr(profile, "kv_width", None)
+    if (not isinstance(weights, (int, float)) or isinstance(weights, bool)
+            or not math.isfinite(weights) or weights <= 0
+            or not isinstance(layers, int) or isinstance(layers, bool) or layers < 0
+            or not isinstance(width, int) or isinstance(width, bool)
+            or width < 0 or (layers > 0 and width == 0)):
+        raise ValueError("CPU source profile requires valid GGUF weights and attention/KV metadata")
+    for name in ("kv_key_width", "kv_value_width"):
+        separate_width = getattr(profile, name, None)
+        if separate_width is not None and (
+                not isinstance(separate_width, int) or isinstance(separate_width, bool)
+                or separate_width < 0 or (layers > 0 and separate_width == 0)):
+            raise ValueError("CPU source profile requires valid GGUF weights and attention/KV metadata")
+    return float(weights)
+
+
 def cpu_required_mib(model: str, quant: str, context_tokens: int, kv_k: str = "q4_0",
-                     kv_v: str = "q4_0") -> int:
+                     kv_v: str = "q4_0", profile=None) -> int:
     """Host-RAM envelope: weights + full KV for all slots + compute buffers, +5%.
 
     The GPU planner's envelope includes CUDA buffers and padding that a CPU
     process does not allocate, so CPU placement uses this architecture estimate.
     """
-    arch = MODEL_ARCH[model]
-    kv = context_tokens * arch["attn_layers"] * arch["kv_dim"] * (KV_BYTES.get(kv_k, 2.0) + KV_BYTES.get(kv_v, 2.0))
+    if profile is not None:
+        weights = _metadata_weights(profile) * 2**20
+        layers, width = profile.attention_layers, profile.kv_width
+    else:
+        arch = MODEL_ARCH[model]
+        weights = weight_gib(model, quant) * 2**30
+        layers, width = arch["attn_layers"], arch["kv_dim"]
+    key_width = getattr(profile, "kv_key_width", None) if profile is not None else None
+    value_width = getattr(profile, "kv_value_width", None) if profile is not None else None
+    kv = context_tokens * layers * (
+        (width if key_width is None else key_width) * KV_BYTES.get(kv_k, 2.0)
+        + (width if value_width is None else value_width) * KV_BYTES.get(kv_v, 2.0))
     compute = 768 * 2**20 + context_tokens * 4096  # graph/compute buffers grow with ubatch×ctx
-    total = (weight_gib(model, quant) * 2**30 + kv + compute) * 1.05
+    total = (weights + kv + compute) * 1.05
     return int(total / 2**20) + 1
 
 
@@ -750,8 +780,26 @@ def _ops(spec: CPUSpec) -> tuple[float, float]:
 
 def estimate(spec: CPUSpec, model: str, quant: str, depths=DEFAULT_DEPTHS,
              kv_type: str = "q4_0", memory_tier: str | None = None, required_mib: int | None = None,
-             storage_gbs: float = 1.5) -> dict:
+             storage_gbs: float = 1.5, profile=None) -> dict:
     """Estimate load time and PP/TG tok/s at each context depth."""
+    if profile is not None:
+        w_gib = _metadata_weights(profile) / 1024
+        if memory_tier is None:
+            memory_tier = "dram"
+            working_gib = required_mib / 1024 if required_mib and spec.fast_mem_mode != "cache" else w_gib * 1.08
+            fast_gib = spec.fast_mem_gib * spec.sockets
+            if spec.fast_mem_kind and working_gib <= fast_gib * (0.94 if spec.fast_mem_mode == "flat" else 0.90):
+                memory_tier = spec.fast_mem_kind if spec.fast_mem_mode == "flat" else "mcdram-cache"
+            elif spec.fast_mem_kind and spec.fast_mem_mode == "flat":
+                memory_tier = "spill"
+        return {
+            "model": model, "quant": quant, "weight_gib": round(w_gib, 2),
+            "memory_tier": memory_tier, "load_time_s": None,
+            "depths": [{"depth": int(d), "pp_tps": None, "tg_tps": None} for d in depths],
+            "status": "UNKNOWN", "weights_source": "gguf-metadata",
+            "method": "GGUF weights + architecture KV + CPU runtime envelope; throughput unknown",
+            "note": "No parameter/compute model or local throughput measurement; benchmark before relying on speed.",
+        }
     arch = MODEL_ARCH.get(model)
     if not arch:
         raise ValueError(f"no CPU planning architecture for {model}")
@@ -873,7 +921,7 @@ class CPUChoice:
 
     def as_row(self) -> dict:
         tg = pp = None
-        evidence = "ESTIMATED"
+        evidence = self.estimate.get("status", "ESTIMATED")
         if self.measured:
             rows = sorted(self.measured.get("depths", []), key=lambda x: x["depth"])
             if rows:
@@ -896,7 +944,7 @@ def choose_profile(model: str, settings: dict, info: CPUInfo, ram_cap_mib: int |
     """
     import claude_local_plan as base
     import pushbutton_capacity as capacity
-    if model not in base.PROFILES or model not in MODEL_ARCH:
+    if model not in base.PROFILES:
         return None
     ram_cap = ram_capacity_mib(info) if ram_cap_mib is None else ram_cap_mib
     fast_cap = fast_capacity_mib(info) if fast_cap_mib is None else fast_cap_mib
@@ -907,12 +955,14 @@ def choose_profile(model: str, settings: dict, info: CPUInfo, ram_cap_mib: int |
         if not capacity.matches_quant(p.quant, settings) or settings["context"] > p.native_context:
             continue
         p2 = replace(p, kv_k=settings.get("kv_k", p.kv_k), kv_v=settings.get("kv_v", p.kv_v))
-        req = cpu_required_mib(model, p.quant, settings["context"] * settings["slots"], p2.kv_k, p2.kv_v)
+        metadata_profile = p2 if p2.source_spec or model not in MODEL_ARCH else None
+        req = cpu_required_mib(model, p.quant, settings["context"] * settings["slots"], p2.kv_k, p2.kv_v,
+                               profile=metadata_profile)
         if req > ram_cap:
             continue
-        w_mib = int(weight_gib(model, p.quant) * 1024)
+        w_mib = _metadata_weights(p2) if metadata_profile is not None else weight_gib(model, p.quant) * 1024
         in_fast = bool(fast_cap) and (req if info.fast_mem_mode == "flat" else int(w_mib * 1.08)) <= fast_cap
-        est = estimate(spec, model, p.quant, (depth,), p2.kv_k, required_mib=req)
+        est = estimate(spec, model, p.quant, (depth,), p2.kv_k, required_mib=req, profile=metadata_profile)
         cands.append((p2, req, in_fast, est["depths"][0]["tg_tps"]))
     if not cands:
         return None
@@ -920,12 +970,15 @@ def choose_profile(model: str, settings: dict, info: CPUInfo, ram_cap_mib: int |
         pick = max((c for c in cands if c[2] and c[0].quality >= 80), key=lambda c: c[0].quality)
     else:
         target = min_tps(settings)
-        meeting = [c for c in cands if c[3] >= target]
+        meeting = [c for c in cands if c[3] is not None and c[3] >= target]
         if meeting:
             pick = max(meeting, key=lambda c: c[0].quality)
         else:
             floor = [c for c in cands if c[0].quality >= 90] or cands
-            pick = max(floor, key=lambda c: (c[3], c[0].quality))
+            if all(c[3] is None for c in floor):
+                pick = max(floor, key=lambda c: c[0].quality)
+            else:
+                pick = max(floor, key=lambda c: (c[3] if c[3] is not None else -1, c[0].quality))
     profile, req, _, _ = pick
     strategies = candidate_strategies(info, req, threads, nodes)
     strategy = strategies[0]
@@ -939,7 +992,7 @@ def choose_profile(model: str, settings: dict, info: CPUInfo, ram_cap_mib: int |
             measured = None
     est = estimate(spec, model, profile.quant, sorted({0, depth, int(settings["context"])}),
                    profile.kv_k, memory_tier=strategy.memory_tier if strategy.memory_tier != "dram" else None,
-                   required_mib=req)
+                   required_mib=req, profile=profile if profile.source_spec or model not in MODEL_ARCH else None)
     return CPUChoice(model, profile, req, strategy, est, ram_cap, measured,
                      [{"quant": c[0].quant, "required_mib": c[1], "fits_fast_memory": c[2],
                        "tg_estimate": c[3], "quality": c[0].quality} for c in cands])

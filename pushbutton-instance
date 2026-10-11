@@ -6,7 +6,7 @@ model+quant selections. Specialized backend adapters remain available when their
 measured SLA is better.
 """
 from __future__ import annotations
-import argparse, json, os, pathlib, platform, shutil, subprocess, sys
+import argparse, json, os, pathlib, platform, re, shutil, subprocess, sys
 
 sys.path.insert(0,str(pathlib.Path(__file__).resolve().parent/'lib'))
 STATE=pathlib.Path(os.environ.get('PUSHBUTTON_RUNTIME_STATE',pathlib.Path.home()/'.local/share/pushbutton/runtime'))
@@ -67,9 +67,19 @@ def cpu_mode(gpus,flag):
     if flag:return True
     return not gpus and platform.system().lower()!='darwin' and not gpu_caps([])
 
+def model_args(spec,cache):
+    # Extended source syntax is resolved locally rather than passed to -hf.
+    if re.fullmatch(r'[\w.-]+/[\w.-]+:[A-Za-z0-9_.-]+',spec) and not spec.lower().endswith('.gguf'):
+        return ['-hf',spec]
+    command=['bash','-c','source "$1" && download_model_fast "$2" "$3" model_path && printf "%s\\n" "$model_path"',
+             'pushbutton-download',str(pathlib.Path(__file__).resolve().parent/'lib/pushbutton_download.sh'),spec,cache]
+    path=subprocess.check_output(command,text=True).strip()
+    if not path:raise ValueError('GGUF downloader did not return a model path')
+    return ['-m',path]
+
 def main():
     ap=argparse.ArgumentParser(prog='pushbutton-instance')
-    ap.add_argument('--hf-spec');ap.add_argument('--alias');ap.add_argument('--gpus',default='')
+    ap.add_argument('--hf-spec',help='HF repo:quant, hf: source, exact GGUF path, or public HTTPS GGUF URL');ap.add_argument('--alias');ap.add_argument('--gpus',default='')
     ap.add_argument('--host',default='127.0.0.1');ap.add_argument('--port',type=int);ap.add_argument('--context',type=int,default=65536)
     ap.add_argument('--cpu',action='store_true',help='force a CPU-only build/launch')
     ap.add_argument('--cpu-strategy',default='',help='JSON strategy from lib/cpu_platform.py (threads, NUMA, numactl, mmap)')
@@ -88,7 +98,7 @@ def main():
     if gpus:env['CUDA_VISIBLE_DEVICES']=','.join(map(str,gpus))
     env.setdefault('GGML_CUDA_ENABLE_UNIFIED_MEMORY','0');env.setdefault('LLAMA_CACHE',str(pathlib.Path.home()/'.cache/pushbutton/llama'))
     total_ctx=a.context*a.parallel
-    cmd=[str(server),'-hf',a.hf_spec,'--alias',a.alias,'--host',a.host,'--port',str(a.port),'-ngl','999','-c',str(total_ctx),'--parallel',str(a.parallel),'--cache-type-k',a.kv_k,'--cache-type-v',a.kv_v,'-b',str(a.batch),'-ub',str(a.ubatch),'-fa','on','--jinja','--cache-prompt','--no-context-shift']
+    cmd=[str(server),*model_args(a.hf_spec,env['LLAMA_CACHE']),'--alias',a.alias,'--host',a.host,'--port',str(a.port),'-ngl','999','-c',str(total_ctx),'--parallel',str(a.parallel),'--cache-type-k',a.kv_k,'--cache-type-v',a.kv_v,'-b',str(a.batch),'-ub',str(a.ubatch),'-fa','on','--jinja','--cache-prompt','--no-context-shift']
     if cpu:
         import cpu_platform
         if a.cpu_strategy:strat=cpu_platform.strategy_from_dict(json.loads(a.cpu_strategy))

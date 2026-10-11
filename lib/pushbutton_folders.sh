@@ -31,7 +31,7 @@
 _PUSHBUTTON_FOLDER_LIB="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 _pushbutton_folder_python() {
-    python3 - "$@" <<'PY'
+    PUSHBUTTON_FOLDER_LIB="$_PUSHBUTTON_FOLDER_LIB" python3 - "$@" <<'PY'
 import datetime
 import json
 import os
@@ -43,6 +43,8 @@ import sys
 import urllib.parse
 import urllib.request
 import uuid
+
+sys.path.insert(0, os.environ["PUSHBUTTON_FOLDER_LIB"])
 
 GIB = 1024 ** 3
 KEYS = ("state_dir", "cache_dir", "config_dir")
@@ -205,8 +207,9 @@ def repo_roots(cache, repo):
             for prefix in ("", "hub", "hf/hub", "llama")]
 
 
-def metadata(cache, repo):
-    key = (canonical(cache), repo)
+def metadata(cache, repo, revision="main"):
+    import gguf_source
+    key = (canonical(cache), repo, revision)
     if key in METADATA_MEMO:
         return METADATA_MEMO[key]
     local = None
@@ -215,7 +218,8 @@ def metadata(cache, repo):
             with open(root / "metadata.json", encoding="utf-8") as stream:
                 candidate = json.load(stream)
             if (isinstance(candidate, dict) and isinstance(candidate.get("siblings"), list)
-                    and candidate.get("id", repo) == repo):
+                    and candidate.get("id", repo) == repo
+                    and (revision == "main" or candidate.get("sha") == revision)):
                 local = candidate
                 break
         except (OSError, ValueError):
@@ -228,18 +232,18 @@ def metadata(cache, repo):
                              "provide complete offline metadata.json")
         METADATA_MEMO[key] = local
         return local
-    endpoint = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
-    url = endpoint + "/api/models/" + urllib.parse.quote(repo, safe="/") + "?blobs=true"
+    url = ("https://huggingface.co/api/models/" + urllib.parse.quote(repo, safe="/")
+           + "/revision/" + urllib.parse.quote(revision, safe="") + "?blobs=true")
     headers = {"User-Agent": "pushbutton-folders/1"}
-    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-    if token:
-        headers["Authorization"] = "Bearer " + token
+    headers.update(gguf_source.hf_headers())
     try:
-        with urllib.request.urlopen(urllib.request.Request(url, headers=headers),
-                                    timeout=2 if local is not None else 15) as response:
+        with gguf_source.safe_open(urllib.request.Request(url, headers=headers),
+                                   timeout=2 if local is not None else 15) as response:
             data = json.load(response)
         if (not isinstance(data, dict) or not isinstance(data.get("siblings"), list)
-                or data.get("id", repo) != repo):
+                or data.get("id", repo) != repo
+                or (re.fullmatch(r"[a-fA-F0-9]{40,64}", revision)
+                    and data.get("sha") != revision)):
             raise ValueError("invalid HF metadata")
     except (OSError, ValueError) as error:
         if local is None:
@@ -267,20 +271,31 @@ def metadata(cache, repo):
 
 
 def download_remaining(spec, cache):
-    spec = re.sub(r"^(?:https?://)?(?:huggingface\.co|hf\.co)/", "", spec)
-    location, colon, quant = spec.partition(":")
-    parts = location.split("/")
-    if len(parts) < 2 or any(not re.fullmatch(r"[A-Za-z0-9_.-]+", p) or p in (".", "..") for p in parts):
-        raise ValueError("expected owner/repo:quant or owner/repo/path.gguf[:quant]")
-    repo = "/".join(parts[:2])
-    explicit = "/".join(parts[2:])
-    if explicit and not explicit.lower().endswith(".gguf"):
-        raise ValueError("explicit model path must end with .gguf")
-    if not explicit and (not colon or not quant):
-        raise ValueError("a quant is required for owner/repo:quant")
-    if colon and not re.fullmatch(r"[A-Za-z0-9_.-]+", quant):
-        raise ValueError("invalid quant")
-    data = metadata(cache, repo)
+    import gguf_source
+    from pushbutton_download import select_files
+    # Preserve the legacy folder guard's optional path:quant spelling.
+    if not spec.startswith("https://") or "/resolve/" not in spec:
+        if not spec.startswith("https://") or urllib.parse.urlsplit(spec).hostname in ("huggingface.co", "hf.co"):
+            spec = re.sub(r"^(?:https://)?(?:huggingface\.co|hf\.co)/", "", spec)
+            location, colon, suffix = spec.removeprefix("hf:").partition(":")
+            if colon and location.lower().endswith(".gguf"):
+                if not re.fullmatch(r"[A-Za-z0-9_.-]+", suffix) or not re.search(
+                        r"(?:^|[-.])" + re.escape(suffix) + r"(?:[.-]|$)", location, re.I):
+                    raise ValueError("explicit GGUF filename does not match requested quant")
+                spec = location
+    source = gguf_source.parse_source(spec)
+    if not source["repo"]:
+        resolved = gguf_source.resolve_files(spec)
+        directory = gguf_source.cache_directory(cache, resolved)
+        remaining = sum(item["size"] for item in resolved["files"]
+                        if not (directory / item["name"]).is_file()
+                        or (directory / item["name"]).stat().st_size != item["size"]
+                        or pathlib.Path(str(directory / item["name"]) + ".aria2").exists())
+        print(f"GGUF download: {resolved['weight_bytes'] / GIB:.2f} GiB total, "
+              f"{remaining / GIB:.2f} GiB remaining (complete cache files only).", file=sys.stderr)
+        return remaining
+    repo = source["repo"]
+    data = metadata(cache, repo, source["revision"])
     files = {}
     for entry in data["siblings"]:
         if not isinstance(entry, dict):
@@ -293,43 +308,17 @@ def download_remaining(spec, cache):
         if name in files:
             raise ValueError("duplicate filename in HF metadata")
         files[name] = entry
-    split_re = re.compile(r"^(.*)-(\d{5})-of-(\d{5})\.gguf$", re.I)
-
-    def group(name):
-        match = split_re.match(name)
-        return match.group(1) if match else name
-
-    def matches_quant(name):
-        stem = split_re.sub(r"\1", name)
-        stem = re.sub(r"\.gguf$", "", stem, flags=re.I)
-        # End anchoring avoids Q4 matching Q4_K_M, or Q4_K_M matching XL.
-        # UD quants are distinct from their non-UD counterpart.
-        match = re.search(r"(?:^|[./_-])(" + re.escape(quant) + r")$", stem, re.I)
-        if not match:
-            return False
-        prefix = stem[:match.start(1)]
-        return quant.upper().startswith("UD-") or not prefix.upper().endswith("UD-")
-
-    if explicit:
-        if explicit not in files:
-            raise ValueError("GGUF file not found: " + explicit)
-        selected = [n for n in files if group(n) == group(explicit)]
-        if quant and not matches_quant(explicit):
-            raise ValueError("explicit GGUF filename does not match requested quant")
-    else:
-        selected = [n for n in files if matches_quant(n)]
-        if not selected:
-            raise ValueError("no exact GGUF match for quant " + quant)
-        if len({group(n) for n in selected}) != 1:
-            raise ValueError("ambiguous GGUF quant; use owner/repo/path.gguf")
-    splits = [split_re.match(n) for n in selected]
-    if any(splits):
-        counts = {int(m.group(3)) for m in splits if m}
-        if len(counts) != 1 or not all(splits):
-            raise ValueError("inconsistent GGUF splits")
-        count = counts.pop()
-        if count != len(selected) or {int(m.group(2)) for m in splits} != set(range(1, count + 1)):
-            raise ValueError("incomplete GGUF split metadata")
+    try:
+        selected = [item["name"] for item in select_files(data, source["selector"])]
+    except ValueError as error:
+        message = str(error)
+        if "Ambiguous" in message:
+            message = message.replace("Ambiguous", "ambiguous")
+        elif "No GGUF files" in message:
+            message = "no exact GGUF match for quant " + source["selector"]
+        elif "Cannot confirm download size" in message:
+            message = message.replace("Cannot confirm download size", "unknown GGUF size")
+        raise ValueError(message) from error
     total = remaining = 0
     for name in selected:
         entry = files[name]
@@ -623,9 +612,9 @@ validate_download_space() {
     if [[ $# -ge 2 ]]; then
         cache="$1"
         spec="$2"
-        if [[ -n ${3:-} ]]; then
+        if [[ -n ${3:-} && ( "$spec" != https://* || "$spec" == https://huggingface.co/* && "$spec" != */resolve/* ) ]]; then
             location="${spec#https://}"
-            location="${location#http://}"
+            location="${location#hf:}"
             if [[ "$location" != *:* ]]; then
                 spec="$spec:$3"
             elif [[ "${spec##*:}" != "$3" ]]; then
