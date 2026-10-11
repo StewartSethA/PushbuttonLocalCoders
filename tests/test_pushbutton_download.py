@@ -7,6 +7,7 @@ import os
 import pathlib
 import shutil
 import socket
+import ssl
 import struct
 import subprocess
 import sys
@@ -217,6 +218,40 @@ def gguf_fixture(arch="llama", **extra):
 
 
 class SourceTests(unittest.TestCase):
+    def test_https_handler_uses_context_without_legacy_hostname_argument(self):
+        for context in (None, ssl.create_default_context()):
+            with self.subTest(context=context):
+                handler = source._PublicHTTPSHandler(context=context)
+                handler.__dict__.pop("_check_hostname", None)
+                request = source.urllib.request.Request("https://huggingface.co/")
+                with mock.patch.object(handler, "do_open") as do_open:
+                    self.assertIs(handler.https_open(request), do_open.return_value)
+                do_open.assert_called_once_with(
+                    source._PublicHTTPSConnection, request, context=handler._context)
+                connection = source._PublicHTTPSConnection(
+                    "huggingface.co", context=handler._context)
+                self.assertTrue(connection._context.check_hostname)
+                self.assertEqual(connection._context.verify_mode, ssl.CERT_REQUIRED)
+                if context is not None:
+                    self.assertIs(connection._context, context)
+
+    def test_https_connection_rejects_non_public_peer(self):
+        for address, public in (("8.8.8.8", True), ("127.0.0.1", False),
+                                ("10.0.0.1", False), ("::1", False)):
+            with self.subTest(address=address):
+                connection = source._PublicHTTPSConnection("huggingface.co")
+                connection.sock = mock.Mock()
+                connection.sock.getpeername.return_value = (address, 443)
+                with mock.patch.object(source.http.client.HTTPSConnection, "connect"), \
+                        mock.patch.object(connection, "close") as close:
+                    if public:
+                        connection.connect()
+                        close.assert_not_called()
+                    else:
+                        with self.assertRaisesRegex(ValueError, "non-public address"):
+                            connection.connect()
+                        close.assert_called_once_with()
+
     def response(self, data, status=200, **headers):
         response = io.BytesIO(data)
         response.status = status

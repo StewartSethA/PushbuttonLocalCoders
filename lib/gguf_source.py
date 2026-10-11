@@ -72,8 +72,7 @@ class _PublicHTTPSConnection(http.client.HTTPSConnection):
 
 class _PublicHTTPSHandler(urllib.request.HTTPSHandler):
     def https_open(self, req):
-        return self.do_open(_PublicHTTPSConnection, req, context=self._context,
-                            check_hostname=self._check_hostname)
+        return self.do_open(_PublicHTTPSConnection, req, context=self._context)
 
 
 def safe_open(request, timeout=30):
