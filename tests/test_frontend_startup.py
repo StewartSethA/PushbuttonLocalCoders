@@ -207,7 +207,8 @@ wait
         plan["servers"].append(second)
         self.plan.write_text(json.dumps(plan))
         config = self.root / "gateway.json"
-        config.write_text(json.dumps({"budget":{"client_context":131072,
+        config.write_text(json.dumps({"budget":{"capacity":150000,
+                                               "client_context":131072,
                                                "compact_window":100000,
                                                "max_output_tokens":512}}))
         result = self.run_functions("claude-local", ["run_claude"],
@@ -227,9 +228,10 @@ wait
 
     def test_silent_claude_failure_reports_status_in_red(self):
         config = self.root / "gateway.json"
-        config.write_text(json.dumps({"budget":{"client_context":7000,
-                                               "compact_window":4500,
-                                               "max_output_tokens":1024}}))
+        config.write_text(json.dumps({"budget":{"capacity":150000,
+                                               "client_context":120000,
+                                               "compact_window":100000,
+                                               "max_output_tokens":512}}))
         result = self.run_functions("claude-local",
             ["say", "good", "debug", "warn", "show_runtime_errors", "run_claude"],
             f'GATEWAY_CONFIG={shlex.quote(str(config))}\n'
