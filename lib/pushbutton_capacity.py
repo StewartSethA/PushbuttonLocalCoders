@@ -189,9 +189,9 @@ def kv_bytes_per_token(model, kv_k, kv_v):
 def memory_estimate(profile, capacity: dict) -> dict:
     """Weights + architecture-derived KV for every slot + runtime overhead.
 
-    Weights use the catalogued GGUF size when known. Otherwise the profile's
-    calibrated full-native-context envelope minus its own native KV share is
-    kept as the weights+runtime base, so only the KV term is re-derived.
+    Weights use the catalogued GGUF size when known, otherwise total parameters
+    and effective quantization bits (including block overhead). A full-context
+    profile envelope is not a weight measurement.
     """
     context = capacity["context"]
     if context > profile.native_context:
@@ -201,12 +201,18 @@ def memory_estimate(profile, capacity: dict) -> dict:
     tokens = context * capacity["slots"]
     per_token = kv_bytes_per_token(profile.model, k, v)
     native_per_token = kv_bytes_per_token(profile.model, profile.kv_k, profile.kv_v)
-    weights = catalog_weight_mib(profile.model, profile.quant)
-    native_kv = profile.native_context * native_per_token / 2**20 if per_token is not None else 0
-    if per_token is None or (weights is None
-                             and profile.required_mib - native_kv <= GPU_RUNTIME_OVERHEAD_MIB):
-        # No architecture data, or a single-slot envelope too small to contain its
-        # own architecture KV: keep the conservative envelope heuristic.
+    if getattr(profile, "attention_layers", None) is not None:
+        key_width = profile.kv_key_width if profile.kv_key_width is not None else profile.kv_width
+        value_width = profile.kv_value_width if profile.kv_value_width is not None else profile.kv_width
+        per_token = profile.attention_layers * (key_width * KV_TYPES[k] + value_width * KV_TYPES[v])
+        native_per_token = profile.attention_layers * (
+            key_width * KV_TYPES[profile.kv_k] + value_width * KV_TYPES[profile.kv_v])
+    weights = getattr(profile, "weight_mib", None)
+    resolved_weights = weights is not None
+    if weights is None:
+        weights = catalog_weight_mib(profile.model, profile.quant)
+    if per_token is None:
+        # No architecture data: keep the conservative envelope heuristic.
         ratio = max(1.0, KV_TYPES[k] / KV_TYPES[profile.kv_k], KV_TYPES[v] / KV_TYPES[profile.kv_v])
         scale = tokens / profile.native_context * ratio
         required = math.ceil(profile.required_mib * (0.85 + 0.15 * scale))
@@ -216,11 +222,16 @@ def memory_estimate(profile, capacity: dict) -> dict:
                 "note": "No usable architecture data; validate actual allocation at startup."}
     kv_mib = tokens * per_token / 2**20
     overhead_mib = GPU_RUNTIME_OVERHEAD_MIB
+    if getattr(profile, "attention_layers", None) == 0 or any(
+            "recurrent" in note.lower() for note in getattr(profile, "architecture_notes", ())):
+        overhead_mib *= capacity["slots"]
     if weights is not None:
-        weights_mib, source = weights, "catalog"
-        overhead_mib += weights * (WEIGHT_MARGIN - 1)
+        weights_mib, source = weights, "gguf-metadata" if resolved_weights else "catalog"
     else:
-        weights_mib, source = profile.required_mib - native_kv - overhead_mib, "profile-envelope"
+        import cpu_platform
+        weights_mib = cpu_platform.weight_gib(profile.model, profile.quant) * 1024
+        source = "parameters-effective-bpw"
+    overhead_mib += weights_mib * (WEIGHT_MARGIN - 1)
     base_mib = weights_mib + overhead_mib
     required = math.ceil(base_mib + kv_mib)
     return {"status": "ESTIMATED", "method": "weights + architecture KV x context x slots + runtime overhead",
@@ -229,5 +240,7 @@ def memory_estimate(profile, capacity: dict) -> dict:
             "kv_mib": math.ceil(kv_mib), "kv_bytes_per_token": per_token,
             "overhead_mib": math.ceil(overhead_mib), "context_tokens_total": tokens,
             "kv_k": k, "kv_v": v,
-            "kv_precision_multiplier": round(per_token / native_per_token, 4),
+            "architecture_source": getattr(profile, "architecture_source", "") or "planning-table",
+            "architecture_notes": list(getattr(profile, "architecture_notes", ())),
+            "kv_precision_multiplier": round(per_token / native_per_token, 4) if native_per_token else 1.0,
             "note": "Planning architecture assumptions; validate actual allocation at startup."}

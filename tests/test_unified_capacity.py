@@ -7,6 +7,7 @@ import sys
 import tempfile
 import types
 import unittest
+from dataclasses import replace
 from unittest.mock import patch
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -18,6 +19,76 @@ loader.exec_module(runtime)
 
 
 class UnifiedCapacityTests(unittest.TestCase):
+    def test_short_native_custom_runtime_defaults_and_explicit_context_validation(self):
+        source = "TestOrg/ShortNative-GGUF:Q4_K_M"
+        with self.custom_source(source), patch.dict(runtime.plan.PROFILES, {source: (
+                replace(runtime.plan.PROFILES[source][0], native_context=32768),)}), patch.object(sys.stdin, "isatty", return_value=False):
+            cfg = runtime.configure({}, self.args(model=source, context=None))
+            self.assertEqual(cfg["context"], 32768)
+            for options in ({"context": 65536}, {"client_context": "65536"}):
+                with self.assertRaises((ValueError, SystemExit)):
+                    runtime.configure({}, self.args(model=source, **options))
+
+    def test_small_model_alias_registers_before_runtime_configuration(self):
+        preset = "qwen3.5:9b"
+        with patch.dict(runtime.plan.ALIASES, {"small-test": preset, preset: preset}), patch.object(runtime.plan, "canonical_model", return_value=preset) as canonical:
+            self.assertEqual(runtime.canon("SMALL-TEST"), preset)
+        canonical.assert_called_once_with(preset)
+
+    def test_canon_registers_custom_profile_from_metadata_without_lowercasing(self):
+        import gguf_source
+        source = "ExampleOrg/CaseSensitive-GGUF:Q4_K_M"
+        metadata = {"repo": "ExampleOrg/CaseSensitive-GGUF", "quant": "Q4_K_M",
+                    "context": 131072, "download_spec": source, "weight_bytes": 2**30,
+                    "attn_layers": 32, "kv_dim": 1024}
+        with patch.dict(runtime.plan.PROFILES), patch.object(gguf_source, "resolve_source", return_value=metadata) as resolve:
+            self.assertEqual(runtime.canon(source), source)
+            profile = runtime.plan.PROFILES[source][0]
+            self.assertEqual(profile.hf_spec, source)
+            self.assertEqual(profile.native_context, 131072)
+            resolve.assert_called_once_with(source)
+
+    @contextlib.contextmanager
+    def custom_source(self, source):
+        profile = replace(runtime.plan.PROFILES["qwen3.8:27b"][3], model=source, source_spec=source, required_mib=4096)
+        original = runtime.plan.canonical_model
+        def canonical(text):
+            return text if text == source else original(text)
+        module = types.SimpleNamespace(is_source=lambda text: text == source)
+        with patch.dict(sys.modules, {"gguf_source": module}), patch.dict(runtime.plan.PROFILES, {source: (profile,)}), patch.object(runtime.plan, "canonical_model", side_effect=canonical):
+            yield profile
+
+    def test_custom_source_preserves_case_and_capacity_settings(self):
+        source = "hf:ExampleOrg/CaseSensitive-GGUF/Model-Q4_K_M.gguf"
+        with self.custom_source(source), patch.object(sys.stdin, "isatty", return_value=False):
+            cfg = runtime.configure({}, self.args(model=source + "@slots=3,context=32768", slots="2"))
+            req = runtime.worker_plan.parse_model_spec(cfg["model_spec"], cfg["models"])
+            self.assertEqual(cfg["model"], source)
+            self.assertEqual(req.model, source)
+            self.assertEqual(req.capacity["slots"], 3)
+            self.assertEqual(req.capacity["context"], 32768)
+            self.assertEqual(runtime.hf_spec(source, runtime.plan.PROFILES[source][0].quant), source)
+            with self.assertRaises(ValueError):
+                runtime.configure({}, self.args(model=source + "@unknown=3"))
+
+    def test_custom_commission_uses_safe_alias_and_never_native_backend(self):
+        source = "https://example.com/CaseSensitive/Model-Q4_K_M.gguf"
+        proc = types.SimpleNamespace(pid=123)
+        with self.custom_source(source) as profile, tempfile.TemporaryDirectory(dir=ROOT) as td, patch.object(runtime, "STATE", pathlib.Path(td)), patch.object(runtime, "free_port", return_value=20880), patch.object(runtime, "start_detached", return_value=proc) as start, patch.object(runtime, "wait_endpoint", return_value=True), patch.object(runtime, "served_model", side_effect=lambda endpoint, alias: alias), patch.object(runtime.registry_store, "append_instance"):
+            row = {"backend": "llama.cpp", "artifact": profile.quant, "gpu": None}
+            instance = runtime.commission(source, 32768, row)
+            cmd, log, _ = start.call_args.args
+            alias = cmd[cmd.index("--alias") + 1]
+            self.assertEqual(cmd[cmd.index("--hf-spec") + 1], source)
+            self.assertRegex(alias, r"^gguf-[0-9a-f]{16}$")
+            self.assertEqual(log.parent, pathlib.Path(td) / "logs")
+            self.assertEqual(instance["model"], source)
+            self.assertEqual(instance["served_model"], alias)
+            self.assertIn(source, instance["aliases"])
+            self.assertNotIn("/", instance["id"])
+            with self.assertRaises(ValueError):
+                runtime.commission(source, 32768, {**row, "backend": "vllm-qwen38-3090"})
+
     def test_standalone_bits_reaches_planner_before_or_after_model(self):
         for args in (["bits=3", "q38"], ["q38", "bits=3"], ["q38", "--bits", "3"]):
             with self.subTest(args=args), patch.object(sys, "argv", ["pushbutton", *args, "--plan-only"]), patch.object(sys.stdin, "isatty", return_value=False), patch.object(runtime, "read_json", return_value={}), patch.object(runtime, "capacity_candidate", return_value=({"workers": []}, {})) as candidate, patch("builtins.print"):
@@ -126,6 +197,37 @@ class UnifiedCapacityTests(unittest.TestCase):
         self.assertIn("--no-context-shift", command)
         self.assertEqual(command[command.index("-c") + 1], "12288")
         self.assertEqual(command[command.index("--parallel") + 1], "3")
+
+    def test_instance_downloads_extended_sources_before_launching_local_file(self):
+        loader = importlib.machinery.SourceFileLoader("instance_sources", str(ROOT / "pushbutton-instance"))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        instance = importlib.util.module_from_spec(spec)
+        loader.exec_module(instance)
+        sources = [
+            "hf:ExampleOrg/Model-GGUF:Q4_K_M",
+            "ExampleOrg/Model-GGUF/CaseSensitive-Q4_K_M.gguf",
+            "ExampleOrg/Model-GGUF:CaseSensitive-Q4_K_M.gguf",
+            "https://example.com/models/CaseSensitive-Q4_K_M.gguf",
+        ]
+        local = ROOT / ".git" / "pushbutton-test-fixtures" / "Model-Q4_K_M.gguf"
+        for source in sources:
+            argv = ["pushbutton-instance", "--hf-spec", source, "--alias", "model",
+                    "--port", "1234", "--context", "4096", "--slots", "3"]
+            with self.subTest(source=source), patch.object(instance.subprocess, "check_output", return_value=str(local) + "\n") as download, patch.dict(instance.os.environ, {"LLAMA_CACHE": str(local.parent)}), patch.object(sys, "argv", argv), patch.object(instance, "ensure_server", return_value=ROOT / "llama-server"), patch.object(instance, "cpu_mode", return_value=False), patch.object(instance.os, "execvpe") as execute:
+                instance.main()
+            download.assert_called_once()
+            self.assertEqual(download.call_args.args[0][-2:], [source, str(local.parent)])
+            self.assertEqual(download.call_args.args[0][2], 'source "$1" && download_model_fast "$2" "$3" model_path && printf "%s\\n" "$model_path"')
+            command = execute.call_args.args[1]
+            self.assertEqual(command[command.index("-m") + 1], str(local))
+            self.assertNotIn("-hf", command)
+            self.assertNotIn("--trust-remote-code", command)
+            self.assertEqual(command[command.index("-c") + 1], "12288")
+        self.assertEqual(instance.model_args("ExampleOrg/Model-GGUF:Q4_K_M", str(local.parent)),
+                         ["-hf", "ExampleOrg/Model-GGUF:Q4_K_M"])
+        with patch.object(instance.subprocess, "check_output", side_effect=runtime.subprocess.CalledProcessError(1, "download")):
+            with self.assertRaises(runtime.subprocess.CalledProcessError):
+                instance.model_args("https://example.com/model.gguf", str(local.parent))
 
     def test_actual_vram_lease_rejects_overallocation(self):
         with patch.object(runtime.subprocess, "check_output", side_effect=["0, GPU-A\n1, GPU-B\n", "123, GPU-A, 17000\n123, GPU-B, 15000\n"]):

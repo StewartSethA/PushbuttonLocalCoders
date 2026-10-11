@@ -2,6 +2,7 @@ import math
 import pathlib
 import sys
 import unittest
+from unittest.mock import patch
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
@@ -11,6 +12,68 @@ import coder_local_plan as coder
 
 
 class CapacityBudgetTests(unittest.TestCase):
+    def test_six_small_presets_resolve_metadata_without_guessed_sizes(self):
+        self.assertEqual(len(base.SMALL_MODELS), 6)
+        for model, preset in base.SMALL_MODELS.items():
+            metadata = dict(repo=preset["repo"], quant="Q4_K_M", context=131072,
+                            download_spec=preset["repo"] + ":Q4_K_M",
+                            weight_bytes=4 * 2**30, attn_layers=8, kv_dim=512)
+            with self.subTest(model=model), patch("gguf_source.resolve_source", return_value=metadata) as resolve:
+                try:
+                    request = coder.parse_model_spec(model + "@slots=2,bits=4")
+                    self.assertEqual(request.model, model)
+                    resolve.assert_called_once_with(preset["repo"] + ":Q4_K_M")
+                    profile = base.PROFILES[model][0]
+                    self.assertEqual(profile.weight_mib, 4096)
+                    self.assertEqual(profile.template, "embedded")
+                    self.assertEqual(coder.resolve_request_options(request, 262144)["context"], 131072)
+                finally:
+                    base.PROFILES.pop(model, None)
+
+    def test_source_kv_distinguishes_key_value_width_and_precision(self):
+        from dataclasses import replace
+        profile = replace(base.PROFILES["qwen3.8:27b"][3],
+                          weight_mib=2048, attention_layers=4, kv_width=384,
+                          kv_key_width=256, kv_value_width=512)
+        settings = capacity.resolve_options(
+            {"context": 32768, "kv_k": "q4_0", "kv_v": "f16"}, 262144)
+        estimate = capacity.memory_estimate(profile, settings)
+        expected = 4 * (256 * capacity.KV_TYPES["q4_0"] + 512 * capacity.KV_TYPES["f16"])
+        self.assertEqual(estimate["kv_bytes_per_token"], expected)
+
+    def test_recurrent_source_keeps_per_slot_runtime_budget(self):
+        from dataclasses import replace
+        profile = replace(base.PROFILES["qwen3.8:27b"][3],
+                          weight_mib=2048, attention_layers=0, kv_width=0)
+        one = capacity.memory_estimate(profile, capacity.resolve_options({}, 32768))
+        four = capacity.memory_estimate(profile, capacity.resolve_options({"slots": 4}, 32768))
+        self.assertEqual(four["kv_mib"], 0)
+        self.assertEqual(four["required_mib"] - one["required_mib"], 3 * capacity.GPU_RUNTIME_OVERHEAD_MIB)
+
+    def test_custom_source_registers_actual_weights_and_safe_instance_ids(self):
+        source = "hf:Example/Small-GGUF:Q4_K_M"
+        metadata = dict(repo="Example/Small-GGUF", quant="Q4_K_M", context=32768,
+                        download_spec=source, weight_bytes=3 * 2**30,
+                        attn_layers=24, kv_dim=256)
+        with patch("gguf_source.resolve_source", return_value=metadata):
+            try:
+                request = coder.parse_model_spec(source + "@gpu=0,slots=2")
+                result = base.plan([source + "@gpu=0,slots=2"], coder.synthetic_3090(1), 262144)
+                server = result["servers"][0]
+                self.assertEqual(server["profile"]["hf_spec"], source)
+                self.assertEqual(server["capacity"]["context"], 32768)
+                self.assertRegex(server["id"], r"^local-gguf-[a-f0-9]{16}$")
+                estimate = server["capacity"]["memory_estimate"]
+                self.assertEqual(estimate["weights_mib"], 3072)
+                self.assertEqual(estimate["weights_source"], "gguf-metadata")
+                self.assertEqual(estimate["kv_mib"], 432)
+                with self.assertRaisesRegex(ValueError, "native context"):
+                    coder.candidates_for_request(
+                        coder.parse_model_spec(source + "@context=65536"),
+                        coder.synthetic_3090(1), 262144)
+            finally:
+                base.PROFILES.pop(source, None)
+
     def test_bits_validation_and_quant_names(self):
         for bits in (1, 2, 3, 4, 5, 6, 8, 16):
             self.assertEqual(capacity.parse_options({"bits": str(bits)})["bits"], bits)
@@ -118,7 +181,7 @@ class CapacityBudgetTests(unittest.TestCase):
         two = capacity.memory_estimate(profile, capacity.resolve_options({"slots": 2}, 262144))
         high_precision = capacity.memory_estimate(
             profile, capacity.resolve_options({"kv_k": "f16", "kv_v": "q8_0"}, 262144))
-        self.assertEqual(one["required_mib"], profile.required_mib)
+        self.assertEqual(one["weights_source"], "parameters-effective-bpw")
         self.assertGreater(two["required_mib"], one["required_mib"])
         self.assertGreater(high_precision["required_mib"], two["required_mib"])
         self.assertEqual(two["context_tokens_total"], 524288)
@@ -141,8 +204,32 @@ class CapacityBudgetTests(unittest.TestCase):
         self.assertGreater(q8["required_mib"], one["required_mib"])
         q38 = base.PROFILES["qwen3.8:27b"][0]
         lowered = capacity.memory_estimate(q38, capacity.resolve_options({"context": 65536}, 262144))
-        self.assertEqual(lowered["weights_source"], "profile-envelope")
+        self.assertEqual(lowered["weights_source"], "parameters-effective-bpw")
         self.assertLess(lowered["required_mib"], q38.required_mib)
+
+    def test_uncatalogued_weights_use_effective_bits_not_envelope(self):
+        import cpu_platform
+        profile = base.PROFILES["qwen3.8:27b"][3]
+        settings = capacity.resolve_options({"slots": 4}, 262144)
+        estimate = capacity.memory_estimate(profile, settings)
+        expected = 27e9 * 4.85 / 8 / 2**20
+        self.assertEqual(estimate["weights_mib"], math.ceil(expected))
+        self.assertEqual(estimate["kv_mib"], 18 * 1024)
+        self.assertEqual(estimate["required_mib"],
+                         math.ceil(expected * capacity.WEIGHT_MARGIN + 18 * 1024 + 1536))
+        with patch.dict(cpu_platform.MODEL_ARCH, {
+                profile.model: {**cpu_platform.MODEL_ARCH[profile.model], "active_b": 1}}):
+            self.assertEqual(capacity.memory_estimate(profile, settings), estimate)
+        from dataclasses import replace
+        self.assertEqual(capacity.memory_estimate(
+            replace(profile, required_mib=100 * 1024), settings), estimate)
+
+    def test_four_slot_q4_fit_uses_total_memory_not_just_weights(self):
+        gpu = base.GPU(2, "32 GB GPU", 32768, int(31.3 * 1024))
+        with self.assertRaisesRegex(ValueError, "parameters-effective-bpw"):
+            base.plan(["q38@gpu=2,slots=4,bits=4"], [gpu], 262144)
+        result = base.plan(["q38@gpu=2,slots=4,bits=4,context=131072"], [gpu], 262144)
+        self.assertEqual(result["servers"][0]["profile"]["quant"], "UD-Q4_K_M")
 
     def test_unplaceable_pinned_models_report_requirement_breakdown(self):
         free = [31.3, 26.7, 27.0, 27.2, 19.5, 19.3, 25.6, 27.0]
@@ -181,8 +268,10 @@ class InstanceCapacityTests(unittest.TestCase):
         model = "qwen3.8-flash-next"
         profiles = [p for p in base.PROFILES[model] if capacity.quant_bits(p.quant) == 4]
         self.assertGreater(len(profiles), 1)
+        required = capacity.memory_estimate(
+            profiles[-1], capacity.resolve_options({}, 262144))["required_mib"]
         profile, _ = base.best_profile_for_capacity(
-            model, profiles[-1].required_mib, 262144, {"bits": 4})
+            model, required, 262144, {"bits": 4})
         self.assertEqual(profile.quant, profiles[-1].quant)
 
     def test_bits_rejects_unavailable_and_conflicting_quants(self):

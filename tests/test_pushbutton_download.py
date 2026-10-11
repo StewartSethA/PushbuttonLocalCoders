@@ -6,6 +6,8 @@ import json
 import os
 import pathlib
 import shutil
+import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -16,6 +18,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location("pushbutton_download", ROOT / "lib/pushbutton_download.py")
 download = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(download)
+source = download.gguf_source
+tempfile.tempdir = str(ROOT)
 REVISION = "a" * 40
 METADATA = {"sha": REVISION, "siblings": [
     {"rfilename": "Qwen-UD-Q4_K_XL-00001-of-00002.gguf", "size": 32},
@@ -103,7 +107,7 @@ class MetadataTests(unittest.TestCase):
             work = pathlib.Path(tmp) / "work"
             work.mkdir()
             output = io.StringIO()
-            with mock.patch.object(download.urllib.request, "urlopen",
+            with mock.patch.object(source, "safe_open",
                                    return_value=io.BytesIO(json.dumps(METADATA).encode())), \
                     contextlib.redirect_stderr(output):
                 manifest = download.prepare("owner/repo:UD-Q4_K_XL", tmp, str(work))
@@ -156,7 +160,7 @@ class MetadataTests(unittest.TestCase):
         metadata = {"sha": REVISION, "siblings": [
             {"rfilename": "Q4_K.gguf", "size": 16, "lfs": {"sha256": "b" * 64}}]}
         with tempfile.TemporaryDirectory() as tmp, \
-                mock.patch.object(download.urllib.request, "urlopen",
+                mock.patch.object(source, "safe_open",
                                   return_value=io.BytesIO(json.dumps(metadata).encode())), \
                 contextlib.redirect_stderr(io.StringIO()):
             download.prepare("owner/repo:Q4_K", tmp, tmp)
@@ -174,7 +178,7 @@ class MetadataTests(unittest.TestCase):
                 if custom:
                     env["HF_TOKEN_PATH"] = "$XDG_CACHE_HOME/huggingface/token"
                 with mock.patch.dict(os.environ, env, clear=True), \
-                        mock.patch.object(download.urllib.request, "urlopen",
+                        mock.patch.object(source, "safe_open",
                                           return_value=io.BytesIO(json.dumps(METADATA).encode())) as api, \
                         contextlib.redirect_stderr(io.StringIO()):
                     download.prepare("owner/repo:UD-Q4_K_XL", tmp, tmp)
@@ -194,6 +198,271 @@ class MetadataTests(unittest.TestCase):
                 download.reuse_blobs(directory, [{"name": "escape/model.gguf", "size": 16}])
 
 
+def gguf_fixture(arch="llama", **extra):
+    metadata = {"general.architecture": arch, arch + ".context_length": 32768,
+                arch + ".block_count": 32, arch + ".embedding_length": 4096,
+                arch + ".attention.head_count": 32, arch + ".attention.head_count_kv": 8,
+                **extra}
+
+    def string(value):
+        encoded = value.encode()
+        return struct.pack("<Q", len(encoded)) + encoded
+
+    data = b"GGUF" + struct.pack("<IQQ", 3, 0, len(metadata))
+    for key, value in metadata.items():
+        data += string(key)
+        data += struct.pack("<I", 8 if isinstance(value, str) else 4)
+        data += string(value) if isinstance(value, str) else struct.pack("<I", value)
+    return data
+
+
+class SourceTests(unittest.TestCase):
+    def response(self, data, status=200, **headers):
+        response = io.BytesIO(data)
+        response.status = status
+        response.headers = {"Content-Length": str(len(data)), **headers}
+        return response
+
+    def test_supported_syntax_and_pinned_shards(self):
+        for spec in ("hf:owner/repo:Q4_K_M", "owner/repo:Q4_K_M",
+                     "owner/repo/Qwen-Q4_K_M.gguf",
+                     f"https://huggingface.co/owner/repo/resolve/{REVISION}/Qwen-Q4_K_M.gguf",
+                     "https://models.example/model.gguf"):
+            self.assertTrue(source.is_source(spec), spec)
+        with mock.patch.object(source, "fetch_metadata", return_value=METADATA) as api:
+            result = source.resolve_files(
+                f"https://huggingface.co/owner/repo/resolve/{REVISION}/"
+                + METADATA["siblings"][0]["rfilename"])
+        self.assertEqual(result["weight_bytes"], 80)
+        self.assertEqual(len(result["files"]), 2)
+        api.assert_called_once_with("owner/repo", REVISION)
+        self.assertIn(REVISION, result["download_spec"])
+
+    def test_unsafe_sources(self):
+        for spec in ("http://example.com/a.gguf", "https://localhost/a.gguf",
+                     "https://127.0.0.1/a.gguf", "https://[::1]/a.gguf",
+                     "https://169.254.169.254/a.gguf", "******example.com/a.gguf",
+                     "https://example.com/a.gguf?token=secret", "https://example.com/a.gguf\n",
+                     "owner/repo/../a.gguf", "hf:owner/repo:Q4\n"):
+            self.assertFalse(source.is_source(spec), spec)
+        with mock.patch.object(source.socket, "getaddrinfo",
+                               return_value=[(2, 1, 6, "", ("10.0.0.5", 443))]):
+            with self.assertRaisesRegex(ValueError, "non-public"):
+                source.validate_url("https://models.example/a.gguf")
+
+    def test_redirect_revalidates_and_strips_token(self):
+        handler = source._SafeRedirect()
+        req = download.urllib.request.Request(
+            "https://huggingface.co/owner/repo/resolve/main/a.gguf",
+            headers={"Authorization": "******"})
+        with mock.patch.object(source, "validate_url") as validate:
+            redirect = handler.redirect_request(req, None, 302, "Found", {},
+                                                "https://cdn.example/a.gguf?Signature=abc")
+        validate.assert_called_once()
+        self.assertIsNone(redirect.get_header("Authorization"))
+        with mock.patch.object(source.socket, "getaddrinfo",
+                               return_value=[(2, 1, 6, "", ("127.0.0.1", 443))]):
+            with self.assertRaises(ValueError):
+                handler.redirect_request(req, None, 302, "Found", {},
+                                         "https://private.example/a.gguf")
+
+    def test_actual_weight_and_unequal_kv(self):
+        data = gguf_fixture(**{"llama.attention.key_length": 128,
+                               "llama.attention.value_length": 64})
+        with mock.patch.object(source, "fetch_metadata", return_value={
+                "sha": REVISION, "siblings": [{"rfilename": "model-Q4_K_M.gguf", "size": len(data)}]}), \
+                mock.patch.object(source, "safe_open", side_effect=lambda *a, **k: self.response(data)):
+            result = source.resolve_source("owner/repo:Q4_K_M")
+        self.assertEqual(result["weight_bytes"], len(data))
+        self.assertEqual(result["context"], 32768)
+        self.assertEqual(result["kv_dim"], 768)
+        self.assertEqual(result["kv_key_dim"], 1024)
+        self.assertEqual(result["kv_value_dim"], 512)
+        self.assertEqual(result["quant"], "Q4_K_M")
+
+    def test_hybrid_and_unsupported_architecture(self):
+        data = gguf_fixture("qwen35", **{"qwen35.full_attention_interval": 4,
+                                       "qwen35.attention.key_length": 256,
+                                       "qwen35.attention.value_length": 256})
+        result = source.architecture(source.read_gguf_metadata(data))
+        self.assertEqual(result["attn_layers"], 8)
+        for metadata in ({"general.architecture": "unknown"},
+                         source.read_gguf_metadata(gguf_fixture("qwen35")),
+                         {"general.architecture": "llama"}):
+            with self.assertRaises(ValueError):
+                source.architecture(metadata)
+        with self.assertRaises(ValueError):
+            source.read_gguf_metadata(b"not a GGUF")
+
+    def test_public_url_size_and_cache_identity(self):
+        data = gguf_fixture()
+        with mock.patch.object(source, "validate_url"), \
+                mock.patch.object(source, "safe_open", side_effect=lambda *a, **k: self.response(
+                    data[:1], 206, **{"Content-Range": f"bytes 0-0/{len(data)}", "ETag": '"one"'})):
+            result = source.resolve_files("https://models.example/a.gguf")
+        self.assertEqual(result["weight_bytes"], len(data))
+        self.assertIsNone(result["repo"])
+        self.assertEqual(len(result["revision"]), 64)
+
+    def test_resumable_safe_download_and_no_token_to_public_url(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "model.gguf"
+            partial = pathlib.Path(str(path) + ".part")
+            partial.write_bytes(b"abc")
+            manifest = {"directory": tmp, "repo": None, "files": [
+                {"name": path.name, "size": 6, "url": "https://models.example/model.gguf",
+                 "etag": '"stable"'}]}
+            with mock.patch.object(source, "safe_open", return_value=self.response(
+                    b"def", 206, **{"Content-Range": "bytes 3-5/6"})) as api, \
+                    mock.patch.dict(os.environ, {"HF_TOKEN": "example-token"}):
+                download.download_safe(manifest)
+            self.assertEqual(path.read_bytes(), b"abcdef")
+            self.assertEqual(api.call_args.args[0].get_header("Range"), "bytes=3-")
+            self.assertIsNone(api.call_args.args[0].get_header("Authorization"))
+            self.assertFalse(partial.exists())
+
+    def test_bounded_prefix_local_cache_and_missing_metadata(self):
+        data = gguf_fixture()
+        metadata = {"sha": REVISION, "siblings": [
+            {"rfilename": "model-Q4_K_M.gguf", "size": len(data)}]}
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = pathlib.Path(tmp) / "models--owner--repo" / REVISION
+            directory.mkdir(parents=True)
+            (directory / "model-Q4_K_M.gguf").write_bytes(data)
+            with mock.patch.dict(os.environ, {"PUSHBUTTON_LOCAL_CACHE": tmp}), \
+                    mock.patch.object(source, "fetch_metadata", return_value=metadata), \
+                    mock.patch.object(source, "safe_open", side_effect=AssertionError("network")):
+                self.assertEqual(source.resolve_source("owner/repo:Q4_K_M")["context"], 32768)
+        with mock.patch.object(source, "fetch_metadata", return_value=metadata), \
+                mock.patch.object(source, "safe_open", side_effect=lambda *a, **k: self.response(
+                    data[:24], **{"Content-Length": str(len(data))})):
+            with self.assertRaisesRegex(ValueError, "bounded"):
+                source.resolve_source("owner/repo:Q4_K_M")
+
+    def test_pinned_revision_mismatch_and_exact_path(self):
+        with mock.patch.object(source, "fetch_metadata", return_value=METADATA):
+            with self.assertRaisesRegex(ValueError, "pinned revision"):
+                source.resolve_files("https://huggingface.co/owner/repo/resolve/"
+                                     + "b" * 40 + "/Qwen-Q4_K_M.gguf")
+        metadata = {"siblings": [{"rfilename": "one/model-Q4.gguf", "size": 16},
+                                  {"rfilename": "two/model-Q4.gguf", "size": 16}]}
+        self.assertEqual(download.select_files(metadata, "one/model-Q4.gguf"),
+                         [{"name": "one/model-Q4.gguf", "size": 16, "sha256": None}])
+
+    def test_public_download_wrapper_returns_local_path(self):
+        data = gguf_fixture()
+        resolved = {"repo": None, "revision": "a" * 64, "files": [
+            {"name": "model.gguf", "size": len(data), "url": "https://models.example/model.gguf"}]}
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(source, "resolve_files", return_value=resolved), \
+                mock.patch.object(source, "safe_open", side_effect=lambda *a, **k: self.response(data)):
+            path = source.download("https://models.example/model.gguf", cache_dir=tmp)
+            self.assertIsInstance(path, pathlib.Path)
+            self.assertEqual(path.read_bytes(), data)
+
+    def test_default_quant_and_recurrent_zero_kv(self):
+        self.assertEqual(source.parse_source("hf:owner/repo")["selector"], "Q4_K_M")
+        with mock.patch.object(source, "fetch_metadata", return_value=METADATA):
+            self.assertEqual(source.resolve_files("owner/repo")["files"][0]["name"],
+                             "Qwen-Q4_K_M.gguf")
+        for arch in ("mamba", "mamba2", "rwkv6", "rwkv7"):
+            result = source.architecture(source.read_gguf_metadata(gguf_fixture(arch)))
+            self.assertEqual(result["attn_layers"], 0)
+            self.assertEqual(result["kv_dim"], 0)
+            self.assertEqual(result["context"], 32768)
+
+    def test_hybrid_per_layer_attention_metadata(self):
+        metadata = {"general.architecture": "granitehybrid",
+                    "granitehybrid.context_length": 131072,
+                    "granitehybrid.block_count": 4,
+                    "granitehybrid.embedding_length": 4096,
+                    "granitehybrid.attention.head_count": 32,
+                    "granitehybrid.attention.head_count_kv": [0, 8, 0, 8],
+                    "granitehybrid.attention.key_length": 128,
+                    "granitehybrid.attention.value_length": 128}
+        result = source.architecture(metadata)
+        self.assertEqual(result["attn_layers"], 2)
+        self.assertEqual(result["kv_dim"], 1024)
+        metadata["granitehybrid.attention.head_count_kv"] = 8
+        with self.assertRaisesRegex(ValueError, "layout"):
+            source.architecture(metadata)
+
+    def test_verified_dense_granite_and_mellum_metadata(self):
+        for arch in ("granite", "mellum"):
+            metadata = source.read_gguf_metadata(gguf_fixture(arch))
+            result = source.architecture(metadata)
+            self.assertEqual(result["attn_layers"], 32)
+            self.assertEqual(result["kv_key_dim"], 1024)
+            self.assertEqual(result["kv_value_dim"], 1024)
+            if arch == "mellum":
+                self.assertIn("full-context", result["architecture_notes"][0])
+                metadata[arch + ".attention.head_count_kv"] = [8] * 32
+                with self.assertRaises(ValueError):
+                    source.architecture(metadata)
+
+    def test_extended_hf_syntax_requires_safe_transport_without_token(self):
+        for spec in ("hf:owner/repo:Q4_K_M", "owner/repo/Qwen-Q4_K_M.gguf",
+                     f"https://huggingface.co/owner/repo/resolve/{REVISION}/Qwen-Q4_K_M.gguf"):
+            with self.subTest(spec=spec), tempfile.TemporaryDirectory() as tmp, \
+                    mock.patch.object(source, "fetch_metadata", return_value=METADATA), \
+                    mock.patch.object(source, "hf_headers", return_value={}), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                self.assertTrue(download.prepare(spec, tmp, tmp)["safe_download"])
+
+    def test_exact_filename_quant_families(self):
+        data = gguf_fixture()
+        for quant in ("Q4_K_M", "MXFP4", "NVFP4"):
+            name = "model_" + quant + ".gguf"
+            with self.subTest(quant=quant), \
+                    mock.patch.object(source, "fetch_metadata", return_value={
+                        "sha": REVISION, "siblings": [{"rfilename": name, "size": len(data)}]}), \
+                    mock.patch.object(source, "safe_open", side_effect=lambda *a, **k: self.response(data)):
+                self.assertEqual(source.resolve_source("owner/repo/" + name)["quant"], quant)
+
+    def test_safe_partial_space_credit_requires_stable_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            partial = pathlib.Path(tmp) / "model.gguf.part"
+            partial.write_bytes(b"x" * 4096)
+            size = 8192
+            allocated = min(size, partial.stat().st_blocks * 512)
+            manifest = {"directory": tmp, "repo": "owner/repo",
+                        "files": [{"name": "model.gguf", "size": size}]}
+            disk = shutil._ntuple_diskusage(100 * 1024**3, 0, 10 * 1024**3 + size - allocated)
+            with mock.patch.object(download.shutil, "disk_usage", return_value=disk):
+                download.validate_space(manifest)
+                manifest["repo"] = None
+                with self.assertRaises(ValueError):
+                    download.validate_space(manifest)
+                manifest["files"][0]["etag"] = '"stable"'
+                download.validate_space(manifest)
+
+    def test_folder_model_and_plan_guards_credit_safe_partial(self):
+        text = (ROOT / "lib/pushbutton_folders.sh").read_text().split("<<'PY'\n", 1)[1].split("\nPY", 1)[0]
+        namespace = {"__name__": "folder_test"}
+        with mock.patch.dict(os.environ, {"PUSHBUTTON_FOLDER_LIB": str(ROOT / "lib")}), \
+                mock.patch.object(sys, "argv", ["-", "no-action"]), \
+                mock.patch("builtins.print"), \
+                mock.patch("sys.exit"):
+            # Load functions without dispatching the embedded command handler.
+            text = text.split("\ntry:\n", 1)[0]
+            exec(compile(text, "<folder-guard>", "exec"), namespace)
+        with tempfile.TemporaryDirectory() as tmp:
+            name = "model-Q4_K_M.gguf"
+            directory = pathlib.Path(tmp) / "models--owner--repo" / REVISION
+            directory.mkdir(parents=True)
+            partial = directory / (name + ".part")
+            partial.write_bytes(b"x" * 4096)
+            metadata = {"sha": REVISION, "siblings": [{"rfilename": name, "size": 8192}]}
+            namespace["metadata"] = lambda *args: metadata
+            expected = 8192 - min(8192, partial.stat().st_blocks * 512)
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(namespace["download_remaining"]("owner/repo:Q4_K_M", tmp), expected)
+                plan = pathlib.Path(tmp) / "plan.json"
+                plan.write_text(json.dumps({"servers": [{"hf_spec": "owner/repo:Q4_K_M"}]}))
+                self.assertEqual(namespace["plan_download_required"](str(plan), tmp),
+                                 expected + 10 * 1024**3)
+
+
 class ShellTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -209,8 +478,25 @@ class ShellTests(unittest.TestCase):
                     "TEST_METADATA": str(self.metadata), "TEST_CALLS": str(self.calls),
                     "HOME": str(self.base), "HF_TOKEN": "", "HF_TOKEN_PATH": str(self.base / "no-token")}
         self.executable("python3", f"""#!{sys.executable}
-import io,json,os,runpy,shutil,sys,urllib.request
-urllib.request.urlopen=lambda *a,**k: io.BytesIO(open(os.environ['TEST_METADATA'],'rb').read())
+import io,json,os,pathlib,runpy,shutil,sys,urllib.request,socket
+sys.path.insert(0,{str(ROOT / 'lib')!r})
+import gguf_source
+class Response(io.BytesIO):
+    status=200
+def safe_open(req,**kwargs):
+    metadata=json.load(open(os.environ['TEST_METADATA']))
+    if '/api/models/' in req.full_url:
+        return io.BytesIO(json.dumps(metadata).encode())
+    if os.environ.get('TEST_HF_FAIL'): raise OSError('test sequential failure')
+    name=urllib.parse.unquote(req.full_url.split('/resolve/')[1].split('/',1)[1])
+    item=next(f for f in metadata['siblings'] if f['rfilename']==name)
+    size=item.get('size') or item['lfs']['size']
+    with open(os.environ['TEST_CALLS'],'a') as stream: stream.write('hf '+json.dumps([name])+'\\n')
+    print('sequential: 100%',file=sys.stderr)
+    response=Response(b'x'*size)
+    response.headers={{'Content-Length':str(size)}}
+    return response
+gguf_source.safe_open=safe_open
 if os.environ.get('TEST_DISK_FULL'):
     shutil.disk_usage=lambda p: shutil._ntuple_diskusage(100*1024**3,100*1024**3,0)
 sys.argv=sys.argv[1:]
@@ -340,7 +626,18 @@ print('huggingface_hub: 100%',file=sys.stderr)
         self.env.update(TEST_CACHE=str(self.cache), HF_HUB_OFFLINE="1")
         self.executable("python3", f"""#!{sys.executable}
 import io,json,os,pathlib,runpy,shutil,sys,urllib.request
-urllib.request.urlopen=lambda *a,**k: io.BytesIO(open(os.environ['TEST_METADATA'],'rb').read())
+sys.path.insert(0,{str(ROOT / 'lib')!r})
+import gguf_source,pushbutton_download
+gguf_source.safe_open=lambda *a,**k: io.BytesIO(open(os.environ['TEST_METADATA'],'rb').read())
+def download_safe(manifest):
+    for f in manifest['files']:
+        path=pathlib.Path(manifest['directory'])/f['name']
+        if pushbutton_download.complete(path,f['size']): continue
+        if os.environ.get('TEST_HF_FAIL'): raise OSError('test failure')
+        with path.open('wb') as stream: stream.truncate(f['size'])
+        pathlib.Path(str(path)+'.aria2').unlink(missing_ok=True)
+        with open(os.environ['TEST_CALLS'],'a') as stream: stream.write('hf '+f['name']+'\\n')
+pushbutton_download.download_safe=download_safe
 def disk_usage(path):
     total=959218776*1024
     used=sum(p.stat().st_size for p in pathlib.Path(os.environ['TEST_CACHE']).rglob('*.gguf'))
@@ -351,7 +648,7 @@ sys.argv=sys.argv[1:]
 if sys.argv[0]=='-':
     exec(compile(sys.stdin.read(),'<stdin>','exec'))
 else:
-    runpy.run_path(sys.argv[0],run_name='__main__')
+    pushbutton_download.main()
 """)
         self.executable("stat", f"""#!{sys.executable}
 import os,pathlib

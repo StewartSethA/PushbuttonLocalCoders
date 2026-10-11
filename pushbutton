@@ -7,7 +7,7 @@ Normal flow:
 Expert tools remain available, but ordinary users should not need to invoke them.
 """
 from __future__ import annotations
-import argparse, json, os, pathlib, platform, shutil, socket, subprocess, sys, time, urllib.request
+import argparse, hashlib, json, os, pathlib, platform, shutil, socket, subprocess, sys, time, urllib.request
 
 ROOT=pathlib.Path(__file__).resolve().parent
 sys.path.insert(0,str(ROOT/'lib'))
@@ -38,13 +38,24 @@ def catalog():return read_json(CATALOG_PATH,{}).get('models',{})
 def aliases():
     a={}
     for k in plan.PROFILES:a[k.lower()]=k
+    a.update(plan.ALIASES)
     for k,v in catalog().items():
         a[k.lower()]=k
         for z in v.get('aliases',[]):a[str(z).lower()]=k
     a.update({'qwen38':'qwen3.8:27b','q38':'qwen3.8:27b'})
     return a
 def canon(x):
-    k=str(x).lower().strip();return aliases().get(k,k)
+    raw=str(x).strip()
+    from gguf_source import is_source
+    if is_source(raw):return plan.canonical_model(raw)
+    k=raw.lower()
+    name=aliases().get(k,k)
+    if name in plan.ALIASES or name in getattr(plan,'SMALL_MODELS',{}):return plan.canonical_model(name)
+    return name
+def model_alias(model):
+    from gguf_source import is_source
+    if is_source(model):return 'gguf-'+hashlib.sha256(model.encode()).hexdigest()[:16]
+    return model.replace(':','-')
 def model_context(model):
     if model in catalog():return int(catalog()[model].get('context') or 262144)
     if model in plan.PROFILES:return max(int(p.native_context) for p in plan.PROFILES[model])
@@ -68,12 +79,12 @@ def broker_ok(port):
 def choose_model(cfg,arg):
     if arg:return canon(arg)
     if cfg.get('model'):return canon(cfg['model'])
-    choices=['qwen3.8:27b','ornith-1.5:35b-a3b','ornith-1.5:9b','deepseek-v4.1-flash']
+    choices=['qwen3.8:27b','ornith-1.5:35b-a3b','ornith-1.5:9b','deepseek-v4.1-flash',*getattr(plan,'SMALL_MODELS',{})]
     if sys.stdin.isatty():
         print('\nModel family:')
-        for i,m in enumerate(choices,1):print(f' {i}. {catalog().get(m,{}).get("display",m)}')
+        for i,m in enumerate(choices,1):print(f' {i}. {catalog().get(m,{}).get("display") or getattr(plan,"SMALL_MODELS",{}).get(m,{}).get("display",m)}')
         raw=input('Choose [1]: ').strip() or '1'
-        try:return choices[int(raw)-1]
+        try:return canon(choices[int(raw)-1])
         except Exception:return canon(raw) if raw else choices[0]
     return choices[0]
 
@@ -100,7 +111,7 @@ def configure(cfg,args):
     cfg['context']=ctx
     if model in plan.PROFILES:
         req=worker_plan.parse_model_spec(spec,cfg['models'])
-        resolved=capacity.resolve_options(req.capacity,ctx)
+        resolved=worker_plan.resolve_request_options(req,ctx)
         if resolved['context']>model_context(model):raise ValueError('per-model context exceeds supported model context')
         options={k:v for k,v in options.items() if k not in capacity.OPTION_KEYS}
         options.update(req.capacity)
@@ -298,12 +309,16 @@ def check_vram_lease(pid,gpus,cap):
     say('actual VRAM lease: '+', '.join(f'GPU {i}: {m:,}/{cap:,} MiB' for i,m in sorted(usage.items())))
     return all(memory<=cap for memory in usage.values())
 def commission(model,context,row):
+    from gguf_source import is_source
+    custom=is_source(model)
     gpu=row.get('gpu');backend=row['backend'];artifact=row.get('artifact');port=free_port(20880);endpoint=backend_endpoint(port);logs=STATE/'logs';logs.mkdir(parents=True,exist_ok=True);slots=1
+    if custom and backend!='llama.cpp':raise ValueError('custom GGUF sources require the llama.cpp backend')
+    safe_name=model_alias(model);alias=safe_name if custom else model
     if backend=='llama.cpp':
         spec=hf_spec(model,artifact)
         if not spec:raise SystemExit(f'cannot resolve GGUF artifact {model} / {artifact}')
         slots=int(row['capacity']['slots']) if row.get('capacity') else provisioned_parallel(model,context,row)
-        cmd=[sys.executable,ROOT/'pushbutton-instance','--hf-spec',spec,'--alias',model,'--port',port,'--context',context,'--parallel',slots]
+        cmd=[sys.executable,ROOT/'pushbutton-instance','--hf-spec',spec,'--alias',alias,'--port',port,'--context',context,'--parallel',slots]
         if row.get('capacity'):
             cmd += ['--kv-k',row['kv_k'],'--kv-v',row['kv_v']]
         if gpu not in (None,''):cmd += ['--gpus',str(gpu)]
@@ -314,7 +329,7 @@ def commission(model,context,row):
         if gpu is not None:cmd += ['--gpus',str(gpu)]
     else:raise SystemExit(f'backend {backend!r} is catalogued but does not yet have an automatic local launcher')
     if slots>1:say(f'pre-provisioning {slots} native llama.cpp slots; broker admission remains C1 until calibrated')
-    log=logs/f'{model.replace(":","-")}-{backend}-{port}.log';timing={}
+    log=logs/f'{safe_name}-{backend}-{port}.log';timing={}
     try:log_offset=log.stat().st_size
     except OSError:log_offset=0
     proc=start_detached(cmd,log,f'{model} / {backend}')
@@ -325,7 +340,7 @@ def commission(model,context,row):
                 try:proc.kill()
                 except Exception:pass
             warn(f'{slots}-slot memory provisioning did not start cleanly; falling back automatically to C1')
-            slots=1;cmd=[sys.executable,ROOT/'pushbutton-instance','--hf-spec',spec,'--alias',model,'--port',port,'--context',context,'--parallel',1]
+            slots=1;cmd=[sys.executable,ROOT/'pushbutton-instance','--hf-spec',spec,'--alias',alias,'--port',port,'--context',context,'--parallel',1]
             if row.get('capacity'):
                 row['capacity']={**row['capacity'],'slots':1,'admission_limit':1}
                 profile=next(p for p in plan.PROFILES[model] if p.quant==artifact)
@@ -335,13 +350,13 @@ def commission(model,context,row):
             if gpu not in (None,''):cmd += ['--gpus',str(gpu)]
             if row.get('device')=='cpu' and row.get('cpu_strategy'):
                 cmd += ['--cpu-strategy',json.dumps(row['cpu_strategy'],separators=(',',':'))]
-            proc=start_detached(cmd,logs/f'{model.replace(":","-")}-{backend}-{port}-c1.log',f'{model} / {backend} C1 fallback')
+            proc=start_detached(cmd,logs/f'{safe_name}-{backend}-{port}-c1.log',f'{model} / {backend} C1 fallback')
             if not wait_endpoint(proc,endpoint):raise SystemExit(f'backend failed to become ready even at C1; inspect {logs}')
         else:raise SystemExit(f'backend failed to become ready; inspect {logs}')
     if not check_vram_lease(proc.pid,gpu,row.get('vram_limit_mib_per_gpu')):
         proc.terminate()
         raise SystemExit('backend exceeded its per-GPU VRAM lease; lower quant, context, or slots')
-    inst={'id':f'{model}-{backend}-{port}','model':model,'served_model':served_model(endpoint,model),'aliases':[model],'backend':backend,'artifact':artifact,'endpoint':endpoint,'pid':proc.pid,'max_context':context,'framework_max_concurrency':slots,'measured_envelopes':[{'concurrency':1,'max_context':context,'safe':True,'evidence':'PROVEN'}],'tg':row.get('tg'),'tg_measured':row.get('evidence')=='LOCAL MEASURED','healthy':True,'gpu':gpu,'required_mib':row.get('req'),'provisioned_slots':slots,'calibration_safe':bool(backend=='llama.cpp' and slots>1)}
+    inst={'id':f'{safe_name if custom else model}-{backend}-{port}','model':model,'served_model':served_model(endpoint,alias),'aliases':list(dict.fromkeys([model,alias])),'backend':backend,'artifact':artifact,'endpoint':endpoint,'pid':proc.pid,'max_context':context,'framework_max_concurrency':slots,'measured_envelopes':[{'concurrency':1,'max_context':context,'safe':True,'evidence':'PROVEN'}],'tg':row.get('tg'),'tg_measured':row.get('evidence')=='LOCAL MEASURED','healthy':True,'gpu':gpu,'required_mib':row.get('req'),'provisioned_slots':slots,'calibration_safe':bool(backend=='llama.cpp' and slots>1)}
     if row.get('capacity'):
         if backend=='llama.cpp':
             try:inst['capacity_proof']=request_budget.verify_backend_capacity(endpoint,row['capacity'])
@@ -455,7 +470,7 @@ def main():
         requested=None;row=None;custom_placement=False
         if model in plan.PROFILES:
             req=worker_plan.parse_model_spec(cfg['model_spec'],cfg.get('models',{}))
-            requested=capacity.resolve_options(req.capacity,ctx);ctx=requested['context']
+            requested=worker_plan.resolve_request_options(req,ctx);ctx=requested['context']
             custom_placement=req.gpu_indices is not None or req.vram_limit_mib is not None or any(k in req.capacity for k in ('slots','quant','bits','kv_k','kv_v'))
             if a.plan_only:
                 if custom_placement:

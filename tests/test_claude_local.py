@@ -90,14 +90,14 @@ class PlannerTests(unittest.TestCase):
         p = planmod.plan(["q38", "q36"], gpus, 262144)
         by_model = {s["model"]: s for s in p["servers"]}
         self.assertEqual(by_model["qwen3.6:35b"]["cuda_visible_devices"], "0")
-        self.assertEqual(by_model["qwen3.6:35b"]["profile"]["quant"], "UD-Q5_K_M")
+        self.assertEqual(by_model["qwen3.6:35b"]["profile"]["quant"], "UD-Q6_K")
         self.assertEqual(by_model["qwen3.8:27b"]["cuda_visible_devices"], "1")
-        self.assertEqual(by_model["qwen3.8:27b"]["profile"]["quant"], "IQ3_XXS")
+        self.assertEqual(by_model["qwen3.8:27b"]["profile"]["quant"], "IQ2_S")
 
     def test_full_context_4060ti_profiles(self):
         gpus = [planmod.GPU(0, "RTX 4060 Ti", 16380, 16100, "8.9", "", 4, 8)]
-        self.assertEqual(planmod.plan(["q38"], gpus, 262144)["servers"][0]["profile"]["quant"], "IQ3_XXS")
-        self.assertEqual(planmod.plan(["q36"], gpus, 262144)["servers"][0]["profile"]["quant"], "UD-IQ3_XXS")
+        self.assertEqual(planmod.plan(["q38"], gpus, 262144)["servers"][0]["profile"]["quant"], "IQ2_S")
+        self.assertEqual(planmod.plan(["q36"], gpus, 262144)["servers"][0]["profile"]["quant"], "UD-IQ2_M")
 
 
 class GatewayTests(unittest.TestCase):
