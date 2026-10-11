@@ -436,6 +436,32 @@ class SourceTests(unittest.TestCase):
                 manifest["files"][0]["etag"] = '"stable"'
                 download.validate_space(manifest)
 
+    def test_folder_model_and_plan_guards_credit_safe_partial(self):
+        text = (ROOT / "lib/pushbutton_folders.sh").read_text().split("<<'PY'\n", 1)[1].split("\nPY", 1)[0]
+        namespace = {"__name__": "folder_test"}
+        with mock.patch.dict(os.environ, {"PUSHBUTTON_FOLDER_LIB": str(ROOT / "lib")}), \
+                mock.patch.object(sys, "argv", ["-", "no-action"]), \
+                mock.patch("builtins.print"), \
+                mock.patch("sys.exit"):
+            # Load functions without dispatching the embedded command handler.
+            text = text.split("\ntry:\n", 1)[0]
+            exec(compile(text, "<folder-guard>", "exec"), namespace)
+        with tempfile.TemporaryDirectory() as tmp:
+            name = "model-Q4_K_M.gguf"
+            directory = pathlib.Path(tmp) / "models--owner--repo" / REVISION
+            directory.mkdir(parents=True)
+            partial = directory / (name + ".part")
+            partial.write_bytes(b"x" * 4096)
+            metadata = {"sha": REVISION, "siblings": [{"rfilename": name, "size": 8192}]}
+            namespace["metadata"] = lambda *args: metadata
+            expected = 8192 - min(8192, partial.stat().st_blocks * 512)
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(namespace["download_remaining"]("owner/repo:Q4_K_M", tmp), expected)
+                plan = pathlib.Path(tmp) / "plan.json"
+                plan.write_text(json.dumps({"servers": [{"hf_spec": "owner/repo:Q4_K_M"}]}))
+                self.assertEqual(namespace["plan_download_required"](str(plan), tmp),
+                                 expected + 10 * 1024**3)
+
 
 class ShellTests(unittest.TestCase):
     def setUp(self):

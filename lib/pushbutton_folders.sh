@@ -270,6 +270,20 @@ def metadata(cache, repo, revision="main"):
     return data
 
 
+def safe_partial_allocated(directory, name, size, stable):
+    if not stable:
+        return 0
+    partial = pathlib.Path(directory) / (name + ".part")
+    try:
+        if (not partial.is_file() or partial.stat().st_size >= size
+                or os.path.commonpath((str(pathlib.Path(directory).resolve()), str(partial.resolve())))
+                != str(pathlib.Path(directory).resolve())):
+            return 0
+        return min(size, getattr(partial.stat(), "st_blocks", 0) * 512)
+    except (OSError, ValueError):
+        return 0
+
+
 def download_remaining(spec, cache):
     import gguf_source
     from pushbutton_download import select_files
@@ -287,7 +301,9 @@ def download_remaining(spec, cache):
     if not source["repo"]:
         resolved = gguf_source.resolve_files(spec)
         directory = gguf_source.cache_directory(cache, resolved)
-        remaining = sum(item["size"] for item in resolved["files"]
+        remaining = sum(item["size"] - safe_partial_allocated(
+                            directory, item["name"], item["size"], bool(item.get("etag")))
+                        for item in resolved["files"]
                         if not (directory / item["name"]).is_file()
                         or (directory / item["name"]).stat().st_size != item["size"]
                         or pathlib.Path(str(directory / item["name"]) + ".aria2").exists())
@@ -354,7 +370,10 @@ def download_remaining(spec, cache):
             except OSError:
                 pass
         if not complete:
-            remaining += size
+            sha = data.get("sha")
+            stable = isinstance(sha, str) and bool(re.fullmatch(r"[a-fA-F0-9]{40,64}", sha))
+            directory = repo_roots(cache, repo)[0] / sha if stable else pathlib.Path(cache)
+            remaining += size - safe_partial_allocated(directory, name, size, stable)
     print(f"GGUF download: {total / GIB:.2f} GiB total, "
           f"{remaining / GIB:.2f} GiB remaining (complete cache files only).", file=sys.stderr)
     return remaining
