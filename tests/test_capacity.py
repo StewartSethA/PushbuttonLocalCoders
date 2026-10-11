@@ -2,6 +2,7 @@ import math
 import pathlib
 import sys
 import unittest
+from unittest.mock import patch
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
@@ -118,7 +119,7 @@ class CapacityBudgetTests(unittest.TestCase):
         two = capacity.memory_estimate(profile, capacity.resolve_options({"slots": 2}, 262144))
         high_precision = capacity.memory_estimate(
             profile, capacity.resolve_options({"kv_k": "f16", "kv_v": "q8_0"}, 262144))
-        self.assertEqual(one["required_mib"], profile.required_mib)
+        self.assertEqual(one["weights_source"], "parameters-effective-bpw")
         self.assertGreater(two["required_mib"], one["required_mib"])
         self.assertGreater(high_precision["required_mib"], two["required_mib"])
         self.assertEqual(two["context_tokens_total"], 524288)
@@ -141,8 +142,32 @@ class CapacityBudgetTests(unittest.TestCase):
         self.assertGreater(q8["required_mib"], one["required_mib"])
         q38 = base.PROFILES["qwen3.8:27b"][0]
         lowered = capacity.memory_estimate(q38, capacity.resolve_options({"context": 65536}, 262144))
-        self.assertEqual(lowered["weights_source"], "profile-envelope")
+        self.assertEqual(lowered["weights_source"], "parameters-effective-bpw")
         self.assertLess(lowered["required_mib"], q38.required_mib)
+
+    def test_uncatalogued_weights_use_effective_bits_not_envelope(self):
+        import cpu_platform
+        profile = base.PROFILES["qwen3.8:27b"][3]
+        settings = capacity.resolve_options({"slots": 4}, 262144)
+        estimate = capacity.memory_estimate(profile, settings)
+        expected = 27e9 * 4.85 / 8 / 2**20
+        self.assertEqual(estimate["weights_mib"], math.ceil(expected))
+        self.assertEqual(estimate["kv_mib"], 18 * 1024)
+        self.assertEqual(estimate["required_mib"],
+                         math.ceil(expected * capacity.WEIGHT_MARGIN + 18 * 1024 + 1536))
+        with patch.dict(cpu_platform.MODEL_ARCH, {
+                profile.model: {**cpu_platform.MODEL_ARCH[profile.model], "active_b": 1}}):
+            self.assertEqual(capacity.memory_estimate(profile, settings), estimate)
+        from dataclasses import replace
+        self.assertEqual(capacity.memory_estimate(
+            replace(profile, required_mib=100 * 1024), settings), estimate)
+
+    def test_four_slot_q4_fit_uses_total_memory_not_just_weights(self):
+        gpu = base.GPU(2, "32 GB GPU", 32768, int(31.3 * 1024))
+        with self.assertRaisesRegex(ValueError, "parameters-effective-bpw"):
+            base.plan(["q38@gpu=2,slots=4,bits=4"], [gpu], 262144)
+        result = base.plan(["q38@gpu=2,slots=4,bits=4,context=131072"], [gpu], 262144)
+        self.assertEqual(result["servers"][0]["profile"]["quant"], "UD-Q4_K_M")
 
     def test_unplaceable_pinned_models_report_requirement_breakdown(self):
         free = [31.3, 26.7, 27.0, 27.2, 19.5, 19.3, 25.6, 27.0]
@@ -181,8 +206,10 @@ class InstanceCapacityTests(unittest.TestCase):
         model = "qwen3.8-flash-next"
         profiles = [p for p in base.PROFILES[model] if capacity.quant_bits(p.quant) == 4]
         self.assertGreater(len(profiles), 1)
+        required = capacity.memory_estimate(
+            profiles[-1], capacity.resolve_options({}, 262144))["required_mib"]
         profile, _ = base.best_profile_for_capacity(
-            model, profiles[-1].required_mib, 262144, {"bits": 4})
+            model, required, 262144, {"bits": 4})
         self.assertEqual(profile.quant, profiles[-1].quant)
 
     def test_bits_rejects_unavailable_and_conflicting_quants(self):

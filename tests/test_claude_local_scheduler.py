@@ -58,9 +58,9 @@ class SchedulerPolicyTests(unittest.TestCase):
         by_model = {s["model"]: s for s in p["servers"]}
         self.assertEqual(p["placement_policy"], "joint-global-plan")
         self.assertEqual(by_model["qwen3.6:35b"]["cuda_visible_devices"], "0")
-        self.assertEqual(by_model["qwen3.6:35b"]["profile"]["quant"], "UD-Q5_K_M")
+        self.assertEqual(by_model["qwen3.6:35b"]["profile"]["quant"], "UD-Q6_K")
         self.assertEqual(by_model["qwen3.8:27b"]["cuda_visible_devices"], "1")
-        self.assertEqual(by_model["qwen3.8:27b"]["profile"]["quant"], "IQ3_XXS")
+        self.assertEqual(by_model["qwen3.8:27b"]["profile"]["quant"], "IQ2_S")
 
     def test_raw_specs_have_per_server_capacity_and_pins(self):
         gpus = [planmod.GPU(i, "RTX 3090", 24576, 24576) for i in range(2)]

@@ -599,11 +599,12 @@ def unplaceable_detail(request, gpus: list[GPU], context: int, slots: int = 1) -
     if not estimates:
         return f"{label}: no profile matches the requested quant/bits/context"
     est, profile = min(estimates, key=lambda x: x[0]["required_mib"])
-    text = f"{label}: smallest matching quant {profile.quant} needs {est['required_mib'] / MIB_PER_GIB:.1f} GiB"
+    text = f"{label}: smallest matching quant {profile.quant} is estimated to need {est['required_mib'] / MIB_PER_GIB:.1f} GiB"
     if "weights_mib" in est:
         text += (f" (weights {est['weights_mib'] / MIB_PER_GIB:.1f} + KV {est['kv_mib'] / MIB_PER_GIB:.1f} "
                  f"for {settings['slots']} slot(s) x {settings['context']:,} tokens at "
-                 f"{est['kv_k']}/{est['kv_v']} + runtime {est['overhead_mib'] / MIB_PER_GIB:.1f})")
+                 f"{est['kv_k']}/{est['kv_v']} + runtime/margin {est['overhead_mib'] / MIB_PER_GIB:.1f}; "
+                 f"weights source: {est['weights_source']}; KV uses planning architecture)")
     text += f"; {where} have {free_mib / MIB_PER_GIB:.1f} GiB free"
     if len(per_gpu) > 1:
         text += f" (largest single GPU {max(per_gpu) / MIB_PER_GIB:.1f} GiB)"

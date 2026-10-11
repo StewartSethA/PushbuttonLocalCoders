@@ -80,6 +80,35 @@ Run a dry plan before downloading anything:
 claude-local qwen3.6:35b qwen3.8:27b --local-dry-run
 ```
 
+Memory planning separates weights from KV and runtime buffers. Catalogued GGUF
+sizes take precedence; otherwise weights are estimated from total parameters
+and effective quantization bits, including block overhead, not extracted from a
+full-context VRAM envelope. These are estimates, not measured allocations.
+KV uses the registered attention architecture and scales with context **per
+slot** times slots; weights are loaded once. For `qwen3.8:27b` at `UD-Q4_K_M`,
+the fallback weight estimate is about **15.25 GiB** (27 billion parameters at
+4.85 effective bits), not 35.5 GiB of weights. Four 262,144-token slots add
+an estimated **18 GiB** of q4_0 KV plus runtime/margin, so the total still exceeds
+31.3 GiB. Four 131,072-token slots halve that KV estimate. Dynamic GGUF sizes
+and architecture metadata are not currently resolved by this planner.
+
+### Low-memory GPUs
+
+The smallest built-in model is **`ornith-1.5:9b`** (`ornith` / `ornith-9b`).
+Its catalogued Q4_K_M weights are **5.78 GiB**; KV and runtime require additional
+VRAM. One 131,072-token q4_0 slot is estimated at roughly **8.6 GiB total**,
+so this is a more realistic 12–16 GiB target than assuming an 8 GiB card fits.
+Use `claude-local models` and `--local-dry-run` to check current profiles.
+
+Outside this curated launcher, smaller GGUF candidates include
+**Qwen2.5-Coder-3B/7B-Instruct**, **Qwen3-4B/8B**, and
+**Llama-3.2-3B-Instruct**. Approximate Q4 weights are 2–3 GiB for 3–4B
+models and 4–5 GiB for 7–8B models; check the actual chosen GGUF size and leave
+room for KV/buffers. These names are **not built-in selectors** here, and tool
+compatibility must be verified before using them as agent backends. For small
+contexts, prefer a coder frontend: Claude Code's supported compaction policy
+requires at least a 100,000-token window and additional reserves.
+
 ## Built-in model selectors
 
 ```text
