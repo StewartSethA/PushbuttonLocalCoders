@@ -87,7 +87,13 @@ def validate_space(manifest, reuse_partial=False):
         if complete(path, item["size"]):
             continue
         allocated = 0
-        if reuse_partial and path.is_file() and pathlib.Path(str(path) + ".aria2").exists():
+        partial = pathlib.Path(str(path) + ".part")
+        stable_resume = bool(manifest.get("repo") or item.get("etag"))
+        if (stable_resume and partial.is_file() and partial.stat().st_size < item["size"]
+                and os.path.commonpath((str(directory.resolve()), str(partial.resolve()))) == str(directory.resolve())):
+            stat = partial.stat()
+            allocated = min(item["size"], getattr(stat, "st_blocks", 0) * 512)
+        elif reuse_partial and path.is_file() and pathlib.Path(str(path) + ".aria2").exists():
             stat = path.stat()
             allocated = min(item["size"], getattr(stat, "st_blocks", 0) * 512)
         remaining += item["size"] - allocated
@@ -138,10 +144,11 @@ def prepare(spec, cache, work):
     directory = gguf_source.cache_directory(cache, resolved)
     directory.mkdir(parents=True, exist_ok=True)
     reuse_blobs(directory, files)
+    classic_spec = bool(re.fullmatch(r"[\w.-]+/[\w.-]+:[A-Za-z0-9_.-]+", spec))
     manifest = {"repo": repo, "spec": spec, "revision": revision,
                 "directory": str(directory), "cache": str(pathlib.Path(cache).expanduser().resolve()),
                 "files": files, "model_path": str(directory / files[0]["name"]),
-                "safe_download": not repo or bool(headers)}
+                "safe_download": not classic_spec or bool(headers)}
     validate_space(manifest, reuse_partial=os.environ.get("PUSHBUTTON_NO_PARALLEL") != "1")
     pending = [f for f in files if not complete(directory / f["name"], f["size"])]
     manifest["download_bytes"] = sum(f["size"] for f in pending)

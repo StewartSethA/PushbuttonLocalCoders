@@ -155,6 +155,10 @@ URLs must be public HTTPS, without embedded credentials or credential query
 parameters. Local/private-network targets and unsafe paths are rejected.
 HF credentials are not sent to other hosts. Embedded templates and tool probes
 remain in force; an arbitrary GGUF is not necessarily a chat/tool model.
+Architecture metadata is supported only for recognized layouts; unknown layouts
+are rejected. Sliding attention is budgeted conservatively at full context.
+Recurrent/hybrid models retain per-slot state/runtime allowances, and estimates
+still require confirmation against actual startup allocation.
 
 ## Built-in model selectors
 

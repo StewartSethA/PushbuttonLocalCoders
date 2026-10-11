@@ -734,20 +734,21 @@ def _metadata_weights(profile) -> float:
     if (not isinstance(weights, (int, float)) or isinstance(weights, bool)
             or not math.isfinite(weights) or weights <= 0
             or not isinstance(layers, int) or isinstance(layers, bool) or layers < 0
-            or not isinstance(width, int) or isinstance(width, bool)
-            or width < 0 or (layers > 0 and width == 0)):
+            or not isinstance(width, (int, float)) or isinstance(width, bool)
+            or not math.isfinite(width) or width < 0 or (layers > 0 and width == 0)):
         raise ValueError("CPU source profile requires valid GGUF weights and attention/KV metadata")
     for name in ("kv_key_width", "kv_value_width"):
         separate_width = getattr(profile, name, None)
         if separate_width is not None and (
-                not isinstance(separate_width, int) or isinstance(separate_width, bool)
+                not isinstance(separate_width, (int, float)) or isinstance(separate_width, bool)
+                or not math.isfinite(separate_width)
                 or separate_width < 0 or (layers > 0 and separate_width == 0)):
             raise ValueError("CPU source profile requires valid GGUF weights and attention/KV metadata")
     return float(weights)
 
 
 def cpu_required_mib(model: str, quant: str, context_tokens: int, kv_k: str = "q4_0",
-                     kv_v: str = "q4_0", profile=None) -> int:
+                     kv_v: str = "q4_0", profile=None, slots: int = 1) -> int:
     """Host-RAM envelope: weights + full KV for all slots + compute buffers, +5%.
 
     The GPU planner's envelope includes CUDA buffers and padding that a CPU
@@ -765,7 +766,10 @@ def cpu_required_mib(model: str, quant: str, context_tokens: int, kv_k: str = "q
     kv = context_tokens * layers * (
         (width if key_width is None else key_width) * KV_BYTES.get(kv_k, 2.0)
         + (width if value_width is None else value_width) * KV_BYTES.get(kv_v, 2.0))
-    compute = 768 * 2**20 + context_tokens * 4096  # graph/compute buffers grow with ubatch×ctx
+    recurrent = profile is not None and (
+        layers == 0 or any("recurrent" in note.lower() for note in getattr(profile, "architecture_notes", ())))
+    runtime_slots = max(1, slots) if recurrent else 1
+    compute = 768 * 2**20 * runtime_slots + context_tokens * 4096  # recurrent state is per slot
     total = (weights + kv + compute) * 1.05
     return int(total / 2**20) + 1
 
@@ -957,7 +961,7 @@ def choose_profile(model: str, settings: dict, info: CPUInfo, ram_cap_mib: int |
         p2 = replace(p, kv_k=settings.get("kv_k", p.kv_k), kv_v=settings.get("kv_v", p.kv_v))
         metadata_profile = p2 if p2.source_spec or model not in MODEL_ARCH else None
         req = cpu_required_mib(model, p.quant, settings["context"] * settings["slots"], p2.kv_k, p2.kv_v,
-                               profile=metadata_profile)
+                               profile=metadata_profile, slots=settings["slots"])
         if req > ram_cap:
             continue
         w_mib = _metadata_weights(p2) if metadata_profile is not None else weight_gib(model, p.quant) * 1024

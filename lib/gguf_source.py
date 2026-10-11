@@ -295,10 +295,10 @@ def architecture(metadata):
     arch = metadata.get("general.architecture")
     dense = {"llama", "qwen2", "qwen2moe", "qwen3", "qwen3moe", "gemma", "gemma2",
              "gemma3", "phi2", "phi3", "falcon", "stablelm", "starcoder2", "internlm2",
-             "olmo", "olmo2", "mistral"}
+             "olmo", "olmo2", "mistral", "granite", "granitemoe", "mellum"}
     hybrid = {"qwen3next", "qwen35", "qwen35moe"}
     recurrent = {"mamba", "mamba2", "rwkv6", "rwkv6qwen2", "rwkv7"}
-    if arch not in dense | hybrid | recurrent:
+    if arch not in dense | hybrid | recurrent | {"granitehybrid"}:
         raise ValueError(f"Cannot conservatively derive KV/context for GGUF architecture {arch!r}")
 
     def integer(key, default=None):
@@ -312,27 +312,49 @@ def architecture(metadata):
     if arch in recurrent:
         return {"context": context, "attn_layers": 0, "kv_dim": 0,
                 "kv_key_dim": 0, "kv_value_dim": 0,
-                "architecture_source": "gguf:" + arch}
+                "architecture_source": "gguf:" + arch,
+                "architecture_notes": [
+                    "Pure recurrent architecture: no attention KV; retain per-slot runtime/state allowance"]}
     heads = integer("attention.head_count")
-    kv_heads = integer("attention.head_count_kv")
+    per_layer_kv = metadata.get(arch + ".attention.head_count_kv")
+    if isinstance(per_layer_kv, list):
+        if arch == "mellum":
+            raise ValueError("Cannot derive Mellum per-layer KV heads")
+        if (len(per_layer_kv) != layers or any(type(v) is not int or v < 0 for v in per_layer_kv)
+                or not any(per_layer_kv)):
+            raise ValueError("Cannot derive per-layer GGUF KV heads")
+        kv_heads = max(per_layer_kv)
+        layers = sum(v > 0 for v in per_layer_kv)
+    else:
+        kv_heads = integer("attention.head_count_kv")
     embedding = integer("embedding_length")
     if embedding % heads:
         raise ValueError("Cannot derive GGUF attention head dimensions")
-    explicit_dimensions = arch in hybrid or arch.startswith("gemma")
+    explicit_dimensions = arch in hybrid or arch == "granitehybrid" or arch.startswith("gemma")
     key_dim = integer("attention.key_length", None if explicit_dimensions else embedding // heads)
     value_dim = integer("attention.value_length", None if explicit_dimensions else key_dim)
-    if arch in hybrid:
+    if arch == "granitehybrid" and not isinstance(per_layer_kv, list):
+        raise ValueError("Cannot derive Granite hybrid attention layout from GGUF metadata")
+    if arch in hybrid and not isinstance(per_layer_kv, list):
         interval = integer("full_attention_interval", metadata.get(
             arch + ".attention.full_attention_interval"))
         layers = (layers + interval - 1) // interval
         if not layers:
             raise ValueError("Cannot derive hybrid full-attention layers")
     # kv_dim includes KV heads and averages K/V, matching planners' 2 * kv_dim.
+    notes = []
+    if arch in hybrid or arch == "granitehybrid" or isinstance(per_layer_kv, list):
+        notes.append("Only explicit full-attention layers contribute KV; retain recurrent/runtime allowance")
+    if isinstance(per_layer_kv, list) and len(set(v for v in per_layer_kv if v)) > 1:
+        notes.append("Unequal per-layer KV heads conservatively budgeted at maximum width")
+    if arch == "mellum" or arch.startswith("gemma") or any("sliding_window" in key for key in metadata):
+        notes.append("Sliding/local attention conservatively budgeted as full-context attention")
     return {"context": context, "attn_layers": layers,
             "kv_dim": kv_heads * (key_dim + value_dim) / 2,
             "kv_key_dim": kv_heads * key_dim,
             "kv_value_dim": kv_heads * value_dim,
-            "architecture_source": "gguf:" + arch}
+            "architecture_source": "gguf:" + arch,
+            "architecture_notes": notes}
 
 
 def resolve_source(text):
@@ -341,7 +363,8 @@ def resolve_source(text):
         raise ValueError("Architecture planning requires a single GGUF model variant")
     resolved = resolve_files(text)
     item = resolved["files"][0]
-    cache = os.environ.get("PUSHBUTTON_LOCAL_CACHE") or os.environ.get("HF_HUB_CACHE")
+    cache = (os.environ.get("CLAUDE_LOCAL_CACHE") or os.environ.get("PUSHBUTTON_LOCAL_CACHE")
+             or os.environ.get("HF_HUB_CACHE"))
     local = cache_directory(cache, resolved) / item["name"] if cache else None
     limit = min(128 * 1024, item["size"])
     while True:
@@ -368,7 +391,7 @@ def resolve_source(text):
                 raise ValueError("Cannot derive KV/context within bounded GGUF metadata prefix")
             limit = min(limit * 4, MAX_PREFIX, item["size"])
     selector = resolved["selector"] or item["name"]
-    quant = re.search(r"(?:^|[-./])((?:UD-)?(?:IQ|Q|BF|F)\d[A-Za-z0-9_]*)",
+    quant = re.search(r"(?:^|[-._/])((?:UD-)?(?:(?:IQ|Q|BF|F)\d[A-Za-z0-9_]*|(?:MX|NV)FP\d))",
                       selector, re.I)
     return {**resolved, **info, "quant": quant[1].upper() if quant else "custom"}
 

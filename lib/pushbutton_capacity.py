@@ -222,7 +222,8 @@ def memory_estimate(profile, capacity: dict) -> dict:
                 "note": "No usable architecture data; validate actual allocation at startup."}
     kv_mib = tokens * per_token / 2**20
     overhead_mib = GPU_RUNTIME_OVERHEAD_MIB
-    if getattr(profile, "attention_layers", None) == 0:
+    if getattr(profile, "attention_layers", None) == 0 or any(
+            "recurrent" in note.lower() for note in getattr(profile, "architecture_notes", ())):
         overhead_mib *= capacity["slots"]
     if weights is not None:
         weights_mib, source = weights, "gguf-metadata" if resolved_weights else "catalog"
@@ -239,5 +240,7 @@ def memory_estimate(profile, capacity: dict) -> dict:
             "kv_mib": math.ceil(kv_mib), "kv_bytes_per_token": per_token,
             "overhead_mib": math.ceil(overhead_mib), "context_tokens_total": tokens,
             "kv_k": k, "kv_v": v,
+            "architecture_source": getattr(profile, "architecture_source", "") or "planning-table",
+            "architecture_notes": list(getattr(profile, "architecture_notes", ())),
             "kv_precision_multiplier": round(per_token / native_per_token, 4) if native_per_token else 1.0,
             "note": "Planning architecture assumptions; validate actual allocation at startup."}

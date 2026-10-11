@@ -250,6 +250,15 @@ class MetadataProfileTests(unittest.TestCase):
         choice = cp.choose_profile(self.model, settings, cascade_lake_2s())
         self.assertEqual(choice.required_mib, expected)
 
+    def test_resolver_float_kv_width_supports_cpu_planning(self):
+        baseline = cp.cpu_required_mib(self.model, self.profile.quant, 8192, profile=self.profile)
+        base.PROFILES[self.model] = [replace(self.profile, kv_width=512.0)]
+        choice = cp.choose_profile(self.model, self.settings, cascade_lake_2s())
+        self.assertEqual(choice.required_mib, baseline)
+        base.PROFILES[self.model] = [replace(self.profile, kv_width=384.5,
+                                           kv_key_width=512.0, kv_value_width=257.0)]
+        self.assertIsNotNone(cp.choose_profile(self.model, self.settings, cascade_lake_2s()))
+
     def test_metadata_uses_fast_memory_and_numa_placement(self):
         with mock.patch.dict(os.environ, {"PUSHBUTTON_ASSUME_NUMACTL": "1"}):
             choice = cp.choose_profile(self.model, self.settings, knl())
@@ -278,7 +287,9 @@ class MetadataProfileTests(unittest.TestCase):
     def test_invalid_metadata_is_not_treated_as_zero_memory(self):
         for fields in ({"weight_mib": None}, {"weight_mib": float("nan")}, {"weight_mib": -1},
                        {"attention_layers": None}, {"attention_layers": -1}, {"kv_width": 0},
-                       {"kv_key_width": -1}, {"kv_value_width": 0}):
+                       {"kv_key_width": -1}, {"kv_value_width": 0},
+                       {"kv_width": float("nan")}, {"kv_width": float("inf")},
+                       {"kv_key_width": float("nan")}, {"kv_value_width": float("inf")}):
             with self.subTest(fields=fields):
                 base.PROFILES[self.model] = [replace(self.profile, **fields)]
                 with self.assertRaisesRegex(ValueError, "valid GGUF"):
@@ -298,6 +309,21 @@ class MetadataProfileTests(unittest.TestCase):
         for item in (server, worker):
             self.assertEqual(item["capacity"]["memory_estimate"]["kv_mib"], 0)
             self.assertIsNone(item["cpu"]["estimate"]["depths"][0]["tg_tps"])
+
+    def test_recurrent_runtime_is_reserved_per_slot_including_hybrid(self):
+        settings = capacity.resolve_options({"slots": "3"}, 8192)
+        for fields in ({"attention_layers": 0, "kv_width": 0},
+                       {"architecture_notes": ("Hybrid attention + recurrent state allowance",)}):
+            with self.subTest(fields=fields):
+                profile = replace(self.profile, **fields)
+                base.PROFILES[self.model] = [profile]
+                tokens = settings["context"] * settings["slots"]
+                one_runtime = cp.cpu_required_mib(self.model, profile.quant, tokens, profile=profile)
+                expected = cp.cpu_required_mib(self.model, profile.quant, tokens, profile=profile, slots=3)
+                self.assertGreaterEqual(expected - one_runtime, int(2 * 768 * 1.05))
+                choice = cp.choose_profile(self.model, settings, cascade_lake_2s())
+                self.assertEqual(choice.required_mib, expected)
+                self.assertIsNone(cp.choose_profile(self.model, settings, cascade_lake_2s(), expected - 1))
 
     def test_source_metadata_overrides_known_model_architecture(self):
         model = "ornith-1.5:9b"

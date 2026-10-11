@@ -371,6 +371,71 @@ class SourceTests(unittest.TestCase):
             self.assertEqual(result["kv_dim"], 0)
             self.assertEqual(result["context"], 32768)
 
+    def test_hybrid_per_layer_attention_metadata(self):
+        metadata = {"general.architecture": "granitehybrid",
+                    "granitehybrid.context_length": 131072,
+                    "granitehybrid.block_count": 4,
+                    "granitehybrid.embedding_length": 4096,
+                    "granitehybrid.attention.head_count": 32,
+                    "granitehybrid.attention.head_count_kv": [0, 8, 0, 8],
+                    "granitehybrid.attention.key_length": 128,
+                    "granitehybrid.attention.value_length": 128}
+        result = source.architecture(metadata)
+        self.assertEqual(result["attn_layers"], 2)
+        self.assertEqual(result["kv_dim"], 1024)
+        metadata["granitehybrid.attention.head_count_kv"] = 8
+        with self.assertRaisesRegex(ValueError, "layout"):
+            source.architecture(metadata)
+
+    def test_verified_dense_granite_and_mellum_metadata(self):
+        for arch in ("granite", "mellum"):
+            metadata = source.read_gguf_metadata(gguf_fixture(arch))
+            result = source.architecture(metadata)
+            self.assertEqual(result["attn_layers"], 32)
+            self.assertEqual(result["kv_key_dim"], 1024)
+            self.assertEqual(result["kv_value_dim"], 1024)
+            if arch == "mellum":
+                self.assertIn("full-context", result["architecture_notes"][0])
+                metadata[arch + ".attention.head_count_kv"] = [8] * 32
+                with self.assertRaises(ValueError):
+                    source.architecture(metadata)
+
+    def test_extended_hf_syntax_requires_safe_transport_without_token(self):
+        for spec in ("hf:owner/repo:Q4_K_M", "owner/repo/Qwen-Q4_K_M.gguf",
+                     f"https://huggingface.co/owner/repo/resolve/{REVISION}/Qwen-Q4_K_M.gguf"):
+            with self.subTest(spec=spec), tempfile.TemporaryDirectory() as tmp, \
+                    mock.patch.object(source, "fetch_metadata", return_value=METADATA), \
+                    mock.patch.object(source, "hf_headers", return_value={}), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                self.assertTrue(download.prepare(spec, tmp, tmp)["safe_download"])
+
+    def test_exact_filename_quant_families(self):
+        data = gguf_fixture()
+        for quant in ("Q4_K_M", "MXFP4", "NVFP4"):
+            name = "model_" + quant + ".gguf"
+            with self.subTest(quant=quant), \
+                    mock.patch.object(source, "fetch_metadata", return_value={
+                        "sha": REVISION, "siblings": [{"rfilename": name, "size": len(data)}]}), \
+                    mock.patch.object(source, "safe_open", side_effect=lambda *a, **k: self.response(data)):
+                self.assertEqual(source.resolve_source("owner/repo/" + name)["quant"], quant)
+
+    def test_safe_partial_space_credit_requires_stable_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            partial = pathlib.Path(tmp) / "model.gguf.part"
+            partial.write_bytes(b"x" * 4096)
+            size = 8192
+            allocated = min(size, partial.stat().st_blocks * 512)
+            manifest = {"directory": tmp, "repo": "owner/repo",
+                        "files": [{"name": "model.gguf", "size": size}]}
+            disk = shutil._ntuple_diskusage(100 * 1024**3, 0, 10 * 1024**3 + size - allocated)
+            with mock.patch.object(download.shutil, "disk_usage", return_value=disk):
+                download.validate_space(manifest)
+                manifest["repo"] = None
+                with self.assertRaises(ValueError):
+                    download.validate_space(manifest)
+                manifest["files"][0]["etag"] = '"stable"'
+                download.validate_space(manifest)
+
 
 class ShellTests(unittest.TestCase):
     def setUp(self):

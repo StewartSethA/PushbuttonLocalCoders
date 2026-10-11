@@ -100,6 +100,8 @@ class Profile:
     kv_width: int | None = None
     kv_key_width: int | None = None
     kv_value_width: int | None = None
+    architecture_source: str = ""
+    architecture_notes: tuple[str, ...] = ()
 
     @property
     def hf_spec(self) -> str:
@@ -270,6 +272,8 @@ def register_source(model: str, source: str) -> None:
         weight_mib=resolved["weight_bytes"] / 2**20,
         attention_layers=resolved["attn_layers"], kv_width=resolved["kv_dim"],
         kv_key_width=resolved.get("kv_key_dim"), kv_value_width=resolved.get("kv_value_dim"),
+        architecture_source=resolved.get("architecture_source", ""),
+        architecture_notes=tuple(resolved.get("architecture_notes", [])),
         note=preset.get("note", "") + "; GGUF metadata resolved; embedded template/tool support must pass startup probes"),)
 
 

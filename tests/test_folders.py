@@ -572,7 +572,12 @@ printf "%s\\n" "$STATE_DIR" "$CACHE_DIR"
 
     def test_invalid_spec_and_explicit_quant_mismatch(self):
         self.metadata()
-        for spec in ("owner/repo", "owner/repo/../bad.gguf", "owner/repo:bad/quant",
+        env = dict(self.mock_space(13), HF_HUB_OFFLINE="1")
+        for spec in ("owner/repo", "hf:owner/repo"):
+            with self.subTest(spec=spec):
+                cp = self.run_bash(f"load_folder_config; validate_download_space {spec}", env)
+                self.assertIn("3.00 GiB remaining", cp.stderr)
+        for spec in ("owner/repo/../bad.gguf", "owner/repo:bad/quant",
                      "owner/repo/model-Q4_K_M.gguf:Q8_0"):
             with self.subTest(spec=spec):
                 cp = self.run_bash(f"load_folder_config; validate_download_space {spec}", check=False)
