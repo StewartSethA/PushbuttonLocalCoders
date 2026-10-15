@@ -9,7 +9,7 @@ class CoderPlanTests(unittest.TestCase):
  def test_two_flashnext_replicas_use_4x4(self):
   x=p.build_plan(self.reqs('qwen3.8-flash-next'),2,p.synthetic_v100(8),262144)
   self.assertEqual([len(w['gpus']) for w in x['workers']],[4,4])
-  self.assertTrue(all(w['profile']['quant']=='UD-IQ4_XS' for w in x['workers']))
+  self.assertTrue(all(w['profile']['quant']=='UD-Q4_K_XL' for w in x['workers']))
   self.assertEqual(len(x['unused_gpus']),0)
 
  def test_mixed_four_agent_layout_leaves_one_spare(self):
@@ -30,7 +30,7 @@ class CoderPlanTests(unittest.TestCase):
   r=p.parse_model_spec('qwen3.8-flash-next@gpu=2+3+4+5,vram=32G',{})
   x=p.build_plan([r],1,p.synthetic_v100(8),262144)
   self.assertEqual({g['index'] for g in x['workers'][0]['gpus']},{2,3,4,5})
-  self.assertEqual(x['workers'][0]['profile']['quant'],'UD-IQ4_XS')
+  self.assertEqual(x['workers'][0]['profile']['quant'],'UD-Q4_K_XL')
 
  def test_too_small_cap_fails_instead_of_overcommitting(self):
   with self.assertRaisesRegex(ValueError,'no fitting quant'):

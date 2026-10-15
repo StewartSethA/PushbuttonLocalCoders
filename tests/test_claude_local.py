@@ -85,7 +85,7 @@ class PlannerTests(unittest.TestCase):
     def test_heterogeneous_joint_placement(self):
         gpus = [
             planmod.GPU(0, "Tesla V100-SXM2-32GB", 32768, 32400, "7.0", "", 3, 16),
-            planmod.GPU(1, "RTX 4060 Ti", 16380, 16000, "8.9", "", 2, 8),
+            planmod.GPU(1, "RTX 4060 Ti", 16380, 13000, "8.9", "", 2, 8),
         ]
         p = planmod.plan(["q38", "q36"], gpus, 262144)
         by_model = {s["model"]: s for s in p["servers"]}
@@ -96,8 +96,8 @@ class PlannerTests(unittest.TestCase):
 
     def test_full_context_4060ti_profiles(self):
         gpus = [planmod.GPU(0, "RTX 4060 Ti", 16380, 16100, "8.9", "", 4, 8)]
-        self.assertEqual(planmod.plan(["q38"], gpus, 262144)["servers"][0]["profile"]["quant"], "IQ2_S")
-        self.assertEqual(planmod.plan(["q36"], gpus, 262144)["servers"][0]["profile"]["quant"], "UD-IQ2_M")
+        self.assertEqual(planmod.plan(["q38"], gpus, 262144)["servers"][0]["profile"]["quant"], "IQ3_XXS")
+        self.assertEqual(planmod.plan(["q36"], gpus, 262144)["servers"][0]["profile"]["quant"], "UD-IQ3_XXS")
 
 
 class GatewayTests(unittest.TestCase):
