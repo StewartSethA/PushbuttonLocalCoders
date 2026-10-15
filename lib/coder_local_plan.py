@@ -233,6 +233,11 @@ def request_capacity(req: WorkerRequest, profile: base.Profile, context: int,
                     kv_v=settings.get("kv_v", profile.kv_v))
     original = next((p for p in base.PROFILES[req.model] if p.quant == profile.quant), profile)
     settings["memory_estimate"] = capacity.memory_estimate(original, settings)
+    if settings.get("force") or "margin" in settings:
+        print(f"Warning: {req.model}: user-selected GPU memory policy "
+              f"(margin={settings.get('margin', 'automatic')} MiB, force={settings.get('force', False)}). "
+              "Planning estimates are not allocation guarantees; startup may run out of memory.",
+              file=sys.stderr)
     return settings
 
 

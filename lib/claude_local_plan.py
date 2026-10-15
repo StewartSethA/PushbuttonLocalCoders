@@ -471,6 +471,7 @@ def best_profile_for_capacity(
         raise ValueError(f"unsupported quant '{settings['quant']}' for {model}")
     if settings["context"] > max(p.native_context for p in PROFILES[model]):
         raise ValueError(f"context exceeds supported native context for {model}")
+    fallback = None
     for profile in PROFILES[model]:
         if not capacity.matches_quant(profile.quant, settings):
             continue
@@ -480,7 +481,10 @@ def best_profile_for_capacity(
         if req <= capacity_mib:
             return replace(profile, kv_k=settings.get("kv_k", profile.kv_k),
                            kv_v=settings.get("kv_v", profile.kv_v)), req
-    return None
+        if fallback is None or req < fallback[1]:
+            fallback = (replace(profile, kv_k=settings.get("kv_k", profile.kv_k),
+                                kv_v=settings.get("kv_v", profile.kv_v)), req)
+    return fallback if settings.get("force") else None
 
 
 def placement_candidates(model: str, gpus: list[GPU], context: int,
@@ -745,7 +749,9 @@ def plan(models: list[str], gpus: list[GPU], context: int, slots: int = 1,
             raise ValueError(
                 "cannot place requested model set: "
                 + "; ".join(unplaceable_detail(requests[i], gpus, context, slots) for i in unplaceable)
-                + ". Lower context/slots, use smaller KV types (kv_k/kv_v), fewer bits, or more GPUs"
+                + ". Lower context/slots, use smaller KV types (kv_k/kv_v), fewer bits, or more GPUs. "
+                "Set MODEL@margin=N (MiB) to choose the runtime/margin allowance, "
+                "or MODEL@force=true to try despite the estimate (may run out of memory)"
             )
         raise ValueError(
             f"cannot place requested model set at context {context:,} without "

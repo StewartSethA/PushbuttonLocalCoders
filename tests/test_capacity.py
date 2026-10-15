@@ -12,6 +12,99 @@ import coder_local_plan as coder
 
 
 class CapacityBudgetTests(unittest.TestCase):
+    def test_memory_policy_validation(self):
+        self.assertEqual(capacity.parse_options({"margin": "0", "force": "TRUE"}),
+                         {"margin": 0, "force": True})
+        self.assertEqual(capacity.parse_options({"margin": 512, "force": False}),
+                         {"margin": 512, "force": False})
+        for value in (-1, True, 1.5, "nan", "inf", "1G", None):
+            with self.subTest(margin=value), self.assertRaisesRegex(ValueError, "margin"):
+                capacity.parse_options({"margin": value})
+        for value in (1, 0, "yes", "", None):
+            with self.subTest(force=value), self.assertRaisesRegex(ValueError, "force"):
+                capacity.parse_options({"force": value})
+
+    def test_low_margin_allows_reported_qwen_configuration(self):
+        spec = "qwen3.6:35b@slots=2,bits=2,context=260000"
+        gpus = [base.GPU(0, "test GPU", 16384, 15564)]
+        with self.assertRaisesRegex(ValueError, "margin=N"):
+            base.plan([spec], gpus, 262144)
+        for margin in (0, 1024):
+            with self.subTest(margin=margin):
+                server = base.plan([spec + f",margin={margin}"], gpus, 262144)["servers"][0]
+                estimate = server["capacity"]["memory_estimate"]
+                self.assertEqual(server["capacity"]["context"], 260000)
+                self.assertEqual(server["capacity"]["slots"], 2)
+                self.assertEqual(estimate["overhead_mib"], margin)
+                self.assertLessEqual(server["required_mib"], gpus[0].free_mib)
+                self.assertGreaterEqual(server["headroom_mib"], 0)
+
+    def test_force_keeps_honest_estimates_and_uses_smallest_fallback(self):
+        spec = "qwen3.6:35b@slots=2,bits=2,context=260000"
+        gpus = [base.GPU(0, "test GPU", 16384, 15564)]
+        plans = [
+            (base.plan([spec + ",force=true"], gpus, 262144), "servers"),
+            (coder.build_plan([coder.parse_model_spec(spec + ",force=true")],
+                              None, gpus, 262144), "workers"),
+        ]
+        for result, key in plans:
+            with self.subTest(planner=key):
+                server = result[key][0]
+                self.assertEqual(server["profile"]["quant"], "UD-IQ2_M")
+                self.assertGreater(server["required_mib"], server["allocated_mib"])
+                self.assertLess(server["headroom_mib"], 0)
+                self.assertEqual(server["required_mib"], server["capacity"]["memory_estimate"]["required_mib"])
+        with self.assertRaises(ValueError):
+            base.plan([spec + ",force=false"], gpus, 262144)
+
+    def test_force_prefers_fitting_quant_and_respects_constraints(self):
+        spec = "qwen3.8:27b"
+        gpus = coder.synthetic_3090(1)
+        ordinary = base.plan([spec], gpus, 32768)["servers"][0]
+        forced = base.plan([spec + "@force=true"], gpus, 32768)["servers"][0]
+        self.assertEqual(ordinary["profile"]["quant"], forced["profile"]["quant"])
+        for specs in ([spec + "@force=true,context=9999999"],
+                      [spec + "@force=true,gpu=99"],
+                      [spec + "@force=true", spec + "@force=true"]):
+            with self.subTest(specs=specs), self.assertRaises(ValueError):
+                base.plan(specs, gpus, 32768)
+        capped = base.plan([spec + "@force=true,vram=1G"], gpus, 32768)["servers"][0]
+        self.assertEqual(capped["allocated_mib"], 1024)
+        self.assertLess(capped["headroom_mib"], 0)
+
+    def test_margin_is_total_allowance_for_catalog_and_custom_profiles(self):
+        from dataclasses import replace
+        profiles = [
+            base.PROFILES["ornith-1.5:35b-a3b"][0],
+            replace(base.PROFILES["qwen3.8:27b"][0],
+                    weight_mib=2048, attention_layers=0, kv_width=0),
+        ]
+        for profile in profiles:
+            with self.subTest(model=profile.model):
+                estimates = [capacity.memory_estimate(profile, capacity.resolve_options(
+                    {"margin": margin, "slots": 2}, 32768)) for margin in (0, 256)]
+                self.assertEqual(estimates[0]["overhead_mib"], 0)
+                self.assertEqual(estimates[1]["required_mib"] - estimates[0]["required_mib"], 256)
+
+    def test_force_and_margin_work_without_architecture_metadata(self):
+        from dataclasses import replace
+        model = "test-unknown-architecture"
+        profile = replace(base.PROFILES["qwen3.8:27b"][0], model=model)
+        with patch.dict(base.PROFILES, {model: (profile,)}):
+            ordinary = capacity.memory_estimate(profile, capacity.resolve_options({}, 32768))
+            custom = capacity.memory_estimate(profile, capacity.resolve_options({"margin": 256}, 32768))
+            self.assertEqual(custom["required_mib"], ordinary["required_mib"] + 256)
+            self.assertIsNone(base.best_profile_for_capacity(model, 1, 32768))
+            self.assertIsNotNone(base.best_profile_for_capacity(model, 1, 32768, {"force": True}))
+
+    def test_model_policy_defaults_and_cli_override(self):
+        model = "qwen3.6:35b"
+        defaults = {model: {"margin": 512, "force": True}}
+        req = coder.parse_model_spec(model, defaults)
+        self.assertEqual(req.capacity, {"margin": 512, "force": True})
+        req = coder.parse_model_spec(model + "@margin=0,force=false", defaults)
+        self.assertEqual(req.capacity, {"margin": 0, "force": False})
+
     def test_six_small_presets_resolve_metadata_without_guessed_sizes(self):
         self.assertEqual(len(base.SMALL_MODELS), 6)
         for model, preset in base.SMALL_MODELS.items():

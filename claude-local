@@ -77,6 +77,8 @@ Harness options (put before ordinary Claude Code flags):
   --agents N                 replicate model configs into N instances (1-4)
                              JSON agent definitions still pass to Claude Code
   MODEL@context=N,slots=N,output=N,client_context=N,compact=N,quant=Q,kv_k=K,kv_v=V,min_tps=N,admission=N
+  MODEL@margin=N,force=true   runtime/safety allowance in MiB (0 allowed);
+                             force tries even if estimated VRAM exceeds free memory
   --local-client-context N   assumed client window (default derived, <=200000)
   --local-port-base N        starting port for gateway/backends
   --local-no-teams           disable experimental Claude agent teams
