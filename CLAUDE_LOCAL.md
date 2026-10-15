@@ -102,6 +102,28 @@ an estimated **18 GiB** of q4_0 KV plus runtime/margin, so the total still excee
 profiles retain these planning assumptions; small-model presets and custom
 sources resolve GGUF sizes and architecture metadata as described below.
 
+The memory allowance is user-controlled for every GPU model, including custom
+GGUF sources. Add `margin=N` to a model spec to replace the automatic combined
+runtime/safety allowance with **N MiB**, including zero. Defaults remain
+1,536 MiB plus 3% of estimated weights (with per-slot runtime allowances for
+recurrent models). This is a planning choice, not a change to llama.cpp's actual
+allocation. If architecture metadata is unavailable, the existing envelope
+cannot be split into weights/KV/runtime; `margin=N` adds N MiB to that envelope.
+
+```bash
+claude-local 'qwen3.6:35b@slots=2,bits=2,context=260000,margin=1024'
+claude-local 'qwen3.6:35b@slots=2,bits=2,context=260000,force=true'
+```
+
+`force=true` allows an attempt even when the estimated requirement exceeds free
+VRAM. The planner first prefers a fitting quant; otherwise it tries the smallest
+matching quant, without changing requested bits, context, slots or KV precision.
+Estimates and negative headroom remain visible, and a warning is emitted.
+GPU selection, disjoint placement, native-context limits and startup validation
+still apply. Actual loading may fail with an out-of-memory error; force does not
+enable offloading. `margin` and boolean `force` also work in per-model placement
+JSON defaults; explicit model-spec fields take precedence.
+
 ### Low-memory GPUs
 
 One compact built-in model is **`ornith-1.5:9b`** (`ornith` / `ornith-9b`).

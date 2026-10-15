@@ -124,10 +124,18 @@ Repeating model specs with different overrides configures individual coder
 replicas. Claude/Hermes roles sharing a server must agree on its settings.
 
 Optional spec keys are `client_context`, `compact`, `safety`, `quant`, `kv_k`, `kv_v`,
-`min_tps`, and `admission`, in addition to `slots`, `context`, `output`, `gpu`,
+`min_tps`, `admission`, `margin`, and `force`, in addition to `slots`, `context`, `output`, `gpu`,
 and `vram`. Weight quantization and K/V-cache precision are separate choices.
 Explicit choices that cannot fit are rejected rather than silently reducing
 context or slots. Unspecified quantization is selected from supported profiles.
+For GPU models, `margin=N` selects the combined runtime/safety allowance in MiB
+(zero allowed), replacing the automatic allowance when weights/KV are known.
+Without architecture metadata, it adds N MiB to the unsplit envelope instead.
+`force=true` permits a launch attempt despite the memory estimate, preserving
+reported requirements and negative headroom. It prefers fitting quants, then
+the smallest matching quant; requested context/slots and GPU isolation remain
+binding. These overrides warn and may cause an out-of-memory failure at startup.
+For example: `claude-local 'qwen3.6:35b@slots=2,bits=2,context=260000,force=true'`.
 Coder placement configuration accepts the same per-model capacity defaults:
 
 ```json

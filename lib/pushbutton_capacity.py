@@ -8,6 +8,7 @@ import re
 OPTION_KEYS = {
     "slots", "context", "output", "client_context", "compact", "quant", "bits",
     "kv_k", "kv_v", "min_tps", "admission", "admission_limit", "safety",
+    "margin", "force",
 }
 KV_TYPES = {"f32": 4.0, "f16": 2.0, "bf16": 2.0, "q8_0": 1.0625,
             "q4_0": 0.5625, "q4_1": 0.625, "q5_0": 0.6875, "q5_1": 0.75}
@@ -94,6 +95,17 @@ def parse_options(options: dict) -> dict:
             result[name] = positive_int(value, name)
             if name == "slots" and result[name] > 128:
                 raise ValueError("slots must be between 1 and 128")
+        elif name == "margin":
+            if isinstance(value, bool) or not re.fullmatch(r"[0-9]+", str(value).strip()):
+                raise ValueError("margin must be a nonnegative integer in MiB")
+            result[name] = int(value)
+        elif name == "force":
+            if isinstance(value, bool):
+                result[name] = value
+            elif isinstance(value, str) and value.strip().lower() in {"true", "false"}:
+                result[name] = value.strip().lower() == "true"
+            else:
+                raise ValueError("force must be true or false")
         elif name == "bits":
             if isinstance(value, bool) or not re.fullmatch(r"[0-9]+", str(value).strip()) or int(value) < 1:
                 raise ValueError("bits must be a positive integer")
@@ -217,6 +229,7 @@ def memory_estimate(profile, capacity: dict) -> dict:
         ratio = max(1.0, KV_TYPES[k] / KV_TYPES[profile.kv_k], KV_TYPES[v] / KV_TYPES[profile.kv_v])
         scale = tokens / profile.native_context * ratio
         required = math.ceil(profile.required_mib * (0.85 + 0.15 * scale))
+        required += capacity.get("margin", 0)
         return {"status": "ESTIMATED", "method": "15% context-dependent envelope heuristic",
                 "architecture_exact": False, "required_mib": required,
                 "context_tokens_total": tokens, "kv_precision_multiplier": ratio,
@@ -241,6 +254,7 @@ def memory_estimate(profile, capacity: dict) -> dict:
                 "quantization_overhead_mib": math.ceil(weights_mib - nominal * 1024),
             }
     overhead_mib += weights_mib * (WEIGHT_MARGIN - 1)
+    overhead_mib = capacity.get("margin", overhead_mib)
     base_mib = weights_mib + overhead_mib
     required = math.ceil(base_mib + kv_mib)
     return {"status": "ESTIMATED", "method": "weights + architecture KV x context x slots + runtime overhead",

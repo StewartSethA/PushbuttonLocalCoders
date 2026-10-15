@@ -471,6 +471,7 @@ def best_profile_for_capacity(
         raise ValueError(f"unsupported quant '{settings['quant']}' for {model}")
     if settings["context"] > max(p.native_context for p in PROFILES[model]):
         raise ValueError(f"context exceeds supported native context for {model}")
+    fallback = None
     for profile in PROFILES[model]:
         if not capacity.matches_quant(profile.quant, settings):
             continue
@@ -480,7 +481,10 @@ def best_profile_for_capacity(
         if req <= capacity_mib:
             return replace(profile, kv_k=settings.get("kv_k", profile.kv_k),
                            kv_v=settings.get("kv_v", profile.kv_v)), req
-    return None
+        if fallback is None or req < fallback[1]:
+            fallback = (replace(profile, kv_k=settings.get("kv_k", profile.kv_k),
+                                kv_v=settings.get("kv_v", profile.kv_v)), req)
+    return fallback if settings.get("force") else None
 
 
 def placement_candidates(model: str, gpus: list[GPU], context: int,
@@ -516,6 +520,7 @@ def placement_candidates(model: str, gpus: list[GPU], context: int,
         dominated = any(
             other is not c
             and other.card_count < c.card_count
+            and (other.headroom_mib >= 0 or c.headroom_mib < 0)
             and other.profile.quality >= c.profile.quality
             and (other.mask & c.mask) == other.mask
             for other in raw
@@ -535,6 +540,7 @@ def single_model_choice(
     return min(
         candidates,
         key=lambda c: (
+            c.headroom_mib < 0,
             c.card_count,             # do not split unless necessary
             -c.free_mib,              # most free remaining first
             -c.link_score,            # then max system-aware PCIe capability
@@ -549,6 +555,7 @@ def _candidate_score(c: Candidate, sonnet_model: str) -> tuple[int, ...]:
     """Additive lexicographic contribution; larger totals are better."""
     is_sonnet = c.model == sonnet_model
     return (
+        -int(c.headroom_mib < 0),              # prefer complete fitting plans
         -c.card_count,                         # preserve concurrency
         c.profile.quality,                    # maximize aggregate quant quality
         c.free_mib if is_sonnet else 0,       # roomy daily-driver placement
@@ -591,7 +598,7 @@ def joint_model_choices(
         for model in order:
             available = {gpus.index(g) for g in remaining}
             viable = [c for c in candidates[model] if set(c.gpu_positions) <= available]
-            local = min(viable, key=lambda c: (c.card_count, -c.free_mib, -c.link_score,
+            local = min(viable, key=lambda c: (c.headroom_mib < 0, c.card_count, -c.free_mib, -c.link_score,
                                                -c.profile.quality, -c.speed_score)) if viable else None
             if local is None:
                 return None
@@ -620,7 +627,7 @@ def joint_model_choices(
         key=lambda m: min(c.required_mib for c in candidates[m]),
         reverse=True,
     )
-    zero_score = (0,) * 9
+    zero_score = (0,) * 10
 
     @lru_cache(maxsize=None)
     def search(
@@ -730,7 +737,7 @@ def plan(models: list[str], gpus: list[GPU], context: int, slots: int = 1,
                                               quality_filter=False) for i in instances}
     if len(instances) == 1:
         candidates = candidate_map[0]
-        picked = min(candidates, key=lambda c: (c.card_count, -c.free_mib, -c.link_score,
+        picked = min(candidates, key=lambda c: (c.headroom_mib < 0, c.card_count, -c.free_mib, -c.link_score,
                      -c.profile.quality, -c.speed_score,
                      tuple(gpus[p].index for p in c.gpu_positions))) if candidates else None
         choices = [picked] if picked else None
@@ -745,7 +752,9 @@ def plan(models: list[str], gpus: list[GPU], context: int, slots: int = 1,
             raise ValueError(
                 "cannot place requested model set: "
                 + "; ".join(unplaceable_detail(requests[i], gpus, context, slots) for i in unplaceable)
-                + ". Lower context/slots, use smaller KV types (kv_k/kv_v), fewer bits, or more GPUs"
+                + ". Lower context/slots, use smaller KV types (kv_k/kv_v), fewer bits, or more GPUs. "
+                "Set MODEL@margin=N (MiB) to choose the runtime/margin allowance, "
+                "or MODEL@force=true to try despite the estimate (may run out of memory)"
             )
         raise ValueError(
             f"cannot place requested model set at context {context:,} without "
