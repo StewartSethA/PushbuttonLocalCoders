@@ -247,6 +247,11 @@ class CapacityBudgetTests(unittest.TestCase):
             with self.subTest(quant=quant):
                 self.assertAlmostEqual(cpu_platform.nominal_weight_gib("qwen3.6:35b", quant),
                                        35e9 * bits / 8 / 2**30)
+        for quant, bits in (("BF16", 16), ("FP16", 16), ("F16", 16), ("FP32", 32)):
+            with self.subTest(quant=quant):
+                self.assertEqual(cpu_platform.quant_bpw(quant), bits)
+                self.assertAlmostEqual(cpu_platform.weight_gib("qwen3.6:35b", quant),
+                                       35e9 * bits / 8 / 2**30)
         mixed = "mixed-Q2_0-Q4_0-2.97BPW"
         self.assertIsNone(cpu_platform.nominal_weight_gib("qwen3.6:35b", mixed))
         self.assertIsNone(cpu_platform.nominal_weight_gib("unknown", "Q4_K_M"))

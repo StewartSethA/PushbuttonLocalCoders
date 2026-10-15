@@ -713,7 +713,10 @@ def quant_bpw(quant: str) -> float:
     m = re.search(r"([0-9.]+)BPW", q)
     if m:
         return float(m.group(1))
-    m = re.search(r"(?:IQ|Q|FP)([0-9])", q)
+    m = re.fullmatch(r"(?:BF|FP|F)([0-9]+)", q)
+    if m:
+        return float(m.group(1))
+    m = re.search(r"(?:IQ|Q|FP)([0-9]+)", q)
     return float(m.group(1)) + 0.5 if m else 4.5
 
 
