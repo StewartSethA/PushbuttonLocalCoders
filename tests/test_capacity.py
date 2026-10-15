@@ -72,6 +72,24 @@ class CapacityBudgetTests(unittest.TestCase):
         self.assertEqual(capped["allocated_mib"], 1024)
         self.assertLess(capped["headroom_mib"], 0)
 
+    def test_force_prefers_complete_fitting_multi_gpu_plans(self):
+        spec = "qwen3.6:35b@slots=2,bits=2,context=260000,force=true"
+        gpus = [base.GPU(i, "test GPU", 16384, 15564) for i in range(4)]
+        for count in (1, 2):
+            plans = [
+                (base.plan([spec] * count, gpus, 262144), "servers"),
+                (coder.build_plan([coder.parse_model_spec(spec)] * count,
+                                  None, gpus, 262144), "workers"),
+            ]
+            for result, key in plans:
+                with self.subTest(count=count, planner=key):
+                    for server in result[key]:
+                        self.assertGreaterEqual(server["headroom_mib"], 0)
+                        self.assertEqual(len(server["gpus"]), 2)
+        # When no fully fitting disjoint plan exists, still permit forced attempts.
+        forced = base.plan([spec] * 2, gpus[:2], 262144)["servers"]
+        self.assertTrue(all(s["headroom_mib"] < 0 for s in forced))
+
     def test_margin_is_total_allowance_for_catalog_and_custom_profiles(self):
         from dataclasses import replace
         profiles = [

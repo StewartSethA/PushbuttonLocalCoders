@@ -183,6 +183,7 @@ def expand_workers(requests: list[WorkerRequest], agents: int | None) -> list[Wo
 
 def score(c: base.Candidate) -> tuple[int, ...]:
     return (
+        -int(c.headroom_mib < 0),
         -c.card_count,
         c.profile.quality,
         c.headroom_mib,
@@ -195,8 +196,11 @@ def score(c: base.Candidate) -> tuple[int, ...]:
 def _near_best(candidates: list[base.Candidate], quality_slack: int = 3) -> list[base.Candidate]:
     if not candidates:
         return candidates
-    best = max(c.profile.quality for c in candidates)
-    kept = [c for c in candidates if c.profile.quality >= best - quality_slack]
+    best = {}
+    for c in candidates:
+        fits = c.headroom_mib >= 0
+        best[fits] = max(best.get(fits, c.profile.quality), c.profile.quality)
+    kept = [c for c in candidates if c.profile.quality >= best[c.headroom_mib >= 0] - quality_slack]
     return kept or candidates
 
 
@@ -271,7 +275,7 @@ def choose_workers(requests: list[WorkerRequest], gpus: list[base.GPU], context:
     @lru_cache(maxsize=None)
     def search(i: int, used: int):
         if i == len(requests):
-            return (0, 0, 0, 0, 0, 0), ()
+            return (0, 0, 0, 0, 0, 0, 0), ()
         best = None
         for c in candidates[i]:
             if c.mask & used:
