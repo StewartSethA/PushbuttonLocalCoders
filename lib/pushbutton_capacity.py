@@ -190,7 +190,8 @@ def memory_estimate(profile, capacity: dict) -> dict:
     """Weights + architecture-derived KV for every slot + runtime overhead.
 
     Weights use the catalogued GGUF size when known, otherwise total parameters
-    and nominal quantization bits (or explicitly specified BPW). A full-context
+    and effective quantization bits (including block/mixed-precision overhead).
+    Nominal-bit ballparks are reported separately, never used to prove a fit. A full-context
     profile envelope is not a weight measurement.
     """
     context = capacity["context"]
@@ -225,24 +226,30 @@ def memory_estimate(profile, capacity: dict) -> dict:
     if getattr(profile, "attention_layers", None) == 0 or any(
             "recurrent" in note.lower() for note in getattr(profile, "architecture_notes", ())):
         overhead_mib *= capacity["slots"]
+    weight_details = {}
     if weights is not None:
         weights_mib, source = weights, "gguf-metadata" if resolved_weights else "catalog"
     else:
         import cpu_platform
         weights_mib = cpu_platform.weight_gib(profile.model, profile.quant) * 1024
-        source = "parameters-bpw"
+        source = "parameters-effective-bpw"
+        nominal = cpu_platform.nominal_weight_gib(profile.model, profile.quant)
+        if nominal is not None:
+            weight_details = {
+                "nominal_weights_gb": nominal * 2**30 / 1e9,
+                "effective_bits_per_weight": cpu_platform.quant_bpw(profile.quant),
+                "quantization_overhead_mib": math.ceil(weights_mib - nominal * 1024),
+            }
     overhead_mib += weights_mib * (WEIGHT_MARGIN - 1)
     base_mib = weights_mib + overhead_mib
     required = math.ceil(base_mib + kv_mib)
     return {"status": "ESTIMATED", "method": "weights + architecture KV x context x slots + runtime overhead",
             "architecture_exact": False, "required_mib": required,
-            "weights_mib": math.ceil(weights_mib), "weights_source": source,
+            "weights_mib": math.ceil(weights_mib), "weights_source": source, **weight_details,
             "kv_mib": math.ceil(kv_mib), "kv_bytes_per_token": per_token,
             "overhead_mib": math.ceil(overhead_mib), "context_tokens_total": tokens,
             "kv_k": k, "kv_v": v,
             "architecture_source": getattr(profile, "architecture_source", "") or "planning-table",
             "architecture_notes": list(getattr(profile, "architecture_notes", ())),
             "kv_precision_multiplier": round(per_token / native_per_token, 4) if native_per_token else 1.0,
-            "note": "Planning architecture assumptions; validate actual allocation at startup."
-                    + (" Nominal-bit weight ballpark excludes GGUF quantization overhead."
-                       if source == "parameters-bpw" else "")}
+            "note": "Planning architecture assumptions; validate actual allocation at startup."}

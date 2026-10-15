@@ -700,6 +700,13 @@ def unplaceable_detail(request, gpus: list[GPU], context: int, slots: int = 1) -
                  f"for {settings['slots']} slot(s) x {settings['context']:,} tokens at "
                  f"{est['kv_k']}/{est['kv_v']} + runtime/margin {est['overhead_mib'] / MIB_PER_GIB:.1f}; "
                  f"weights source: {est['weights_source']}; KV uses planning architecture)")
+        if "nominal_weights_gb" in est:
+            nominal = est["nominal_weights_gb"]
+            text += (f"; nominal packed weights {nominal:.2f} GB"
+                     f" ({nominal * 1e9 / 2**30:.2f} GiB, Gparams * bits / 8),"
+                     f" plus estimated quantization/mixed-precision overhead"
+                     f" {est['quantization_overhead_mib'] / MIB_PER_GIB:.2f} GiB"
+                     f" ({est['effective_bits_per_weight']:g} effective bits/weight)")
     text += f"; {where} have {free_mib / MIB_PER_GIB:.1f} GiB free"
     if len(per_gpu) > 1:
         text += f" (largest single GPU {max(per_gpu) / MIB_PER_GIB:.1f} GiB)"

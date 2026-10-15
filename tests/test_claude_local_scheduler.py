@@ -52,7 +52,7 @@ class SchedulerPolicyTests(unittest.TestCase):
     def test_joint_plan_preserves_large_gpu_for_large_model(self):
         gpus = [
             planmod.GPU(0, "Tesla V100-SXM2-32GB", 32768, 32400, "7.0", "", 3, 16),
-            planmod.GPU(1, "RTX 4060 Ti", 16380, 13000, "8.9", "", 4, 8),
+            planmod.GPU(1, "RTX 4060 Ti", 16380, 16000, "8.9", "", 4, 8),
         ]
         p = planmod.plan(["q38", "q36"], gpus, 262144)
         by_model = {s["model"]: s for s in p["servers"]}

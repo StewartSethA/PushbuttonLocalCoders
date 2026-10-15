@@ -245,7 +245,7 @@ class SelectorTests(unittest.TestCase):
         obj = json.loads(out)
         self.assertEqual(code, 0, obj)
         self.assertEqual([len(w['gpus']) for w in obj['plan']['workers']], [4, 1])
-        self.assertEqual(obj['plan']['workers'][0]['profile']['quant'], 'UD-Q4_K_XL')
+        self.assertEqual(obj['plan']['workers'][0]['profile']['quant'], 'UD-IQ4_XS')
         self.assertEqual(obj['plan']['workers'][1]['vram_limit_mib_per_gpu'], 30720)
         self.assertEqual(len(obj['plan']['unused_gpus']), 1)
         self.assertTrue(any(arg.startswith('qwen3.8:27b@gpu=4,vram=30720MiB,')

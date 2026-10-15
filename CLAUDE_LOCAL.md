@@ -80,18 +80,23 @@ Run a dry plan before downloading anything:
 claude-local qwen3.6:35b qwen3.8:27b --local-dry-run
 ```
 
-Memory planning separates weights from KV and runtime buffers. Catalogued GGUF
-sizes take precedence; otherwise weights are estimated from total parameters
-and nominal quantization bits: **Gparams × bits / 8 = GB** (decimal). For
+Memory planning separates weights from KV and runtime buffers. The ideal packed
+weight ballpark is **Gparams × bits / 8 = GB** (decimal). For
 example, 16B at 2 bits is 4 GB (**3.73 GiB**), and 35B at 2 bits is 8.75 GB
 (**8.15 GiB**). Explicit BPW labels are used for mixed-precision quants.
-These ballparks exclude GGUF quantization/block overhead; known GGUF sizes
-override them. Weights are not extracted from a full-context VRAM envelope.
-These are estimates, not measured allocations.
+These ballparks exclude quantization scales, block metadata and higher-precision
+tensors. They are not sufficient to prove that a GGUF fits. Resolved GGUF sizes
+and catalogued sizes take precedence for placement; otherwise the planner uses
+total parameters and **effective bits per weight**, including estimated
+quantization/mixed-precision overhead. Failure diagnostics show the nominal
+ballpark and this overhead separately. For `UD-IQ2_M`, the fallback is 2.7
+effective bits, so 35B weights are estimated at **11.00 GiB**, not 8.15 GiB.
+This is an assumption, not a measured size; using a custom GGUF source resolves
+the actual size. Weights are never extracted from a full-context VRAM envelope.
 KV uses the registered attention architecture and scales with context **per
 slot** times slots; weights are loaded once. For `qwen3.8:27b` at `UD-Q4_K_M`,
-the fallback weight estimate is about **12.57 GiB** (27 billion parameters at
-4 nominal bits), not 35.5 GiB of weights. Four 262,144-token slots add
+the fallback weight estimate is about **15.25 GiB** (27 billion parameters at
+4.85 effective bits), not 35.5 GiB of weights. Four 262,144-token slots add
 an estimated **18 GiB** of q4_0 KV plus runtime/margin, so the total still exceeds
 31.3 GiB. Four 131,072-token slots halve that KV estimate. Existing curated
 profiles retain these planning assumptions; small-model presets and custom
