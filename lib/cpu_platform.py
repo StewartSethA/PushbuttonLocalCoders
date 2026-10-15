@@ -713,11 +713,25 @@ def quant_bpw(quant: str) -> float:
     m = re.search(r"([0-9.]+)BPW", q)
     if m:
         return float(m.group(1))
-    m = re.search(r"(?:IQ|Q|FP)([0-9])", q)
+    m = re.fullmatch(r"(?:BF|FP|F)([0-9]+)", q)
+    if m:
+        return float(m.group(1))
+    m = re.search(r"(?:IQ|Q|FP)([0-9]+)", q)
     return float(m.group(1)) + 0.5 if m else 4.5
 
 
+def nominal_weight_gib(model: str, quant: str) -> float | None:
+    """Ideal packed-weight ballpark, excluding quantization metadata/mixed tensors."""
+    import pushbutton_capacity
+    arch = MODEL_ARCH.get(model)
+    bits = pushbutton_capacity.quant_bits(quant)
+    if arch is None or bits is None or "BPW" in quant.upper():
+        return None
+    return arch["total_b"] * 1e9 * bits / 8 / 2**30
+
+
 def weight_gib(model: str, quant: str) -> float:
+    """Known GGUF size, otherwise total parameters * effective bits / 8 in GiB."""
     for q in _catalog().get(model, {}).get("quants", []) or []:
         if str(q.get("name", "")).upper() == quant.upper():
             return float(q["weight_gib"])
