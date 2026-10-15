@@ -718,13 +718,18 @@ def quant_bpw(quant: str) -> float:
 
 
 def weight_gib(model: str, quant: str) -> float:
+    """Known GGUF size, otherwise parameters * nominal bits / 8 in GiB."""
     for q in _catalog().get(model, {}).get("quants", []) or []:
         if str(q.get("name", "")).upper() == quant.upper():
             return float(q["weight_gib"])
     arch = MODEL_ARCH.get(model)
     if not arch:
         raise ValueError(f"no CPU planning architecture for {model}")
-    return arch["total_b"] * 1e9 * quant_bpw(quant) / 8 / 2**30
+    import pushbutton_capacity
+    bits = pushbutton_capacity.quant_bits(quant) if "BPW" not in quant.upper() else None
+    if bits is None:
+        bits = quant_bpw(quant)
+    return arch["total_b"] * 1e9 * bits / 8 / 2**30
 
 
 def _metadata_weights(profile) -> float:

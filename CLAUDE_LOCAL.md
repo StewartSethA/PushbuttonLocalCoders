@@ -82,12 +82,16 @@ claude-local qwen3.6:35b qwen3.8:27b --local-dry-run
 
 Memory planning separates weights from KV and runtime buffers. Catalogued GGUF
 sizes take precedence; otherwise weights are estimated from total parameters
-and effective quantization bits, including block overhead, not extracted from a
-full-context VRAM envelope. These are estimates, not measured allocations.
+and nominal quantization bits: **Gparams × bits / 8 = GB** (decimal). For
+example, 16B at 2 bits is 4 GB (**3.73 GiB**), and 35B at 2 bits is 8.75 GB
+(**8.15 GiB**). Explicit BPW labels are used for mixed-precision quants.
+These ballparks exclude GGUF quantization/block overhead; known GGUF sizes
+override them. Weights are not extracted from a full-context VRAM envelope.
+These are estimates, not measured allocations.
 KV uses the registered attention architecture and scales with context **per
 slot** times slots; weights are loaded once. For `qwen3.8:27b` at `UD-Q4_K_M`,
-the fallback weight estimate is about **15.25 GiB** (27 billion parameters at
-4.85 effective bits), not 35.5 GiB of weights. Four 262,144-token slots add
+the fallback weight estimate is about **12.57 GiB** (27 billion parameters at
+4 nominal bits), not 35.5 GiB of weights. Four 262,144-token slots add
 an estimated **18 GiB** of q4_0 KV plus runtime/margin, so the total still exceeds
 31.3 GiB. Four 131,072-token slots halve that KV estimate. Existing curated
 profiles retain these planning assumptions; small-model presets and custom

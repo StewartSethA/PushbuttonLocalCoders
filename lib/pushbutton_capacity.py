@@ -190,7 +190,7 @@ def memory_estimate(profile, capacity: dict) -> dict:
     """Weights + architecture-derived KV for every slot + runtime overhead.
 
     Weights use the catalogued GGUF size when known, otherwise total parameters
-    and effective quantization bits (including block overhead). A full-context
+    and nominal quantization bits (or explicitly specified BPW). A full-context
     profile envelope is not a weight measurement.
     """
     context = capacity["context"]
@@ -230,7 +230,7 @@ def memory_estimate(profile, capacity: dict) -> dict:
     else:
         import cpu_platform
         weights_mib = cpu_platform.weight_gib(profile.model, profile.quant) * 1024
-        source = "parameters-effective-bpw"
+        source = "parameters-bpw"
     overhead_mib += weights_mib * (WEIGHT_MARGIN - 1)
     base_mib = weights_mib + overhead_mib
     required = math.ceil(base_mib + kv_mib)
@@ -243,4 +243,6 @@ def memory_estimate(profile, capacity: dict) -> dict:
             "architecture_source": getattr(profile, "architecture_source", "") or "planning-table",
             "architecture_notes": list(getattr(profile, "architecture_notes", ())),
             "kv_precision_multiplier": round(per_token / native_per_token, 4) if native_per_token else 1.0,
-            "note": "Planning architecture assumptions; validate actual allocation at startup."}
+            "note": "Planning architecture assumptions; validate actual allocation at startup."
+                    + (" Nominal-bit weight ballpark excludes GGUF quantization overhead."
+                       if source == "parameters-bpw" else "")}
