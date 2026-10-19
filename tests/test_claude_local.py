@@ -227,11 +227,31 @@ class PlannerTests(unittest.TestCase):
         self.assertIn("largest single GPU 15.8 GiB", message)
         self.assertIn("Lower context/slots", message)
 
+    def test_reported_two_gpu_setup_does_not_keep_smaller_curated_estimate(self):
+        gpus = [planmod.GPU(i, "RTX 4060 Ti", 16384, 16179) for i in range(2)]
+
+        def metadata(repo):
+            quant, gib = ("IQ1_S", 5) if "27B" in repo else ("UD-IQ2_M", 12)
+            return {"sha": "b" * 40, "siblings": [
+                {"rfilename": f"model-{quant}.gguf", "size": int(gib * 2**30)}]}
+
+        with mock.patch("gguf_source.fetch_metadata", side_effect=metadata):
+            with self.assertRaises(ValueError) as error:
+                planmod.plan(["qwen3.8:27b@slots=2", "qwen3.6:35b@slots=2"],
+                             gpus, 262144)
+        self.assertIn("weights 12.0", str(error.exception))
+        self.assertIn("weights source: gguf-metadata", str(error.exception))
+
     def test_reported_two_gpu_setup_half_context_fits_without_network(self):
         gpus = [planmod.GPU(i, "RTX 4060 Ti", 16384, 16179) for i in range(2)]
         with mock.patch("gguf_source.fetch_metadata") as fetch:
             result = planmod.plan(
                 ["qwen3.8:27b@slots=2", "qwen3.6:35b@slots=2"], gpus, 131072)
+            with self.assertRaisesRegex(budgetmod.BudgetError, "minimum auto-compaction window"):
+                budgetmod.shared_policy(budgetmod.planned_routes(result), "", {})
+            result = planmod.plan(
+                ["qwen3.8:27b@slots=2,compact=100000",
+                 "qwen3.6:35b@slots=2,compact=100000"], gpus, 131072)
         fetch.assert_not_called()
         self.assertEqual([s["profile"]["quant"] for s in result["servers"]],
                          ["IQ2_S", "UD-IQ3_XXS"])
@@ -242,6 +262,9 @@ class PlannerTests(unittest.TestCase):
             self.assertEqual(server["capacity"]["slots"], 2)
             self.assertEqual(server["capacity"]["context"], 131072)
             self.assertGreaterEqual(server["headroom_mib"], 0)
+        policy = budgetmod.shared_policy(budgetmod.planned_routes(result), "", {})
+        self.assertEqual(policy["compact_window"], 100000)
+        self.assertLess(policy["compact_window"], policy["client_context"])
 
 
 class GatewayTests(unittest.TestCase):

@@ -15,8 +15,10 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "lib"))
 FIXTURE_DIR = pathlib.Path("/tmp/pushbutton-test-fixtures")
 FRONTENDS = ("coder-local", "claude-local", "hermes-local")
 WRAPPERS = ("qwen-local", "opencode-local", "deepseek-local", "mini-swe-local")
@@ -106,6 +108,92 @@ wait
                 registry = next(self.root.glob("coder-backends.*.tsv")) if frontend == "coder-local" else \
                     next(self.root.glob("backends.*" if frontend == "claude-local" else "hermes-backends.*"))
                 self.assertEqual(json.loads(registry.read_text().strip().split("\t")[-1]), self.capacity)
+
+    def test_reported_two_gpu_plan_launches_and_verifies_both_two_slot_backends(self):
+        import claude_local_plan as planner
+        import claude_local_budget as budget
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                raw = json.dumps({"total_slots": 2, "n_ctx_slot": self.server.context}).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                raw = json.dumps({"input_tokens": 20}).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def log_message(self, *args):
+                pass
+
+        servers = []
+        for _ in range(2):
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            self.addCleanup(server.server_close)
+            self.addCleanup(server.shutdown)
+            servers.append(server)
+
+        def metadata(repo):
+            # Synthetic sizes test the fallback path, not real GPU allocations.
+            quant, gib = ("IQ1_S", 5) if "27B" in repo else ("UD-IQ2_M", 9)
+            return {"sha": "c" * 40, "siblings": [
+                {"rfilename": f"model-{quant}.gguf", "size": int(gib * 2**30)}]}
+
+        for context in (262144, 131072):
+            with self.subTest(context=context):
+                for server in servers:
+                    server.context = context
+                compact = ",compact=100000" if context == 131072 else ""
+                with mock.patch("gguf_source.fetch_metadata", side_effect=metadata) as fetch:
+                    plan = planner.plan(
+                        [f"qwen3.8:27b@slots=2{compact}", f"qwen3.6:35b@slots=2{compact}"],
+                        [planner.GPU(i, "RTX 4060 Ti", 16384, 16179) for i in range(2)],
+                        context)
+                if context == 131072:
+                    fetch.assert_not_called()
+                self.plan.write_text(json.dumps(plan))
+                self.run_functions("claude-local", ["server_rows", "start_backends", "verify_capacity"],
+                                   f"""
+QWEN_TEMPLATE="$STATE_DIR/template.jinja"
+say(){{ :; }}; good(){{ :; }}; die(){{ echo "$*" >&2; exit 1; }}
+validate_download_space(){{ :; }}
+download_model_fast(){{ printf -v "$3" '%s' model.gguf; }}
+free_port(){{ if [[ "$1" == 18001 ]]; then echo {servers[0].server_port}; else echo {servers[1].server_port}; fi; }}
+start_log_follower(){{ echo ''; }}; stop_log_follower(){{ :; }}
+env(){{ printf '%s\\n' "$@" >"$STATE_DIR/${{1#*=}}.args"; }}
+start_backends
+wait
+""")
+                rows = next(self.root.glob("backends.*")).read_text().splitlines()
+                backends = {}
+                for row, expected in zip(rows, plan["servers"]):
+                    model_id, port, hf_spec, capacity_json = row.split("\t")
+                    backends[model_id] = int(port)
+                    self.assertEqual(hf_spec, expected["profile"]["hf_spec"])
+                    self.assertEqual(json.loads(capacity_json), expected["capacity"])
+                    args = (self.root / f"{expected['cuda_visible_devices']}.args").read_text().splitlines()
+                    self.assertEqual(args[args.index("-c") + 1], str(context * 2))
+                    self.assertEqual(args[args.index("-np") + 1], "2")
+                    self.assertIn("--no-context-shift", args)
+                    self.assertIn("GGML_CUDA_ENABLE_UNIFIED_MEMORY=0", args)
+                    self.assertLessEqual(expected["required_mib"], expected["allocated_mib"])
+                self.assertEqual(len(rows), 2)
+                self.assertEqual(len({s["cuda_visible_devices"] for s in plan["servers"]}), 2)
+                config = budget.prepare_config(plan, backends, context, "", {})
+                self.assertEqual(config["budget"]["capacity"], context)
+                self.assertGreaterEqual(config["budget"]["compact_window"], 100000)
+                for route in config["roles"].values():
+                    self.assertEqual(route["context_capacity"], context)
+                    self.assertEqual(route["capacity"]["slots"], 2)
+                for registry in self.root.glob("backends.*"):
+                    registry.unlink()
 
     def test_gateway_routes_carry_capacity(self):
         capacity = {**self.capacity, "context":262144, "client_context":200000,
@@ -739,6 +827,42 @@ class StartupTests(unittest.TestCase):
                 self.assertNotIn("UNEXPECTED_PROVISIONING", result.stderr)
                 self.assertNotIn("Installing", result.stdout)
                 self.assertFalse((self.root / "state" / "frontends").exists())
+
+    def test_claude_two_gpu_dry_run_requires_supported_compact_window(self):
+        shutil.copytree(ROOT / "lib", self.root / "lib", ignore=shutil.ignore_patterns("__pycache__"))
+        shutil.copytree(ROOT / "configs", self.root / "configs")
+        self.env.pop("CLAUDE_LOCAL_CLIENT_CONTEXT", None)
+        self.env["PUSHBUTTON_CONFIG_DIR"] = str(self.root / "config")
+        for tool in ("git", "cmake", "ninja", "curl", "tar"):
+            executable = self.bin / tool
+            executable.write_text("#!/bin/bash\necho UNEXPECTED_PROVISIONING >&2\nexit 91\n")
+            executable.chmod(0o755)
+        nvidia = self.bin / "nvidia-smi"
+        nvidia.write_text(
+            "#!/bin/bash\ncase \"$*\" in\n"
+            "  *index,name*) printf '%s\\n' "
+            "'0, RTX 4060 Ti, 16384, 16179, 8.9, 0000:01:00.0' "
+            "'1, RTX 4060 Ti, 16384, 16179, 8.9, 0000:02:00.0';;\n"
+            "  *) printf '%s\\n' '4, 8' '4, 8';;\nesac\n")
+        nvidia.chmod(0o755)
+        prefix = ["--local-context", "131072", "--local-dry-run"]
+        rejected = self.run_script(
+            "claude-local", [*prefix, "qwen3.8:27b@slots=2", "qwen3.6:35b@slots=2"])
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("minimum auto-compaction window", rejected.stderr)
+        result = self.run_script(
+            "claude-local", [*prefix, "qwen3.8:27b@slots=2,compact=100000",
+                             "qwen3.6:35b@slots=2,compact=100000"])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("UNEXPECTED_PROVISIONING", result.stderr)
+        plan = json.loads(next((self.root / "state").glob("plan.*.json")).read_text())
+        self.assertEqual(len(plan["servers"]), 2)
+        self.assertEqual(len({s["cuda_visible_devices"] for s in plan["servers"]}), 2)
+        for server in plan["servers"]:
+            self.assertEqual(server["capacity"]["context"], 131072)
+            self.assertEqual(server["capacity"]["slots"], 2)
+            self.assertEqual(server["capacity"]["compact_trigger"], 100000)
+            self.assertGreaterEqual(server["headroom_mib"], 0)
 
     def test_real_selector_pty_cancel_is_before_provisioning(self):
         shutil.copy2(ROOT / "pushbutton-select", self.root / "pushbutton-select")

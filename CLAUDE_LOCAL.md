@@ -75,13 +75,33 @@ The planner inventories every visible NVIDIA GPU independently, including free V
 When the curated quant tiers cannot fit the complete model set at the requested
 context and slots, the planner automatically checks those models' Hugging Face
 repositories for smaller quant artifacts and replans using their confirmed file
-sizes. It announces the next-best fitting quant for each downgraded model on
+sizes, including confirmed sizes for already-curated quants rather than keeping
+their estimated weights. It announces the next-best fitting quant for each downgraded model on
 stderr, warns of possible coding/tool-use degradation below 4 bits, and passes
 the selected, revision-pinned artifacts to the normal downloader and launcher.
 Explicit `quant=`/`bits=`, GPU assignments, VRAM caps, context, and slots remain
 constraints; they are not silently relaxed. If no verified fallback fits (or
 repository metadata is unavailable), planning still fails rather than
 overcommitting memory. A curated fit requires no extra network lookup.
+
+For two GPUs with approximately 15.8 GiB free each, two slots per model at the
+default 262,144-token context may still exceed VRAM even after discovery. Each
+slot receives its own context allocation; discovering a quant does not prove it
+fits. This reduced-context configuration passes the planner and simulated backend
+startup/context-policy checks using the curated profiles:
+
+```bash
+claude-local --local-context 131072 \
+  'qwen3.8:27b@slots=2,compact=100000' \
+  'qwen3.6:35b@slots=2,compact=100000' --local-dry-run
+```
+
+The explicit compaction windows are required here: the generic 80%-of-input
+default is below Claude's supported 100,000-token minimum at this context.
+Remove `--local-dry-run` to launch. This is not a real-GPU allocation guarantee;
+the Qwen3.6 estimate leaves little headroom. Full-context fallback tests use
+synthetic repository inventories and do not establish that fitting artifacts
+are published or available on your host.
 
 The default **requested** physical context is **262,144 tokens**. After loading each backend, the launcher verifies its actual per-slot capacity and derives Claude's budgets. Requested `-c`, model-native context, assumed client window, and proactive compaction window are different quantities.
 
