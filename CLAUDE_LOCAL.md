@@ -73,13 +73,35 @@ The planner inventories every visible NVIDIA GPU independently, including free V
 7. Builds CUDA for all compute capabilities in the plan, so mixed Volta/Ada hosts can use one compatible build.
 
 When the curated quant tiers cannot fit the complete model set at the requested
-context and slots, the planner automatically checks those models' Hugging Face
-repositories for smaller quant artifacts and replans using their confirmed file
-sizes, including confirmed sizes for already-curated quants rather than keeping
-their estimated weights. It announces the next-best fitting quant for each downgraded model on
+context and slots, the planner checks all recognized GGUF quant variants in the
+configured repositories and searches HF for additional GGUF repositories.
+Additional repositories must declare the same direct base-model identity in
+their model-card metadata or HF tags; declared fine-tunes, merges, unrelated
+models and missing identities are excluded. The catalog's `hf_model` is used
+when available; otherwise configured repositories supply that identity.
+Search is bounded to three 50-result pages per base identity (up to four
+identities and 150 additional repository inspections per model). Missing
+identity or network failures are reported, not interpreted as proof that no
+other quants exist.
+
+The planner resolves exact filenames and complete shard sets, confirms their
+combined payload sizes and pins the selected revision. Separate filename
+variants with the same quant are considered independently; incomplete shards,
+unknown sizes, projection files and implicit MTP variants are excluded.
+Successful inventories replace estimates, including removing unpublished
+curated entries; unreachable configured repositories retain their estimates.
+Across discovered and curated tiers, quant quality is approximated by effective
+bits per weight, not curated-list membership or file size. Equal-BPW variants
+are tried largest-payload first within each GPU subset. This is a quality
+heuristic, not an accuracy benchmark; base identity is a repository declaration,
+not independent proof of tensor contents or runtime compatibility.
+
+Placement includes weights, KV for the requested context times slots, and
+runtime/margin, and still jointly assigns disjoint GPU sets. It announces
+the next-best fitting quant for each changed model on
 stderr, warns of possible coding/tool-use degradation below 4 bits, and passes
 the selected, revision-pinned artifacts to the normal downloader and launcher.
-Explicit `quant=`/`bits=`, GPU assignments, VRAM caps, context, and slots remain
+Explicit `quant=`/`bits=` skip automatic discovery. GPU assignments, VRAM caps, context, and slots remain
 constraints; they are not silently relaxed. If no verified fallback fits (or
 repository metadata is unavailable), planning still fails rather than
 overcommitting memory. A curated fit requires no extra network lookup.

@@ -174,6 +174,82 @@ def fetch_metadata(repo, revision="main"):
     return result
 
 
+def base_model_ids(metadata):
+    """Direct base-model declarations only; never follow fine-tune ancestry."""
+    card = metadata.get("cardData") or {}
+    if not isinstance(card, dict):
+        return set()
+    relation = card.get("base_model_relation")
+    if relation and relation != "quantized":
+        return set()
+    values = card.get("base_model", [])
+    values = [values] if isinstance(values, str) else values
+    tags = metadata.get("tags") or []
+    if not isinstance(values, list) or not isinstance(tags, list):
+        return set()
+    values = list(values)
+    for tag in tags:
+        if isinstance(tag, str) and tag.startswith("base_model:"):
+            value = tag.removeprefix("base_model:")
+            if ":" in value:
+                kind, value = value.split(":", 1)
+                if kind != "quantized":
+                    return set()
+            values.append(value)
+    result = set()
+    for value in values:
+        if isinstance(value, str):
+            try:
+                if parse_source(value)["repo"] == value:
+                    result.add(value)
+            except ValueError:
+                pass
+    return result
+
+
+def search_gguf_repositories(base_model):
+    """Bounded Hub search; returned IDs still require model-card verification."""
+    if parse_source(base_model)["repo"] != base_model:
+        raise ValueError("Invalid base-model repository")
+    query = urllib.parse.urlencode({
+        "search": base_model.split("/")[-1], "filter": "gguf",
+        "full": "true", "limit": 50,
+    })
+    url = f"https://{HF_HOST}/api/models?{query}"
+    repos = []
+    seen_pages = set()
+    for _ in range(3):
+        if url in seen_pages:
+            break
+        seen_pages.add(url)
+        with safe_open(urllib.request.Request(url, headers=hf_headers())) as response:
+            data = response.read(MAX_PREFIX + 1)
+            links = response.headers.get("Link", "")
+        if len(data) > MAX_PREFIX:
+            raise ValueError("Hugging Face search exceeds safety limit")
+        entries = json.loads(data)
+        if not isinstance(entries, list):
+            raise ValueError("Invalid Hugging Face search response")
+        for entry in entries[:50]:
+            repo = entry.get("id") if isinstance(entry, dict) else None
+            if not isinstance(repo, str):
+                continue
+            try:
+                if parse_source(repo)["repo"] == repo and repo not in repos:
+                    repos.append(repo)
+            except ValueError:
+                continue
+        next_link = re.search(r'<([^>]+)>;\s*rel="next"', links)
+        if not next_link:
+            return repos
+        url = next_link[1]
+        parsed = urllib.parse.urlsplit(url)
+        if (parsed.scheme != "https" or parsed.netloc != HF_HOST
+                or parsed.path != "/api/models" or parsed.fragment):
+            raise ValueError("Unsafe Hugging Face search pagination URL")
+    return repos
+
+
 def cache_directory(cache, resolved):
     root = pathlib.Path(cache).expanduser().resolve()
     if resolved["repo"]:
