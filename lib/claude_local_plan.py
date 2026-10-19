@@ -462,17 +462,19 @@ def gpu_subsets(gpus: list[GPU]) -> Iterable[tuple[int, ...]]:
 
 
 def best_profile_for_capacity(
-    model: str, capacity_mib: int, context: int, settings: dict | None = None
+    model: str, capacity_mib: int, context: int, settings: dict | None = None,
+    profiles: tuple[Profile, ...] | None = None,
 ) -> tuple[Profile, int] | None:
+    profiles = PROFILES[model] if profiles is None else profiles
     settings = capacity.resolve_options(
         {k: v for k, v in (settings or {}).items() if k in capacity.OPTION_KEYS and v is not None},
         context)
-    if settings.get("quant") and settings["quant"] not in {p.quant.upper() for p in PROFILES[model]}:
+    if settings.get("quant") and settings["quant"] not in {p.quant.upper() for p in profiles}:
         raise ValueError(f"unsupported quant '{settings['quant']}' for {model}")
-    if settings["context"] > max(p.native_context for p in PROFILES[model]):
+    if settings["context"] > max(p.native_context for p in profiles):
         raise ValueError(f"context exceeds supported native context for {model}")
     fallback = None
-    for profile in PROFILES[model]:
+    for profile in profiles:
         if not capacity.matches_quant(profile.quant, settings):
             continue
         if settings["context"] > profile.native_context:
@@ -488,14 +490,15 @@ def best_profile_for_capacity(
 
 
 def placement_candidates(model: str, gpus: list[GPU], context: int,
-                         settings: dict | None = None, exact_gpus=None) -> list[Candidate]:
+                         settings: dict | None = None, exact_gpus=None,
+                         profiles: tuple[Profile, ...] | None = None) -> list[Candidate]:
     raw: list[Candidate] = []
     for positions in gpu_subsets(gpus):
         group = [gpus[p] for p in positions]
         if exact_gpus is not None and {g.index for g in group} != set(exact_gpus):
             continue
         free_mib = sum(g.free_mib for g in group)
-        picked = best_profile_for_capacity(model, free_mib, context, settings)
+        picked = best_profile_for_capacity(model, free_mib, context, settings, profiles)
         if picked is None:
             continue
         profile, req = picked
@@ -720,6 +723,41 @@ def unplaceable_detail(request, gpus: list[GPU], context: int, slots: int = 1) -
     return text
 
 
+def discover_fallback_profiles(model: str) -> tuple[Profile, ...]:
+    """Extend curated tiers only with smaller, confirmed repository artifacts."""
+    import cpu_platform
+    import gguf_source
+    profiles = PROFILES[model]
+    if any(p.source_spec for p in profiles):
+        return profiles
+    lowest_bpw = min(cpu_platform.quant_bpw(p.quant) for p in profiles)
+    quants = sorted(
+        (q for q, bpw in cpu_platform.QUANT_BPW.items() if bpw < lowest_bpw),
+        key=lambda q: -cpu_platform.quant_bpw(q))
+    discovered = []
+    for repo in dict.fromkeys(p.repo for p in profiles):
+        try:
+            metadata = gguf_source.fetch_metadata(repo)
+        except (ValueError, OSError) as exc:
+            print(f"Warning: {model}: cannot check fallback quants in {repo}: {exc}",
+                  file=sys.stderr)
+            continue
+        template = next(p for p in profiles if p.repo == repo)
+        for rank, quant in enumerate(quants, 1):
+            for variant in (quant, "UD-" + quant):
+                try:
+                    resolved = gguf_source.resolve_files(f"{repo}:{variant}", metadata)
+                except ValueError:
+                    continue
+                discovered.append(replace(
+                    template, quant=variant,
+                    quality=min(p.quality for p in profiles) - rank,
+                    weight_mib=resolved["weight_bytes"] / 2**20,
+                    source_spec=resolved["download_spec"],
+                    note="automatically discovered lower-quant memory fallback"))
+    return profiles + tuple(sorted(discovered, key=lambda p: -p.quality))
+
+
 def plan(models: list[str], gpus: list[GPU], context: int, slots: int = 1,
          defaults: dict | None = None, client_context: int | None = None,
          agents: int | None = None) -> dict:
@@ -746,6 +784,20 @@ def plan(models: list[str], gpus: list[GPU], context: int, slots: int = 1,
         choices = joint_model_choices(instances, gpus, context, rm["sonnet"], candidate_map)
         policy = "joint-global-plan"
 
+    if not choices:
+        print("Warning: curated quants cannot fit the requested context/slots on disjoint GPUs; "
+              "checking repositories for smaller fallback quants.", file=sys.stderr)
+        fallback_profiles = {}
+        for i, request in enumerate(requests):
+            if any(key in request.capacity for key in ("quant", "bits")) or request.capacity.get("force"):
+                continue
+            if request.model not in fallback_profiles:
+                fallback_profiles[request.model] = discover_fallback_profiles(request.model)
+            candidate_map[i] = candidates_for_request(
+                request, gpus, context, slots, quality_filter=False,
+                profiles=fallback_profiles[request.model])
+        choices = joint_model_choices(instances, gpus, context, rm["sonnet"], candidate_map)
+
     if not choices or any(c is None for c in choices):
         unplaceable = [i for i in instances if not candidate_map[i]]
         if unplaceable:
@@ -769,6 +821,20 @@ def plan(models: list[str], gpus: list[GPU], context: int, slots: int = 1,
         used_mask |= c.mask
         group = ordered_group_for_layer_split(c, gpus)
         settings = request_capacity(request, c.profile, context, slots)
+        preferred = next(p for p in PROFILES[request.model]
+                         if capacity.matches_quant(p.quant, request.capacity))
+        if c.profile.quant != preferred.quant:
+            print(f"Warning: {request.model}: automatically selecting next best fit quant "
+                  f"{c.profile.quant} instead of {preferred.quant}; "
+                  f"{settings['slots']} slot(s) x {settings['context']:,} tokens, "
+                  f"estimated {c.required_mib / MIB_PER_GIB:.2f} GiB / "
+                  f"{c.free_mib / MIB_PER_GIB:.2f} GiB available. "
+                  "Deploying this quant.", file=sys.stderr)
+        bits = capacity.quant_bits(c.profile.quant)
+        if bits is not None and bits < 4:
+            print(f"Warning: {request.model}: {c.profile.quant} is below 4 bits "
+                  f"({bits}-bit); possible quality degradation, including coding and tool use.",
+                  file=sys.stderr)
         server_id = f"local-{model_slug(c.model)}"
         if sum(r.model == request.model for r in requests) > 1:
             server_id += f"-{i + 1}"

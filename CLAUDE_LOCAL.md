@@ -72,6 +72,17 @@ The planner inventories every visible NVIDIA GPU independently, including free V
 6. On a heterogeneous layer split, places the slowest PCIe endpoint at an edge rather than between faster cards.
 7. Builds CUDA for all compute capabilities in the plan, so mixed Volta/Ada hosts can use one compatible build.
 
+When the curated quant tiers cannot fit the complete model set at the requested
+context and slots, the planner automatically checks those models' Hugging Face
+repositories for smaller quant artifacts and replans using their confirmed file
+sizes. It announces the next-best fitting quant for each downgraded model on
+stderr, warns of possible coding/tool-use degradation below 4 bits, and passes
+the selected, revision-pinned artifacts to the normal downloader and launcher.
+Explicit `quant=`/`bits=`, GPU assignments, VRAM caps, context, and slots remain
+constraints; they are not silently relaxed. If no verified fallback fits (or
+repository metadata is unavailable), planning still fails rather than
+overcommitting memory. A curated fit requires no extra network lookup.
+
 The default **requested** physical context is **262,144 tokens**. After loading each backend, the launcher verifies its actual per-slot capacity and derives Claude's budgets. Requested `-c`, model-native context, assumed client window, and proactive compaction window are different quantities.
 
 Run a dry plan before downloading anything:

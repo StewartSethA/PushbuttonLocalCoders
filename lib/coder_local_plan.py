@@ -205,7 +205,8 @@ def _near_best(candidates: list[base.Candidate], quality_slack: int = 3) -> list
 
 
 def candidates_for_request(req: WorkerRequest, gpus: list[base.GPU], context: int,
-                           slots: int = 1, quality_filter: bool = True) -> list[base.Candidate]:
+                           slots: int = 1, quality_filter: bool = True,
+                           profiles: tuple[base.Profile, ...] | None = None) -> list[base.Candidate]:
     settings = resolve_request_options(req, context, slots)
     physical = {g.index for g in gpus}
     if req.gpu_indices is not None:
@@ -221,7 +222,7 @@ def candidates_for_request(req: WorkerRequest, gpus: list[base.GPU], context: in
         for g in gpus
     ]
     candidates = base.placement_candidates(req.model, effective, settings["context"], settings,
-                                           exact_gpus=req.gpu_indices)
+                                           exact_gpus=req.gpu_indices, profiles=profiles)
     if req.gpu_indices is not None:
         exact_positions = tuple(i for i, g in enumerate(gpus) if g.index in set(req.gpu_indices))
         exact_set = set(exact_positions)

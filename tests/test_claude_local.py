@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import importlib.util
+import io
 import http.client
 import json
 import os
@@ -13,6 +14,7 @@ import unittest
 from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
+from contextlib import redirect_stderr
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -98,6 +100,80 @@ class PlannerTests(unittest.TestCase):
         gpus = [planmod.GPU(0, "RTX 4060 Ti", 16380, 16100, "8.9", "", 4, 8)]
         self.assertEqual(planmod.plan(["q38"], gpus, 262144)["servers"][0]["profile"]["quant"], "IQ2_S")
         self.assertEqual(planmod.plan(["q36"], gpus, 262144)["servers"][0]["profile"]["quant"], "UD-IQ2_M")
+
+    @staticmethod
+    def fallback_metadata(repo):
+        quant, gib = (("IQ1_S", 5) if "27B" in repo else ("UD-IQ2_XXS", 8.5))
+        return {"sha": "a" * 40, "siblings": [
+            {"rfilename": f"model-{quant}.gguf", "size": int(gib * 2**30)}]}
+
+    def test_two_slot_models_discover_and_deploy_fitting_quants(self):
+        gpus = [planmod.GPU(i, "RTX 4060 Ti", 16384, 16179) for i in range(2)]
+        stderr = io.StringIO()
+        with mock.patch("gguf_source.fetch_metadata", side_effect=self.fallback_metadata), redirect_stderr(stderr):
+            result = planmod.plan(["q38@slots=2", "q36@slots=2"], gpus, 262144)
+        self.assertEqual([s["profile"]["quant"] for s in result["servers"]],
+                         ["IQ1_S", "UD-IQ2_M"])
+        self.assertNotEqual(result["servers"][0]["cuda_visible_devices"],
+                            result["servers"][1]["cuda_visible_devices"])
+        for server in result["servers"]:
+            self.assertEqual(server["capacity"]["context"], 262144)
+            self.assertEqual(server["capacity"]["slots"], 2)
+            self.assertEqual(server["capacity"]["quant"], server["profile"]["quant"])
+            self.assertGreaterEqual(server["headroom_mib"], 0)
+            self.assertEqual(server["required_mib"],
+                             server["capacity"]["memory_estimate"]["required_mib"])
+            if server["profile"]["source_spec"]:
+                self.assertIn("/resolve/" + "a" * 40 + "/", server["profile"]["hf_spec"])
+                self.assertTrue(server["profile"]["hf_spec"].endswith(
+                    server["profile"]["quant"] + ".gguf"))
+            self.assertIn(server["model"] + ": automatically selecting next best fit quant",
+                          stderr.getvalue())
+        self.assertEqual(stderr.getvalue().count("possible quality degradation"), 2)
+        launcher = (ROOT / "claude-local").read_text()
+        rows_function = launcher[launcher.index("server_rows() {"):].split("\n}\n", 1)[0] + "\n}\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = pathlib.Path(tmp) / "plan.json"
+            plan.write_text(json.dumps(result))
+            rows = subprocess.run(
+                ["bash", "-c", rows_function + f"\nPLAN_FILE={shlex.quote(str(plan))}\nserver_rows"],
+                capture_output=True, text=True, check=True).stdout
+        for server in result["servers"]:
+            self.assertIn(server["profile"]["hf_spec"], rows)
+
+    def test_fallback_discovery_preserves_explicit_constraints(self):
+        gpus = [planmod.GPU(i, "test GPU", 16384, 16179) for i in range(2)]
+        with mock.patch("gguf_source.fetch_metadata") as fetch:
+            for option in ("bits=4", "quant=UD-Q4_K_M"):
+                with self.subTest(option=option), self.assertRaises(ValueError):
+                    planmod.plan([f"q38@slots=2,{option}", f"q36@slots=2,{option}"],
+                                 gpus, 262144)
+            fetch.assert_not_called()
+        with mock.patch("gguf_source.fetch_metadata", side_effect=self.fallback_metadata):
+            result = planmod.plan(["q38@slots=2,gpu=1", "q36@slots=2,gpu=0,vram=14G"],
+                                  gpus, 262144)
+        self.assertEqual(result["servers"][0]["cuda_visible_devices"], "1")
+        self.assertEqual(result["servers"][1]["cuda_visible_devices"], "0")
+        self.assertEqual(result["servers"][1]["allocated_mib"], 14 * 1024)
+        self.assertEqual(result["servers"][1]["profile"]["quant"], "UD-IQ2_XXS")
+
+    def test_fallback_never_overcommits_or_invents_missing_artifacts(self):
+        gpus = [planmod.GPU(i, "tiny GPU", 1024, 1024) for i in range(2)]
+        for metadata in (self.fallback_metadata, lambda repo: {"sha": "a" * 40, "siblings": []}):
+            with mock.patch("gguf_source.fetch_metadata", side_effect=metadata):
+                with self.assertRaises(ValueError):
+                    planmod.plan(["q38@slots=2", "q36@slots=2"], gpus, 262144)
+        with mock.patch("gguf_source.fetch_metadata", side_effect=OSError("offline")):
+            with self.assertRaises(ValueError):
+                planmod.plan(["q38@slots=2", "q36@slots=2"], gpus, 262144)
+
+    def test_curated_fit_needs_no_network_and_warns_for_low_bits(self):
+        stderr = io.StringIO()
+        with mock.patch("gguf_source.fetch_metadata") as fetch, redirect_stderr(stderr):
+            planmod.plan(["q38"], [planmod.GPU(0, "test GPU", 16384, 16100)], 262144)
+        fetch.assert_not_called()
+        self.assertIn("automatically selecting next best fit quant IQ2_S", stderr.getvalue())
+        self.assertIn("below 4 bits", stderr.getvalue())
 
 
 class GatewayTests(unittest.TestCase):
