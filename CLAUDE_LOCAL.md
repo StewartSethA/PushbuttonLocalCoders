@@ -20,6 +20,23 @@ This creates `/usr/local/bin/claude-local` with `sudo`. It is an executable entr
 
 Heavy dependencies are provisioned lazily. The harness installs ordinary build dependencies, installs Claude Code if needed, keeps a working NVIDIA driver untouched, bootstraps a compatible CUDA toolkit privately when `nvcc` is missing/incompatible, and builds the required CUDA llama.cpp variant.
 
+### Startup troubleshooting
+
+If an older launcher stops at `Updating llama.cpp` with `origin/master
+(non-fast-forward)`, update PushbuttonLocalCoders and retry. Cached CUDA source
+updates now allow the upstream branch to rewrite its history, including the GLM
+fork branch. As before, rebuilding resets the managed source checkout to that
+upstream revision; keep local source edits elsewhere. Fetch failures such as
+network or authentication errors still stop the build.
+
+DKMS failures for `nvidia` or `mlnx-ofed-kernel` during kernel package configuration
+are separate from this Git error. The package summary does not identify the
+compiler failure: inspect `/var/lib/dkms/nvidia/575.57.08/build/make.log` and the
+matching `mlnx-ofed-kernel` build log, and check driver/OFED compatibility with the
+target kernel before retrying package configuration. A working `nvcc` alone does
+not confirm that the NVIDIA kernel module works. Do not remove working drivers
+or reboot into the new kernel merely to resolve the Git fetch error.
+
 ## Basic use
 
 With no model arguments, let the planner choose a fast local default:

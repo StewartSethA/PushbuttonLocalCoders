@@ -325,7 +325,7 @@ ensure_llamacpp() {
     [[ -x "$LLAMA_SERVER" && "${CLAUDE_LOCAL_REBUILD:-0}" != 1 ]] && { say "Using existing CUDA llama.cpp: $LLAMA_SERVER"; return; }
     if [[ -d "$src/.git" ]]; then
         say "Updating llama.cpp ($kind)..."
-        git -C "$src" fetch --depth=1 origin "$ref:refs/remotes/origin/$ref"
+        git -C "$src" fetch --depth=1 origin "+refs/heads/$ref:refs/remotes/origin/$ref"
         git -C "$src" checkout -q "$ref" 2>/dev/null || git -C "$src" checkout -q -B "$ref" "origin/$ref"
         git -C "$src" reset --hard "origin/$ref"
     else

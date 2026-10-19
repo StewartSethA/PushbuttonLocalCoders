@@ -32,6 +32,76 @@ budgetmod = load("claude_local_budget", ROOT / "lib" / "claude_local_budget.py")
 gwmod = load("claude_local_gateway", ROOT / "lib" / "claude_local_gateway.py")
 
 
+class LlamaCppUpdateTests(unittest.TestCase):
+    def test_cached_source_tracks_rewritten_upstream(self):
+        launcher = (ROOT / "claude-local").read_text()
+        function = launcher[launcher.index("ensure_llamacpp() {"):].split("\n}\n", 1)[0] + "\n}\n"
+        for kind, ref, directory in (
+            ("upstream", "master", "llama.cpp"),
+            ("glm53", "glm5next/upstream", "llama.cpp-glm53"),
+        ):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
+                root = pathlib.Path(tmp)
+                remote = root / "remote"
+                src = root / directory
+                env = {
+                    **os.environ,
+                    "GIT_AUTHOR_NAME": "Test",
+                    "GIT_AUTHOR_EMAIL": "test@example.invalid",
+                    "GIT_COMMITTER_NAME": "Test",
+                    "GIT_COMMITTER_EMAIL": "test@example.invalid",
+                }
+
+                def git(path, *args):
+                    return subprocess.run(
+                        ["git", "-C", str(path), *args], env=env, text=True,
+                        input="", capture_output=True, check=True, timeout=10,
+                    ).stdout.strip()
+
+                remote.mkdir()
+                src.mkdir()
+                git(remote, "init", "-b", ref)
+                (remote / "version").write_text("original")
+                git(remote, "add", "version")
+                git(remote, "commit", "-m", "original")
+                git(src, "init", "-b", ref)
+                git(src, "remote", "add", "origin", remote.as_uri())
+                git(src, "fetch", "--depth=1", "origin",
+                    f"refs/heads/{ref}:refs/remotes/origin/{ref}")
+                git(src, "reset", "--hard", f"origin/{ref}")
+                original = git(src, "rev-parse", "HEAD")
+                (remote / "version").write_text("rewritten")
+                git(remote, "add", "version")
+                git(remote, "commit", "--amend", "-m", "rewritten")
+                expected = git(remote, "rev-parse", "HEAD")
+                self.assertNotEqual(original, expected)
+                body = f"""
+set -euo pipefail
+STATE_DIR={shlex.quote(tmp)}
+CLAUDE_LOCAL_REBUILD=1
+CUDA_ROOT=
+build_kind() {{ echo {kind}; }}
+inventory_arches() {{ echo 80; }}
+say() {{ :; }}
+die() {{ echo "$*" >&2; exit 1; }}
+cmake() {{
+    if [[ "$1" == --build ]]; then
+        mkdir -p "$2/bin"
+        touch "$2/bin/llama-server"
+        chmod +x "$2/bin/llama-server"
+    fi
+}}
+"""
+                result = subprocess.run(
+                    ["bash", "-c", body + function + "\nensure_llamacpp"],
+                    env=env, text=True, capture_output=True, timeout=15,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(git(src, "rev-parse", "HEAD"), expected)
+                self.assertEqual(git(src, "rev-parse", f"refs/remotes/origin/{ref}"), expected)
+                self.assertEqual((src / "version").read_text(), "rewritten")
+
+
 class PlannerTests(unittest.TestCase):
     def test_ornith_catalog_aliases_and_profiles(self):
         catalog = json.loads((ROOT / "configs/model-catalog.json").read_text())["models"]
