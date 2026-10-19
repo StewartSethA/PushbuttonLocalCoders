@@ -731,9 +731,6 @@ def discover_fallback_profiles(model: str) -> tuple[Profile, ...]:
     if any(p.source_spec for p in profiles):
         return profiles
     lowest_bpw = min(cpu_platform.quant_bpw(p.quant) for p in profiles)
-    quants = sorted(
-        (q for q, bpw in cpu_platform.QUANT_BPW.items() if bpw < lowest_bpw),
-        key=lambda q: -cpu_platform.quant_bpw(q))
     discovered = []
     for repo in dict.fromkeys(p.repo for p in profiles):
         try:
@@ -743,19 +740,28 @@ def discover_fallback_profiles(model: str) -> tuple[Profile, ...]:
                   file=sys.stderr)
             continue
         template = next(p for p in profiles if p.repo == repo)
-        for rank, quant in enumerate(quants, 1):
-            for variant in (quant, "UD-" + quant):
-                try:
-                    resolved = gguf_source.resolve_files(f"{repo}:{variant}", metadata)
-                except ValueError:
-                    continue
-                discovered.append(replace(
-                    template, quant=variant,
-                    quality=min(p.quality for p in profiles) - rank,
-                    weight_mib=resolved["weight_bytes"] / 2**20,
-                    source_spec=resolved["download_spec"],
-                    note="automatically discovered lower-quant memory fallback"))
-    return profiles + tuple(sorted(discovered, key=lambda p: -p.quality))
+        quants = set()
+        for item in metadata.get("siblings", []):
+            name = str(item.get("rfilename", "")).rsplit("/", 1)[-1].upper()
+            match = re.search(
+                r"(?:^|[-.])((?:UD-)?(?:IQ|Q|MXFP|NVFP|FP|BF)[0-9]+(?:_[A-Z0-9]+)*)"
+                r"(?=(?:-[0-9]{5}-OF-[0-9]{5})?\.GGUF$)", name)
+            if match and cpu_platform.quant_bpw(match[1]) < lowest_bpw:
+                quants.add(match[1])
+        for quant in sorted(quants):
+            try:
+                resolved = gguf_source.resolve_files(f"{repo}:{quant}", metadata)
+            except ValueError:
+                continue
+            discovered.append(replace(
+                template, quant=quant,
+                weight_mib=resolved["weight_bytes"] / 2**20,
+                source_spec=resolved["download_spec"],
+                note="automatically discovered lower-quant memory fallback"))
+    discovered.sort(key=lambda p: -cpu_platform.quant_bpw(p.quant))
+    return profiles + tuple(
+        replace(p, quality=min(profile.quality for profile in profiles) - rank)
+        for rank, p in enumerate(discovered, 1))
 
 
 def plan(models: list[str], gpus: list[GPU], context: int, slots: int = 1,
@@ -796,7 +802,14 @@ def plan(models: list[str], gpus: list[GPU], context: int, slots: int = 1,
             candidate_map[i] = candidates_for_request(
                 request, gpus, context, slots, quality_filter=False,
                 profiles=fallback_profiles[request.model])
-        choices = joint_model_choices(instances, gpus, context, rm["sonnet"], candidate_map)
+        if len(instances) == 1:
+            picked = min(candidate_map[0], key=lambda c: (
+                c.headroom_mib < 0, c.card_count, -c.free_mib, -c.link_score,
+                -c.profile.quality, -c.speed_score,
+                tuple(gpus[p].index for p in c.gpu_positions))) if candidate_map[0] else None
+            choices = [picked] if picked else None
+        else:
+            choices = joint_model_choices(instances, gpus, context, rm["sonnet"], candidate_map)
 
     if not choices or any(c is None for c in choices):
         unplaceable = [i for i in instances if not candidate_map[i]]

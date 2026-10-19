@@ -175,6 +175,18 @@ class PlannerTests(unittest.TestCase):
         self.assertIn("automatically selecting next best fit quant IQ2_S", stderr.getvalue())
         self.assertIn("below 4 bits", stderr.getvalue())
 
+    def test_fallback_discovers_standard_quants_outside_cpu_bpw_table(self):
+        metadata = {"sha": "a" * 40, "siblings": [
+            {"rfilename": "model-Q3_K_M.gguf", "size": 4 * 2**30},
+            {"rfilename": "model-Q2_K-00001-of-00002.gguf", "size": 2 * 2**30},
+            {"rfilename": "model-Q2_K-00002-of-00002.gguf", "size": 2 * 2**30}]}
+        with mock.patch("gguf_source.fetch_metadata", return_value=metadata):
+            server = planmod.plan(
+                ["ornith-9b"], [planmod.GPU(0, "test GPU", 8192, 7168)], 32768)["servers"][0]
+        self.assertEqual(server["profile"]["quant"], "Q3_K_M")
+        self.assertEqual(server["capacity"]["memory_estimate"]["weights_mib"], 4096)
+        self.assertGreaterEqual(server["headroom_mib"], 0)
+
 
 class GatewayTests(unittest.TestCase):
     def setUp(self):
