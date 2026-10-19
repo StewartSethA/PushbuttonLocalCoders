@@ -187,6 +187,62 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(server["capacity"]["memory_estimate"]["weights_mib"], 4096)
         self.assertGreaterEqual(server["headroom_mib"], 0)
 
+    def test_reported_two_gpu_setup_uses_confirmed_curated_quant_sizes(self):
+        gpus = [planmod.GPU(i, "RTX 4060 Ti", 16384, 16179) for i in range(2)]
+
+        def metadata(repo):
+            # Synthetic inventory: exercise exact-size accounting, not artifact availability.
+            quant, gib = ("IQ1_S", 5) if "27B" in repo else ("UD-IQ2_M", 9)
+            return {"sha": "b" * 40, "siblings": [
+                {"rfilename": f"model-{quant}.gguf", "size": int(gib * 2**30)}]}
+
+        with mock.patch("gguf_source.fetch_metadata", side_effect=metadata):
+            result = planmod.plan(
+                ["qwen3.8:27b@slots=2", "qwen3.6:35b@slots=2,gpu=0,vram=14G"],
+                gpus, 262144)
+        self.assertEqual([s["cuda_visible_devices"] for s in result["servers"]], ["1", "0"])
+        for server, weights_mib in zip(result["servers"], (5120, 9216)):
+            with self.subTest(model=server["model"]):
+                estimate = server["capacity"]["memory_estimate"]
+                self.assertEqual(estimate["weights_source"], "gguf-metadata")
+                self.assertEqual(estimate["weights_mib"], weights_mib)
+                self.assertEqual(server["required_mib"], estimate["required_mib"])
+                self.assertLessEqual(server["required_mib"], server["allocated_mib"])
+                self.assertEqual(server["capacity"]["context"], 262144)
+                self.assertEqual(server["capacity"]["slots"], 2)
+                self.assertIn("/resolve/" + "b" * 40 + "/", server["profile"]["hf_spec"])
+
+    def test_reported_two_gpu_setup_rejects_just_too_large_fallback(self):
+        gpus = [planmod.GPU(i, "RTX 4060 Ti", 16384, 16179) for i in range(2)]
+        metadata = {"sha": "b" * 40, "siblings": [
+            {"rfilename": "model-IQ1_S.gguf", "size": int(5.25 * 2**30)}]}
+        with mock.patch("gguf_source.fetch_metadata", return_value=metadata):
+            with self.assertRaises(ValueError) as error:
+                planmod.plan(["qwen3.8:27b@slots=2", "qwen3.6:35b@slots=2"],
+                             gpus, 262144)
+        message = str(error.exception)
+        self.assertIn("without sharing/overcommitting GPUs", message)
+        self.assertIn("qwen3.8:27b: smallest matching quant IQ1_S", message)
+        self.assertIn("2 slot(s) x 262,144 tokens", message)
+        self.assertIn("largest single GPU 15.8 GiB", message)
+        self.assertIn("Lower context/slots", message)
+
+    def test_reported_two_gpu_setup_half_context_fits_without_network(self):
+        gpus = [planmod.GPU(i, "RTX 4060 Ti", 16384, 16179) for i in range(2)]
+        with mock.patch("gguf_source.fetch_metadata") as fetch:
+            result = planmod.plan(
+                ["qwen3.8:27b@slots=2", "qwen3.6:35b@slots=2"], gpus, 131072)
+        fetch.assert_not_called()
+        self.assertEqual([s["profile"]["quant"] for s in result["servers"]],
+                         ["IQ2_S", "UD-IQ3_XXS"])
+        self.assertEqual([s["required_mib"] for s in result["servers"]], [14433, 16127])
+        self.assertNotEqual(result["servers"][0]["cuda_visible_devices"],
+                            result["servers"][1]["cuda_visible_devices"])
+        for server in result["servers"]:
+            self.assertEqual(server["capacity"]["slots"], 2)
+            self.assertEqual(server["capacity"]["context"], 131072)
+            self.assertGreaterEqual(server["headroom_mib"], 0)
+
 
 class GatewayTests(unittest.TestCase):
     def setUp(self):

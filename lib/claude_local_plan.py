@@ -685,7 +685,8 @@ def ordered_group_for_layer_split(candidate: Candidate, gpus: list[GPU]) -> list
     return [slowest] + rest
 
 
-def unplaceable_detail(request, gpus: list[GPU], context: int, slots: int = 1) -> str:
+def unplaceable_detail(request, gpus: list[GPU], context: int, slots: int = 1,
+                       profiles: tuple[Profile, ...] | None = None) -> str:
     """Explain why one request has no placement: smallest fitting need vs. free VRAM."""
     from coder_local_plan import resolve_request_options
     settings = resolve_request_options(request, context, slots)
@@ -699,7 +700,8 @@ def unplaceable_detail(request, gpus: list[GPU], context: int, slots: int = 1) -
         where += f" capped at {limit / MIB_PER_GIB:.1f} GiB each"
     label = request.model + (f"@gpu={'+'.join(map(str, request.gpu_indices))}"
                              if request.gpu_indices is not None else "")
-    estimates = [(capacity.memory_estimate(p, settings), p) for p in PROFILES[request.model]
+    profiles = PROFILES[request.model] if profiles is None else profiles
+    estimates = [(capacity.memory_estimate(p, settings), p) for p in profiles
                  if capacity.matches_quant(p.quant, settings) and settings["context"] <= p.native_context]
     if not estimates:
         return f"{label}: no profile matches the requested quant/bits/context"
@@ -724,13 +726,14 @@ def unplaceable_detail(request, gpus: list[GPU], context: int, slots: int = 1) -
 
 
 def discover_fallback_profiles(model: str) -> tuple[Profile, ...]:
-    """Extend curated tiers only with smaller, confirmed repository artifacts."""
+    """Confirm curated sizes and extend tiers with smaller repository artifacts."""
     import cpu_platform
     import gguf_source
     profiles = PROFILES[model]
     if any(p.source_spec for p in profiles):
         return profiles
     lowest_bpw = min(cpu_platform.quant_bpw(p.quant) for p in profiles)
+    confirmed = {(p.repo, p.quant.upper()): p for p in profiles}
     discovered = []
     for repo in dict.fromkeys(p.repo for p in profiles):
         try:
@@ -746,20 +749,26 @@ def discover_fallback_profiles(model: str) -> tuple[Profile, ...]:
             match = re.search(
                 r"(?:^|[-.])((?:UD-)?(?:IQ|Q|MXFP|NVFP|FP|BF)[0-9]+(?:_[A-Z0-9]+)*)"
                 r"(?=(?:-[0-9]{5}-OF-[0-9]{5})?\.GGUF$)", name)
-            if match and cpu_platform.quant_bpw(match[1]) < lowest_bpw:
+            if match and (cpu_platform.quant_bpw(match[1]) < lowest_bpw
+                          or (repo, match[1]) in confirmed):
                 quants.add(match[1])
         for quant in sorted(quants):
             try:
                 resolved = gguf_source.resolve_files(f"{repo}:{quant}", metadata)
             except ValueError:
                 continue
-            discovered.append(replace(
-                template, quant=quant,
+            key = (repo, quant)
+            profile = replace(
+                confirmed.get(key, template), quant=quant,
                 weight_mib=resolved["weight_bytes"] / 2**20,
                 source_spec=resolved["download_spec"],
-                note="automatically discovered lower-quant memory fallback"))
+                note="repository-confirmed quant memory fallback")
+            if key in confirmed:
+                confirmed[key] = profile
+            else:
+                discovered.append(profile)
     discovered.sort(key=lambda p: -cpu_platform.quant_bpw(p.quant))
-    return profiles + tuple(
+    return tuple(confirmed[(p.repo, p.quant.upper())] for p in profiles) + tuple(
         replace(p, quality=min(profile.quality for profile in profiles) - rank)
         for rank, p in enumerate(discovered, 1))
 
@@ -790,10 +799,10 @@ def plan(models: list[str], gpus: list[GPU], context: int, slots: int = 1,
         choices = joint_model_choices(instances, gpus, context, rm["sonnet"], candidate_map)
         policy = "joint-global-plan"
 
+    fallback_profiles = {}
     if not choices:
         print("Warning: curated quants cannot fit the requested context/slots on disjoint GPUs; "
               "checking repositories for smaller fallback quants.", file=sys.stderr)
-        fallback_profiles = {}
         for i, request in enumerate(requests):
             if any(key in request.capacity for key in ("quant", "bits")) or request.capacity.get("force"):
                 continue
@@ -816,7 +825,9 @@ def plan(models: list[str], gpus: list[GPU], context: int, slots: int = 1,
         if unplaceable:
             raise ValueError(
                 "cannot place requested model set: "
-                + "; ".join(unplaceable_detail(requests[i], gpus, context, slots) for i in unplaceable)
+                + "; ".join(unplaceable_detail(
+                    requests[i], gpus, context, slots, fallback_profiles.get(requests[i].model))
+                    for i in unplaceable)
                 + ". Lower context/slots, use smaller KV types (kv_k/kv_v), fewer bits, or more GPUs. "
                 "Set MODEL@margin=N (MiB) to choose the runtime/margin allowance, "
                 "or MODEL@force=true to try despite the estimate (may run out of memory)"
@@ -825,6 +836,12 @@ def plan(models: list[str], gpus: list[GPU], context: int, slots: int = 1,
             f"cannot place requested model set at context {context:,} without "
             f"sharing/overcommitting GPUs; free VRAM is "
             f"{[round(g.free_gib, 1) for g in gpus]} GiB"
+            + "; " + "; ".join(unplaceable_detail(
+                request, gpus, context, slots, fallback_profiles.get(request.model))
+                for request in requests)
+            + ". Each concurrent model needs a disjoint GPU set. "
+            "Lower context/slots, select a smaller quant, or add GPUs; "
+            "requested limits were not changed."
         )
 
     servers = []

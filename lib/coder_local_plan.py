@@ -236,7 +236,9 @@ def request_capacity(req: WorkerRequest, profile: base.Profile, context: int,
     settings = resolve_request_options(req, context, slots)
     settings.update(quant=profile.quant, kv_k=settings.get("kv_k", profile.kv_k),
                     kv_v=settings.get("kv_v", profile.kv_v))
-    original = next((p for p in base.PROFILES[req.model] if p.quant == profile.quant), profile)
+    original = next((p for p in base.PROFILES[req.model]
+                     if (p.repo, p.quant, p.source_spec) ==
+                     (profile.repo, profile.quant, profile.source_spec)), profile)
     settings["memory_estimate"] = capacity.memory_estimate(original, settings)
     if settings.get("force") or "margin" in settings:
         print(f"Warning: {req.model}: user-selected GPU memory policy "
