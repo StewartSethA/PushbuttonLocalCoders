@@ -32,6 +32,96 @@ budgetmod = load("claude_local_budget", ROOT / "lib" / "claude_local_budget.py")
 gwmod = load("claude_local_gateway", ROOT / "lib" / "claude_local_gateway.py")
 
 
+class BuildToolTests(unittest.TestCase):
+    @staticmethod
+    def functions(*names):
+        launcher = (ROOT / "claude-local").read_text()
+        return "\n".join(
+            launcher[launcher.index(name + "() {"):].split("\n}\n", 1)[0] + "\n}\n"
+            for name in names)
+
+    @staticmethod
+    def executable(directory, name, body):
+        path = directory / name
+        path.write_text("#!/bin/sh\n" + body + "\n")
+        path.chmod(0o755)
+        return path
+
+    def test_ninja_skips_broken_shadowing_wrapper(self):
+        with tempfile.TemporaryDirectory(prefix="ninja tools ") as tmp:
+            root = pathlib.Path(tmp)
+            broken, working = root / "local", root / "system"
+            broken.mkdir()
+            working.mkdir()
+            self.executable(broken, "ninja", "echo \"ModuleNotFoundError: No module named 'ninja'\" >&2\nexit 1")
+            expected = self.executable(working, "ninja", "echo 1.11.1")
+            result = subprocess.run(
+                ["/bin/bash", "-c", self.functions("find_working_ninja") + "\nfind_working_ninja"],
+                env={**os.environ, "PATH": f"{broken}:{working}"},
+                capture_output=True, text=True, check=True)
+            self.assertEqual(result.stdout.strip(), str(expected))
+            self.assertEqual(result.stderr, "")
+
+    def test_ninja_selection_and_dependency_check(self):
+        for executables, selected in (
+                ({"ninja": "echo 1.11.1", "ninja-build": "echo 1.12.0"}, "ninja"),
+                ({"ninja-build": "echo 1.11.1"}, "ninja-build"),
+                ({"ninja": "exit 1"}, None),
+                ({}, None)):
+            with self.subTest(executables=executables), tempfile.TemporaryDirectory() as tmp:
+                directory = pathlib.Path(tmp)
+                for name, body in executables.items():
+                    self.executable(directory, name, body)
+                script = self.functions("find_working_ninja", "base_deps_missing")
+                script += "\nhave_cmd() { return 0; }\npkg-config() { return 0; }\n"
+                result = subprocess.run(
+                    ["/bin/bash", "-c", script + "\nfind_working_ninja"],
+                    env={**os.environ, "PATH": tmp}, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0 if selected else 1)
+                self.assertEqual(result.stdout.strip(), str(directory / selected) if selected else "")
+                deps = subprocess.run(
+                    ["/bin/bash", "-c", script + "\nbase_deps_missing"],
+                    env={**os.environ, "PATH": tmp}, capture_output=True, text=True, check=True)
+                self.assertEqual(deps.stdout.strip(), "" if selected else "ninja")
+
+    def test_cuda_rebuild_pins_working_ninja_over_cached_wrapper(self):
+        with tempfile.TemporaryDirectory(prefix="cuda build ") as tmp:
+            root = pathlib.Path(tmp)
+            broken, working = root / "local", root / "system"
+            broken.mkdir()
+            working.mkdir()
+            bad_ninja = self.executable(broken, "ninja", "exit 1")
+            ninja = self.executable(working, "ninja", "echo 1.11.1")
+            src = root / "llama.cpp"
+            (src / ".git").mkdir(parents=True)
+            build = src / "build-cuda-80"
+            (build / "bin").mkdir(parents=True)
+            self.executable(build / "bin", "llama-server", "exit 0")
+            (build / "CMakeCache.txt").write_text(f"CMAKE_MAKE_PROGRAM:FILEPATH={bad_ninja}\n")
+            script = self.functions("find_working_ninja", "ensure_llamacpp") + """
+build_kind() { echo upstream; }
+inventory_arches() { echo 80; }
+say() { :; }
+die() { echo "$*" >&2; exit 1; }
+git() { :; }
+nproc() { echo 2; }
+cmake() { printf '%s\\n' "$@"; }
+ensure_llamacpp
+"""
+            result = subprocess.run(
+                ["/bin/bash", "-Eeuo", "pipefail", "-c", script],
+                env={**os.environ, "PATH": f"{broken}:{working}", "STATE_DIR": tmp,
+                     "CUDA_ROOT": "/private/cuda", "CLAUDE_LOCAL_REBUILD": "1"},
+                capture_output=True, text=True, check=True)
+            args = result.stdout.splitlines()
+            self.assertIn(f"-DCMAKE_MAKE_PROGRAM={ninja}", args)
+            self.assertNotIn(f"-DCMAKE_MAKE_PROGRAM={bad_ninja}", args)
+            for arg in ("Ninja", "-DGGML_CUDA=ON", "-DCMAKE_CUDA_ARCHITECTURES=80",
+                        "-DCMAKE_CUDA_COMPILER=/private/cuda/bin/nvcc",
+                        "--build", "llama-server", "llama-bench"):
+                self.assertIn(arg, args)
+
+
 class PlannerTests(unittest.TestCase):
     def test_ornith_catalog_aliases_and_profiles(self):
         catalog = json.loads((ROOT / "configs/model-catalog.json").read_text())["models"]

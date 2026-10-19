@@ -101,12 +101,24 @@ require_files() {
     [[ -f "$BUDGET_PY" ]] || die "missing $BUDGET_PY"
 }
 
+find_working_ninja() {
+    local candidate
+    while IFS= read -r candidate; do
+        if "$candidate" --version >/dev/null 2>&1; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done < <(type -aP ninja ninja-build 2>/dev/null || true)
+    return 1
+}
+
 base_deps_missing() {
     local -a missing=()
     local c
-    for c in git cmake ninja python3 curl tar cc c++ lspci flock tail; do
+    for c in git cmake python3 curl tar cc c++ lspci flock tail; do
         have_cmd "$c" || missing+=("$c")
     done
+    find_working_ninja >/dev/null || missing+=("ninja")
     if ! have_cmd pkg-config; then
         missing+=("pkg-config")
     elif ! pkg-config --exists openssl 2>/dev/null; then
@@ -314,7 +326,7 @@ PY
 }
 
 ensure_llamacpp() {
-    local kind arches src build repo ref
+    local kind arches src build repo ref ninja
     kind="$(build_kind)"; arches="$(inventory_arches)"; [[ -n "$arches" ]] || arches=native
     if [[ "$kind" == glm53 ]]; then
         src="$STATE_DIR/llama.cpp-glm53"; repo=https://github.com/unslothai/llama.cpp.git; ref=glm5next/upstream
@@ -323,6 +335,7 @@ ensure_llamacpp() {
     fi
     build="$src/build-cuda-${arches//;/_}"; LLAMA_SERVER="$build/bin/llama-server"
     [[ -x "$LLAMA_SERVER" && "${CLAUDE_LOCAL_REBUILD:-0}" != 1 ]] && { say "Using existing CUDA llama.cpp: $LLAMA_SERVER"; return; }
+    ninja="$(find_working_ninja)" || die "No working Ninja executable found; install ninja-build and rerun."
     if [[ -d "$src/.git" ]]; then
         say "Updating llama.cpp ($kind)..."
         git -C "$src" fetch --depth=1 origin "$ref:refs/remotes/origin/$ref"
@@ -334,7 +347,7 @@ ensure_llamacpp() {
     local -a cmake_args=(-DGGML_CUDA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON -DGGML_CUDA_PEER_MAX_BATCH_SIZE=8192 -DLLAMA_OPENSSL=ON -DCMAKE_BUILD_TYPE=Release "-DCMAKE_CUDA_ARCHITECTURES=$arches")
     [[ -n "${CUDA_ROOT:-}" ]] && cmake_args+=("-DCMAKE_CUDA_COMPILER=$CUDA_ROOT/bin/nvcc" "-DCUDAToolkit_ROOT=$CUDA_ROOT")
     say "Building CUDA llama.cpp for SM: $arches"
-    cmake -S "$src" -B "$build" -G Ninja "${cmake_args[@]}"
+    cmake -S "$src" -B "$build" -G Ninja "-DCMAKE_MAKE_PROGRAM=$ninja" "${cmake_args[@]}"
     cmake --build "$build" --target llama-server llama-bench -j"$(nproc)"
     [[ -x "$LLAMA_SERVER" ]] || die "CUDA llama-server build failed"
 }
