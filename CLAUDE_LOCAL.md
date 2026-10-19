@@ -20,6 +20,8 @@ This creates `/usr/local/bin/claude-local` with `sudo`. It is an executable entr
 
 Heavy dependencies are provisioned lazily. The harness installs ordinary build dependencies, installs Claude Code if needed, keeps a working NVIDIA driver untouched, bootstraps a compatible CUDA toolkit privately when `nvcc` is missing/incompatible, and builds the required CUDA llama.cpp variant.
 
+CUDA builds probe `ninja` and `ninja-build` executables on `PATH` and explicitly select a working one for CMake, including cached builds. Broken Python-installed Ninja wrappers are skipped rather than shadowing the system `ninja-build` package.
+
 ## Basic use
 
 With no model arguments, let the planner choose a fast local default:
