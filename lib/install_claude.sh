@@ -248,6 +248,16 @@ start_local_claude_gateway() {
     tui_success "Local Claude Code gateway running ✓"
 }
 
+run_direct_ollama_session() {
+    local model_tag="${1:?model_tag required}"
+    local session_dir="${2:-$PWD}"
+    if ! command -v ollama &>/dev/null; then
+        tui_warn "Ollama CLI is unavailable; use the configured Claude gateway or install the Ollama CLI for direct sessions."
+        return 1
+    fi
+    (cd "$session_dir" && ollama run "$model_tag" < /dev/tty > /dev/tty 2> /dev/tty)
+}
+
 launch_interactive_claude_session() {
     local model_tag="${1:?model_tag required}"
     local session_dir="${2:-$PWD}"
@@ -258,7 +268,7 @@ launch_interactive_claude_session() {
     if ! command -v claude &>/dev/null; then
         tui_warn "Claude Code is unavailable; falling back to an interactive Ollama session."
         if [[ -r /dev/tty ]]; then
-            (cd "$session_dir" && ollama run "$model_tag" < /dev/tty > /dev/tty 2> /dev/tty)
+            run_direct_ollama_session "$model_tag" "$session_dir"
             return $?
         fi
         return 1
@@ -271,7 +281,7 @@ launch_interactive_claude_session() {
 
     if ! start_local_claude_gateway "$model_tag"; then
         tui_warn "Falling back to a direct interactive Ollama session."
-        (cd "$session_dir" && ollama run "$model_tag" < /dev/tty > /dev/tty 2> /dev/tty)
+        run_direct_ollama_session "$model_tag" "$session_dir"
         return $?
     fi
 
