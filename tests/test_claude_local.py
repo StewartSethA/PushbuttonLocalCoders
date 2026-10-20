@@ -123,6 +123,11 @@ ensure_llamacpp
 
 
 class PlannerTests(unittest.TestCase):
+    def setUp(self):
+        search = mock.patch("gguf_source.search_gguf_repositories", return_value=[])
+        self.hub_search = search.start()
+        self.addCleanup(search.stop)
+
     def test_ornith_catalog_aliases_and_profiles(self):
         catalog = json.loads((ROOT / "configs/model-catalog.json").read_text())["models"]
         for model in ("ornith-1.5:9b", "ornith-1.5:35b-a3b"):
@@ -203,7 +208,7 @@ class PlannerTests(unittest.TestCase):
         with mock.patch("gguf_source.fetch_metadata", side_effect=self.fallback_metadata), redirect_stderr(stderr):
             result = planmod.plan(["q38@slots=2", "q36@slots=2"], gpus, 262144)
         self.assertEqual([s["profile"]["quant"] for s in result["servers"]],
-                         ["IQ1_S", "UD-IQ2_M"])
+                         ["IQ1_S", "UD-IQ2_XXS"])
         self.assertNotEqual(result["servers"][0]["cuda_visible_devices"],
                             result["servers"][1]["cuda_visible_devices"])
         for server in result["servers"]:
@@ -276,6 +281,192 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(server["profile"]["quant"], "Q3_K_M")
         self.assertEqual(server["capacity"]["memory_estimate"]["weights_mib"], 4096)
         self.assertGreaterEqual(server["headroom_mib"], 0)
+
+    def test_reported_two_gpu_setup_uses_confirmed_curated_quant_sizes(self):
+        gpus = [planmod.GPU(i, "RTX 4060 Ti", 16384, 16179) for i in range(2)]
+
+        def metadata(repo):
+            # Synthetic inventory: exercise exact-size accounting, not artifact availability.
+            quant, gib = ("IQ1_S", 5) if "27B" in repo else ("UD-IQ2_M", 9)
+            return {"sha": "b" * 40, "siblings": [
+                {"rfilename": f"model-{quant}.gguf", "size": int(gib * 2**30)}]}
+
+        with mock.patch("gguf_source.fetch_metadata", side_effect=metadata):
+            result = planmod.plan(
+                ["qwen3.8:27b@slots=2", "qwen3.6:35b@slots=2,gpu=0,vram=14G"],
+                gpus, 262144)
+        self.assertEqual([s["cuda_visible_devices"] for s in result["servers"]], ["1", "0"])
+        for server, weights_mib in zip(result["servers"], (5120, 9216)):
+            with self.subTest(model=server["model"]):
+                estimate = server["capacity"]["memory_estimate"]
+                self.assertEqual(estimate["weights_source"], "gguf-metadata")
+                self.assertEqual(estimate["weights_mib"], weights_mib)
+                self.assertEqual(server["required_mib"], estimate["required_mib"])
+                self.assertLessEqual(server["required_mib"], server["allocated_mib"])
+                self.assertEqual(server["capacity"]["context"], 262144)
+                self.assertEqual(server["capacity"]["slots"], 2)
+                self.assertIn("/resolve/" + "b" * 40 + "/", server["profile"]["hf_spec"])
+
+    def test_reported_two_gpu_setup_rejects_just_too_large_fallback(self):
+        gpus = [planmod.GPU(i, "RTX 4060 Ti", 16384, 16179) for i in range(2)]
+        metadata = {"sha": "b" * 40, "siblings": [
+            {"rfilename": "model-IQ1_S.gguf", "size": int(5.25 * 2**30)}]}
+        with mock.patch("gguf_source.fetch_metadata", return_value=metadata):
+            with self.assertRaises(ValueError) as error:
+                planmod.plan(["qwen3.8:27b@slots=2", "qwen3.6:35b@slots=2"],
+                             gpus, 262144)
+        message = str(error.exception)
+        self.assertIn("without sharing/overcommitting GPUs", message)
+        self.assertIn("qwen3.8:27b: smallest matching quant IQ1_S", message)
+        self.assertIn("2 slot(s) x 262,144 tokens", message)
+        self.assertIn("largest single GPU 15.8 GiB", message)
+        self.assertIn("Lower context/slots", message)
+
+    def test_reported_two_gpu_setup_does_not_keep_smaller_curated_estimate(self):
+        gpus = [planmod.GPU(i, "RTX 4060 Ti", 16384, 16179) for i in range(2)]
+
+        def metadata(repo):
+            quant, gib = ("IQ1_S", 5) if "27B" in repo else ("UD-IQ2_M", 12)
+            return {"sha": "b" * 40, "siblings": [
+                {"rfilename": f"model-{quant}.gguf", "size": int(gib * 2**30)}]}
+
+        with mock.patch("gguf_source.fetch_metadata", side_effect=metadata):
+            with self.assertRaises(ValueError) as error:
+                planmod.plan(["qwen3.8:27b@slots=2", "qwen3.6:35b@slots=2"],
+                             gpus, 262144)
+        self.assertIn("weights 12.0", str(error.exception))
+        self.assertIn("weights source: gguf-metadata", str(error.exception))
+
+    def test_reported_two_gpu_setup_half_context_fits_without_network(self):
+        gpus = [planmod.GPU(i, "RTX 4060 Ti", 16384, 16179) for i in range(2)]
+        with mock.patch("gguf_source.fetch_metadata") as fetch:
+            result = planmod.plan(
+                ["qwen3.8:27b@slots=2", "qwen3.6:35b@slots=2"], gpus, 131072)
+            with self.assertRaisesRegex(budgetmod.BudgetError, "minimum auto-compaction window"):
+                budgetmod.shared_policy(budgetmod.planned_routes(result), "", {})
+            result = planmod.plan(
+                ["qwen3.8:27b@slots=2,compact=100000",
+                 "qwen3.6:35b@slots=2,compact=100000"], gpus, 131072)
+        fetch.assert_not_called()
+        self.assertEqual([s["profile"]["quant"] for s in result["servers"]],
+                         ["IQ2_S", "UD-IQ3_XXS"])
+        self.assertEqual([s["required_mib"] for s in result["servers"]], [14433, 16127])
+        self.assertNotEqual(result["servers"][0]["cuda_visible_devices"],
+                            result["servers"][1]["cuda_visible_devices"])
+        for server in result["servers"]:
+            self.assertEqual(server["capacity"]["slots"], 2)
+            self.assertEqual(server["capacity"]["context"], 131072)
+            self.assertGreaterEqual(server["headroom_mib"], 0)
+        policy = budgetmod.shared_policy(budgetmod.planned_routes(result), "", {})
+        self.assertEqual(policy["compact_window"], 100000)
+        self.assertLess(policy["compact_window"], policy["client_context"])
+
+    def test_broad_hub_search_finds_best_fitting_quant_for_both_models(self):
+        bases = {"27B": "Qwen/Qwen3.8-27B", "35B": "Qwen/Qwen3.6-35B-A3B"}
+        self.hub_search.side_effect = lambda base: [
+            "community/" + base.split("/")[-1] + "-GGUF",
+            "other/unrelated", "other/finetune", "other/undeclared", "other/merge",
+        ]
+
+        def metadata(repo):
+            base = bases["27B" if "27B" in repo else "35B"]
+            card = {"base_model": base, "base_model_relation": "quantized"}
+            items = []
+            if repo.startswith("community/"):
+                quants = [("Q8_0", 30), ("Q4_K_S", 6), ("IQ2_XS", 5), ("IQ1_S", 4)]
+                if "35B" in repo:
+                    quants = [("Q8_0", 30), ("Q3_K_S", 9), ("UD-IQ2_M", 8)]
+                items = [{"rfilename": f"model-{q}.gguf", "size": int(gib * 2**30)}
+                         for q, gib in quants]
+            elif repo.startswith("other/"):
+                items = [{"rfilename": "model-Q8_0.gguf", "size": 2**30}]
+                if repo.endswith("unrelated"):
+                    card["base_model"] = "other/different-model"
+                elif repo.endswith("finetune"):
+                    card["base_model_relation"] = "finetune"
+                elif repo.endswith("merge"):
+                    card["base_model"] = [base, "other/different-model"]
+                else:
+                    card = {}
+            return {"sha": "d" * 40, "cardData": card, "siblings": items}
+
+        with mock.patch("gguf_source.fetch_metadata", side_effect=metadata):
+            result = planmod.plan(
+                ["q38@slots=2,gpu=1", "q36@slots=2,gpu=0,vram=14G"],
+                [planmod.GPU(i, "RTX 4060 Ti", 16384, 16179) for i in range(2)], 262144)
+        self.assertEqual(self.hub_search.call_count, 2)
+        self.assertEqual([s["profile"]["quant"] for s in result["servers"]], ["IQ2_XS", "Q3_K_S"])
+        self.assertEqual([s["cuda_visible_devices"] for s in result["servers"]], ["1", "0"])
+        for server in result["servers"]:
+            self.assertTrue(server["profile"]["repo"].startswith("community/"))
+            self.assertIn("/resolve/" + "d" * 40 + "/", server["profile"]["hf_spec"])
+            self.assertEqual(server["capacity"]["context"], 262144)
+            self.assertEqual(server["capacity"]["slots"], 2)
+            self.assertEqual(server["required_mib"], server["capacity"]["memory_estimate"]["required_mib"])
+            self.assertGreaterEqual(server["headroom_mib"], 0)
+
+    def test_broad_discovery_ranks_above_curated_and_resolves_variants_and_shards(self):
+        model = "qwen3.8:27b"
+        repo = planmod.PROFILES[model][-1].repo
+        metadata = {"sha": "e" * 40, "siblings": [
+            {"rfilename": "curated-IQ2_XS.gguf", "size": 4 * 2**30},
+            {"rfilename": "higher/model-IQ3_S-00001-of-00002.gguf", "size": 2 * 2**30},
+            {"rfilename": "higher/model-IQ3_S-00002-of-00002.gguf", "size": 3 * 2**30},
+            {"rfilename": "smaller/model-IQ3_S.gguf", "size": 4 * 2**30},
+            {"rfilename": "incomplete/model-Q8_0-00001-of-00002.gguf", "size": 2**30},
+            {"rfilename": "mmproj-Q8_0.gguf", "size": 2**30},
+            {"rfilename": "model-Q8_0-mtp.gguf", "size": 2**30},
+            {"rfilename": "MTP/model-Q8_0.gguf", "size": 2**30},
+            {"rfilename": "model-MTP-Q8_0.gguf", "size": 2**30},
+            {"rfilename": "model-F16.gguf", "size": 40 * 2**30},
+            {"rfilename": "model-Q6_K.gguf"},
+            None,
+        ]}
+        with mock.patch("gguf_source.fetch_metadata", side_effect=lambda r:
+                        metadata if r == repo else {"sha": "e" * 40, "siblings": []}):
+            profiles = planmod.discover_fallback_profiles(model)
+        self.assertEqual({p.quant for p in profiles}, {"F16", "IQ3_S", "IQ2_XS"})
+        selected, required = planmod.best_profile_for_capacity(
+            model, 16179, 262144, {"slots": 2}, profiles)
+        self.assertEqual(selected.quant, "IQ3_S")
+        self.assertEqual(selected.weight_mib, 5 * 1024)
+        self.assertIn("higher/model-IQ3_S-00001-of-00002.gguf", selected.hf_spec)
+        self.assertLessEqual(required, 16179)
+
+    def test_broad_discovery_network_failure_keeps_verified_known_artifacts(self):
+        self.hub_search.side_effect = OSError("offline")
+        metadata = {"sha": "a" * 40, "cardData": {"base_model": "Qwen/Qwen3.8-27B"},
+                    "siblings": [{"rfilename": "model-IQ1_S.gguf", "size": 5 * 2**30}]}
+        with mock.patch("gguf_source.fetch_metadata", return_value=metadata):
+            server = planmod.plan(
+                ["q38@slots=2"], [planmod.GPU(0, "test GPU", 16384, 16179)],
+                262144)["servers"][0]
+        self.assertTrue(self.hub_search.called)
+        self.assertEqual(server["profile"]["quant"], "IQ1_S")
+        self.assertEqual(server["capacity"]["memory_estimate"]["weights_source"], "gguf-metadata")
+
+    def test_broad_discovery_keeps_published_mixed_bpw_curated_artifact(self):
+        model = "nemotron-3.5-lightning"
+        profile = planmod.PROFILES[model][-1]
+        metadata = {"sha": "a" * 40, "siblings": [
+            {"rfilename": f"model-{profile.quant}.gguf", "size": 10 * 2**30}]}
+        with mock.patch("gguf_source.fetch_metadata", side_effect=lambda repo:
+                        metadata if repo == profile.repo else {"sha": "a" * 40, "siblings": []}):
+            profiles = planmod.discover_fallback_profiles(model)
+        self.assertEqual([p.quant for p in profiles], [profile.quant])
+        for selected in profiles:
+            self.assertEqual(selected.weight_mib, 10 * 1024)
+            self.assertEqual(selected.quality, 2970)
+            self.assertIn("/resolve/" + "a" * 40 + "/", selected.hf_spec)
+
+    def test_broad_discovery_uses_effective_ternary_bpw_for_quality_order(self):
+        metadata = {"sha": "a" * 40, "siblings": [
+            {"rfilename": f"model-{quant}.gguf", "size": 4 * 2**30}
+            for quant in ("TQ1_0", "TQ2_0", "IQ1_S", "IQ1_M", "IQ2_M")]}
+        with mock.patch("gguf_source.fetch_metadata", return_value=metadata):
+            profiles = planmod.discover_fallback_profiles("qwen3.8:27b")
+        self.assertEqual(list(dict.fromkeys(p.quant for p in profiles)),
+                         ["IQ2_M", "TQ2_0", "IQ1_M", "TQ1_0", "IQ1_S"])
 
 
 class GatewayTests(unittest.TestCase):

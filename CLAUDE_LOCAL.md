@@ -75,15 +75,57 @@ The planner inventories every visible NVIDIA GPU independently, including free V
 7. Builds CUDA for all compute capabilities in the plan, so mixed Volta/Ada hosts can use one compatible build.
 
 When the curated quant tiers cannot fit the complete model set at the requested
-context and slots, the planner automatically checks those models' Hugging Face
-repositories for smaller quant artifacts and replans using their confirmed file
-sizes. It announces the next-best fitting quant for each downgraded model on
+context and slots, the planner checks all recognized GGUF quant variants in the
+configured repositories and searches HF for additional GGUF repositories.
+Additional repositories must declare the same direct base-model identity in
+their model-card metadata or HF tags; declared fine-tunes, merges, unrelated
+models and missing identities are excluded. The catalog's `hf_model` is used
+when available; otherwise configured repositories supply that identity.
+Search is bounded to three 50-result pages per base identity (up to four
+identities and 150 additional repository inspections per model). Missing
+identity or network failures are reported, not interpreted as proof that no
+other quants exist.
+
+The planner resolves exact filenames and complete shard sets, confirms their
+combined payload sizes and pins the selected revision. Separate filename
+variants with the same quant are considered independently; incomplete shards,
+unknown sizes, projection files and implicit MTP variants are excluded.
+Successful inventories replace estimates, including removing unpublished
+curated entries; unreachable configured repositories retain their estimates.
+Across discovered and curated tiers, quant quality is approximated by effective
+bits per weight, not curated-list membership or file size. Equal-BPW variants
+are tried largest-payload first within each GPU subset. This is a quality
+heuristic, not an accuracy benchmark; base identity is a repository declaration,
+not independent proof of tensor contents or runtime compatibility.
+
+Placement includes weights, KV for the requested context times slots, and
+runtime/margin, and still jointly assigns disjoint GPU sets. It announces
+the next-best fitting quant for each changed model on
 stderr, warns of possible coding/tool-use degradation below 4 bits, and passes
 the selected, revision-pinned artifacts to the normal downloader and launcher.
-Explicit `quant=`/`bits=`, GPU assignments, VRAM caps, context, and slots remain
+Explicit `quant=`/`bits=` skip automatic discovery. GPU assignments, VRAM caps, context, and slots remain
 constraints; they are not silently relaxed. If no verified fallback fits (or
 repository metadata is unavailable), planning still fails rather than
 overcommitting memory. A curated fit requires no extra network lookup.
+
+For two GPUs with approximately 15.8 GiB free each, two slots per model at the
+default 262,144-token context may still exceed VRAM even after discovery. Each
+slot receives its own context allocation; discovering a quant does not prove it
+fits. This reduced-context configuration passes the planner and simulated backend
+startup/context-policy checks using the curated profiles:
+
+```bash
+claude-local --local-context 131072 \
+  'qwen3.8:27b@slots=2,compact=100000' \
+  'qwen3.6:35b@slots=2,compact=100000' --local-dry-run
+```
+
+The explicit compaction windows are required here: the generic 80%-of-input
+default is below Claude's supported 100,000-token minimum at this context.
+Remove `--local-dry-run` to launch. This is not a real-GPU allocation guarantee;
+the Qwen3.6 estimate leaves little headroom. Full-context fallback tests use
+synthetic repository inventories and do not establish that fitting artifacts
+are published or available on your host.
 
 The default **requested** physical context is **262,144 tokens**. After loading each backend, the launcher verifies its actual per-slot capacity and derives Claude's budgets. Requested `-c`, model-native context, assumed client window, and proactive compaction window are different quantities.
 

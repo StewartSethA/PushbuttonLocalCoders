@@ -466,6 +466,8 @@ def best_profile_for_capacity(
     profiles: tuple[Profile, ...] | None = None,
 ) -> tuple[Profile, int] | None:
     profiles = PROFILES[model] if profiles is None else profiles
+    if not profiles:
+        return None
     settings = capacity.resolve_options(
         {k: v for k, v in (settings or {}).items() if k in capacity.OPTION_KEYS and v is not None},
         context)
@@ -685,7 +687,8 @@ def ordered_group_for_layer_split(candidate: Candidate, gpus: list[GPU]) -> list
     return [slowest] + rest
 
 
-def unplaceable_detail(request, gpus: list[GPU], context: int, slots: int = 1) -> str:
+def unplaceable_detail(request, gpus: list[GPU], context: int, slots: int = 1,
+                       profiles: tuple[Profile, ...] | None = None) -> str:
     """Explain why one request has no placement: smallest fitting need vs. free VRAM."""
     from coder_local_plan import resolve_request_options
     settings = resolve_request_options(request, context, slots)
@@ -699,7 +702,8 @@ def unplaceable_detail(request, gpus: list[GPU], context: int, slots: int = 1) -
         where += f" capped at {limit / MIB_PER_GIB:.1f} GiB each"
     label = request.model + (f"@gpu={'+'.join(map(str, request.gpu_indices))}"
                              if request.gpu_indices is not None else "")
-    estimates = [(capacity.memory_estimate(p, settings), p) for p in PROFILES[request.model]
+    profiles = PROFILES[request.model] if profiles is None else profiles
+    estimates = [(capacity.memory_estimate(p, settings), p) for p in profiles
                  if capacity.matches_quant(p.quant, settings) and settings["context"] <= p.native_context]
     if not estimates:
         return f"{label}: no profile matches the requested quant/bits/context"
@@ -724,44 +728,86 @@ def unplaceable_detail(request, gpus: list[GPU], context: int, slots: int = 1) -
 
 
 def discover_fallback_profiles(model: str) -> tuple[Profile, ...]:
-    """Extend curated tiers only with smaller, confirmed repository artifacts."""
+    """Rank all GGUF variants in known and matching-base Hub repositories."""
     import cpu_platform
     import gguf_source
     profiles = PROFILES[model]
     if any(p.source_spec for p in profiles):
         return profiles
-    lowest_bpw = min(cpu_platform.quant_bpw(p.quant) for p in profiles)
-    discovered = []
-    for repo in dict.fromkeys(p.repo for p in profiles):
+    known_repos = list(dict.fromkeys(p.repo for p in profiles))
+    inventories = {}
+    for repo in known_repos:
         try:
-            metadata = gguf_source.fetch_metadata(repo)
+            inventories[repo] = gguf_source.fetch_metadata(repo)
         except (ValueError, OSError) as exc:
-            print(f"Warning: {model}: cannot check fallback quants in {repo}: {exc}",
+            print(f"Warning: {model}: cannot check quants in {repo}: {exc}", file=sys.stderr)
+    catalog_base = cpu_platform._catalog().get(model, {}).get("hf_model")
+    bases = {catalog_base} if catalog_base else set().union(
+        *(gguf_source.base_model_ids(data) for data in inventories.values()))
+    searched = set(known_repos)
+    for base_model in sorted(bases)[:4]:
+        try:
+            repos = gguf_source.search_gguf_repositories(base_model)
+        except (ValueError, OSError) as exc:
+            print(f"Warning: {model}: cannot search HF repositories for {base_model}: {exc}",
                   file=sys.stderr)
             continue
-        template = next(p for p in profiles if p.repo == repo)
-        quants = set()
-        for item in metadata.get("siblings", []):
-            name = str(item.get("rfilename", "")).rsplit("/", 1)[-1].upper()
-            match = re.search(
-                r"(?:^|[-.])((?:UD-)?(?:IQ|Q|MXFP|NVFP|FP|BF)[0-9]+(?:_[A-Z0-9]+)*)"
-                r"(?=(?:-[0-9]{5}-OF-[0-9]{5})?\.GGUF$)", name)
-            if match and cpu_platform.quant_bpw(match[1]) < lowest_bpw:
-                quants.add(match[1])
-        for quant in sorted(quants):
+        for repo in repos:
+            if repo in searched:
+                continue
+            if len(searched) >= len(known_repos) + 150:
+                break
+            searched.add(repo)
             try:
-                resolved = gguf_source.resolve_files(f"{repo}:{quant}", metadata)
+                data = gguf_source.fetch_metadata(repo)
+                declared = gguf_source.base_model_ids(data)
+                if declared and declared <= bases:
+                    inventories[repo] = data
+            except (ValueError, OSError) as exc:
+                print(f"Warning: {model}: cannot inspect HF repository {repo}: {exc}",
+                      file=sys.stderr)
+    if not bases:
+        print(f"Warning: {model}: no direct base-model identity available; "
+              "search is limited to configured repositories.", file=sys.stderr)
+    discovered = []
+    curated_quants = "|".join(re.escape(q) for q in sorted(
+        {p.quant.upper() for p in profiles}, key=lambda q: (-len(q), q)))
+    for repo, metadata in inventories.items():
+        metadata = {**metadata, "siblings": [
+            item for item in metadata.get("siblings", []) if isinstance(item, dict)]}
+        template = next((p for p in profiles if p.repo == repo), profiles[0])
+        artifacts = {}
+        for item in metadata.get("siblings", []):
+            filename = str(item.get("rfilename", ""))
+            if re.search(r"(?:^|[-_./])mtp(?:[-_./]|$)", filename, re.I):
+                continue
+            name = filename.rsplit("/", 1)[-1].upper()
+            match = re.search(
+                r"(?:^|[-.])(" + curated_quants
+                + r"|(?:UD-)?(?:IQ|Q|TQ|MXFP|NVFP|FP|BF|F)[0-9]+(?:_[A-Z0-9]+)*)"
+                r"(?=(?:-[0-9]{5}-OF-[0-9]{5})?\.GGUF$)", name)
+            if match and "mmproj" not in name.lower():
+                group = re.sub(r"-[0-9]{5}-of-[0-9]{5}(?=\.gguf$)", "", filename)
+                artifacts.setdefault(group, (filename, match[1]))
+        for filename, quant in artifacts.values():
+            try:
+                resolved = gguf_source.resolve_files(f"{repo}/{filename}", metadata)
             except ValueError:
                 continue
+            original = next((p for p in profiles if p.repo == repo and p.quant == quant), template)
             discovered.append(replace(
-                template, quant=quant,
+                original, repo=repo, quant=quant,
                 weight_mib=resolved["weight_bytes"] / 2**20,
                 source_spec=resolved["download_spec"],
-                note="automatically discovered lower-quant memory fallback"))
-    discovered.sort(key=lambda p: -cpu_platform.quant_bpw(p.quant))
-    return profiles + tuple(
-        replace(p, quality=min(profile.quality for profile in profiles) - rank)
-        for rank, p in enumerate(discovered, 1))
+                note="Hub-discovered quant; base-model identity from repository metadata"))
+    # Retain estimates only when that configured repository could not be checked.
+    print(f"Warning: {model}: checked {len(inventories)} repository inventories; "
+          f"found {len(discovered)} verified GGUF artifact(s).", file=sys.stderr)
+    discovered.extend(p for p in profiles if p.repo not in inventories)
+    ranked = [replace(p, quality=round(cpu_platform.quant_bpw(p.quant) * 1000))
+              for p in discovered]
+    return tuple(sorted(ranked, key=lambda p: (
+        -p.quality, -(p.weight_mib or 0), p.repo, p.hf_spec)))
 
 
 def plan(models: list[str], gpus: list[GPU], context: int, slots: int = 1,
@@ -790,10 +836,10 @@ def plan(models: list[str], gpus: list[GPU], context: int, slots: int = 1,
         choices = joint_model_choices(instances, gpus, context, rm["sonnet"], candidate_map)
         policy = "joint-global-plan"
 
+    fallback_profiles = {}
     if not choices:
         print("Warning: curated quants cannot fit the requested context/slots on disjoint GPUs; "
-              "checking repositories for smaller fallback quants.", file=sys.stderr)
-        fallback_profiles = {}
+              "searching HF repositories for fitting GGUF quants.", file=sys.stderr)
         for i, request in enumerate(requests):
             if any(key in request.capacity for key in ("quant", "bits")) or request.capacity.get("force"):
                 continue
@@ -816,7 +862,9 @@ def plan(models: list[str], gpus: list[GPU], context: int, slots: int = 1,
         if unplaceable:
             raise ValueError(
                 "cannot place requested model set: "
-                + "; ".join(unplaceable_detail(requests[i], gpus, context, slots) for i in unplaceable)
+                + "; ".join(unplaceable_detail(
+                    requests[i], gpus, context, slots, fallback_profiles.get(requests[i].model))
+                    for i in unplaceable)
                 + ". Lower context/slots, use smaller KV types (kv_k/kv_v), fewer bits, or more GPUs. "
                 "Set MODEL@margin=N (MiB) to choose the runtime/margin allowance, "
                 "or MODEL@force=true to try despite the estimate (may run out of memory)"
@@ -825,6 +873,12 @@ def plan(models: list[str], gpus: list[GPU], context: int, slots: int = 1,
             f"cannot place requested model set at context {context:,} without "
             f"sharing/overcommitting GPUs; free VRAM is "
             f"{[round(g.free_gib, 1) for g in gpus]} GiB"
+            + "; " + "; ".join(unplaceable_detail(
+                request, gpus, context, slots, fallback_profiles.get(request.model))
+                for request in requests)
+            + ". Each concurrent model needs a disjoint GPU set. "
+            "Lower context/slots, select a smaller quant, or add GPUs; "
+            "requested limits were not changed."
         )
 
     servers = []

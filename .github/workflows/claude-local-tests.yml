@@ -17,6 +17,7 @@ on:
       - "lib/pushbutton_download.*"
       - "tests/test_pushbutton_download.py"
       - "tests/test_claude_local.py"
+      - "tests/test_frontend_startup.py"
       - "tests/test_claude_local_scheduler.py"
       - "tests/test_backend_row_protocol.sh"
       - ".github/workflows/claude-local-tests.yml"
@@ -38,6 +39,7 @@ on:
       - "lib/pushbutton_download.*"
       - "tests/test_pushbutton_download.py"
       - "tests/test_claude_local.py"
+      - "tests/test_frontend_startup.py"
       - "tests/test_claude_local_scheduler.py"
       - "tests/test_backend_row_protocol.sh"
       - ".github/workflows/claude-local-tests.yml"
@@ -64,6 +66,6 @@ jobs:
       - name: Claude-local permission policy
         run: bash ./tests/test_claude_local_policy.sh
       - name: Unit tests
-        run: python3 -m unittest -v tests/test_claude_local.py tests/test_claude_local_scheduler.py tests/test_folders.py tests/test_storage_launchers.py
+        run: python3 -m unittest -v tests/test_claude_local.py tests/test_claude_local_scheduler.py tests/test_frontend_startup.py tests/test_folders.py tests/test_storage_launchers.py
       - name: Download tests
         run: python3 -m unittest discover -s tests -p test_pushbutton_download.py -v

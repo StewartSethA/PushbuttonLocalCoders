@@ -30,6 +30,75 @@ METADATA = {"sha": REVISION, "siblings": [
 
 
 class MetadataTests(unittest.TestCase):
+    @staticmethod
+    def search_response(entries, link=""):
+        response = io.BytesIO(json.dumps(entries).encode())
+        response.headers = {"Link": link}
+        return response
+
+    def test_hub_search_pagination_and_safe_repository_ids(self):
+        next_url = "https://huggingface.co/api/models?cursor=page2"
+        with mock.patch.object(source, "safe_open", side_effect=[
+                self.search_response([{"id": "community/Qwen-GGUF"},
+                                      {"id": "../unsafe"}, {"id": "evil/repo?query"},
+                                      {"id": "owner/repo/extra"}, None],
+                                     f'<{next_url}>; rel="next"'),
+                self.search_response([{"id": "community/Qwen-GGUF"}, {"id": "other/Qwen-GGUF"}]),
+        ]) as opened:
+            self.assertEqual(source.search_gguf_repositories("Qwen/Qwen3.8-27B"),
+                             ["community/Qwen-GGUF", "other/Qwen-GGUF"])
+        first_url = opened.call_args_list[0].args[0].full_url
+        self.assertIn("search=Qwen3.8-27B", first_url)
+        self.assertIn("filter=gguf", first_url)
+        self.assertEqual(opened.call_args_list[1].args[0].full_url, next_url)
+
+    def test_hub_search_rejects_unsafe_pagination_and_invalid_responses(self):
+        for next_url in ("https://evil.example/api/models", "https://huggingface.co/other",
+                         "http://huggingface.co/api/models",
+                         "******huggingface.co/api/models"):
+            with self.subTest(url=next_url), mock.patch.object(
+                    source, "safe_open", return_value=self.search_response(
+                        [], f'<{next_url}>; rel="next"')) as opened:
+                with self.assertRaisesRegex(ValueError, "Unsafe.*pagination"):
+                    source.search_gguf_repositories("Qwen/model")
+                self.assertEqual(opened.call_count, 1)
+        for entries in ({}, None, "invalid"):
+            with self.subTest(entries=entries), mock.patch.object(
+                    source, "safe_open", return_value=self.search_response(entries)):
+                with self.assertRaisesRegex(ValueError, "Invalid.*search"):
+                    source.search_gguf_repositories("Qwen/model")
+        with mock.patch.object(source, "safe_open") as opened:
+            with self.assertRaises(ValueError):
+                source.search_gguf_repositories("owner/repo/extra")
+            opened.assert_not_called()
+
+    def test_hub_search_is_bounded_and_rejects_oversize(self):
+        responses = [self.search_response(
+            [{"id": f"owner/repo{i}"}],
+            f'<https://huggingface.co/api/models?cursor={i+1}>; rel="next"')
+                     for i in range(3)]
+        with mock.patch.object(source, "safe_open", side_effect=responses) as opened:
+            self.assertEqual(len(source.search_gguf_repositories("Qwen/model")), 3)
+            self.assertEqual(opened.call_count, 3)
+        response = io.BytesIO(b" " * (source.MAX_PREFIX + 1))
+        response.headers = {}
+        with mock.patch.object(source, "safe_open", return_value=response):
+            with self.assertRaisesRegex(ValueError, "safety limit"):
+                source.search_gguf_repositories("Qwen/model")
+
+    def test_hub_base_identity_requires_direct_matching_quantization(self):
+        for card, tags, expected in (
+                ({"base_model": "Qwen/model"}, [], {"Qwen/model"}),
+                ({"base_model": ["Qwen/model"], "base_model_relation": "quantized"}, [], {"Qwen/model"}),
+                ({}, ["base_model:quantized:Qwen/model"], {"Qwen/model"}),
+                ({"base_model": "Qwen/model", "base_model_relation": "finetune"}, [], set()),
+                ({}, ["base_model:finetune:Qwen/model"], set()),
+                ({"base_model": "Qwen/model/extra"}, [], set()),
+                ({"base_model": ["Qwen/model", "other/model"]}, [], {"Qwen/model", "other/model"}),
+                ({}, [], set())):
+            with self.subTest(card=card, tags=tags):
+                self.assertEqual(source.base_model_ids({"cardData": card, "tags": tags}), expected)
+
     def test_quant_and_shards(self):
         self.assertEqual(len(download.select_files(METADATA, "UD-Q4_K_XL")), 2)
         self.assertEqual(len(download.select_files(METADATA, "Q4_K_M")), 1)
