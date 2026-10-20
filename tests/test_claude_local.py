@@ -326,8 +326,11 @@ class PlannerTests(unittest.TestCase):
             {"rfilename": "incomplete/model-Q8_0-00001-of-00002.gguf", "size": 2**30},
             {"rfilename": "mmproj-Q8_0.gguf", "size": 2**30},
             {"rfilename": "model-Q8_0-mtp.gguf", "size": 2**30},
+            {"rfilename": "MTP/model-Q8_0.gguf", "size": 2**30},
+            {"rfilename": "model-MTP-Q8_0.gguf", "size": 2**30},
             {"rfilename": "model-F16.gguf", "size": 40 * 2**30},
             {"rfilename": "model-Q6_K.gguf"},
+            None,
         ]}
         with mock.patch("gguf_source.fetch_metadata", side_effect=lambda r:
                         metadata if r == repo else {"sha": "e" * 40, "siblings": []}):

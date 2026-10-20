@@ -773,10 +773,14 @@ def discover_fallback_profiles(model: str) -> tuple[Profile, ...]:
     curated_quants = "|".join(re.escape(q) for q in sorted(
         {p.quant.upper() for p in profiles}, key=lambda q: (-len(q), q)))
     for repo, metadata in inventories.items():
+        metadata = {**metadata, "siblings": [
+            item for item in metadata.get("siblings", []) if isinstance(item, dict)]}
         template = next((p for p in profiles if p.repo == repo), profiles[0])
         artifacts = {}
         for item in metadata.get("siblings", []):
             filename = str(item.get("rfilename", ""))
+            if re.search(r"(?:^|[-_./])mtp(?:[-_./]|$)", filename, re.I):
+                continue
             name = filename.rsplit("/", 1)[-1].upper()
             match = re.search(
                 r"(?:^|[-.])(" + curated_quants
