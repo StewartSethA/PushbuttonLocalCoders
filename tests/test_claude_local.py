@@ -352,6 +352,29 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(server["profile"]["quant"], "IQ1_S")
         self.assertEqual(server["capacity"]["memory_estimate"]["weights_source"], "gguf-metadata")
 
+    def test_broad_discovery_keeps_published_mixed_bpw_curated_artifact(self):
+        model = "nemotron-3.5-lightning"
+        profile = planmod.PROFILES[model][-1]
+        metadata = {"sha": "a" * 40, "siblings": [
+            {"rfilename": f"model-{profile.quant}.gguf", "size": 10 * 2**30}]}
+        with mock.patch("gguf_source.fetch_metadata", side_effect=lambda repo:
+                        metadata if repo == profile.repo else {"sha": "a" * 40, "siblings": []}):
+            profiles = planmod.discover_fallback_profiles(model)
+        self.assertEqual([p.quant for p in profiles], [profile.quant])
+        for selected in profiles:
+            self.assertEqual(selected.weight_mib, 10 * 1024)
+            self.assertEqual(selected.quality, 2970)
+            self.assertIn("/resolve/" + "a" * 40 + "/", selected.hf_spec)
+
+    def test_broad_discovery_uses_effective_ternary_bpw_for_quality_order(self):
+        metadata = {"sha": "a" * 40, "siblings": [
+            {"rfilename": f"model-{quant}.gguf", "size": 4 * 2**30}
+            for quant in ("TQ1_0", "TQ2_0", "IQ1_S", "IQ1_M", "IQ2_M")]}
+        with mock.patch("gguf_source.fetch_metadata", return_value=metadata):
+            profiles = planmod.discover_fallback_profiles("qwen3.8:27b")
+        self.assertEqual(list(dict.fromkeys(p.quant for p in profiles)),
+                         ["IQ2_M", "TQ2_0", "IQ1_M", "TQ1_0", "IQ1_S"])
+
 
 class GatewayTests(unittest.TestCase):
     def setUp(self):

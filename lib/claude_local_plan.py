@@ -770,6 +770,8 @@ def discover_fallback_profiles(model: str) -> tuple[Profile, ...]:
         print(f"Warning: {model}: no direct base-model identity available; "
               "search is limited to configured repositories.", file=sys.stderr)
     discovered = []
+    curated_quants = "|".join(re.escape(q) for q in sorted(
+        {p.quant.upper() for p in profiles}, key=lambda q: (-len(q), q)))
     for repo, metadata in inventories.items():
         template = next((p for p in profiles if p.repo == repo), profiles[0])
         artifacts = {}
@@ -777,7 +779,8 @@ def discover_fallback_profiles(model: str) -> tuple[Profile, ...]:
             filename = str(item.get("rfilename", ""))
             name = filename.rsplit("/", 1)[-1].upper()
             match = re.search(
-                r"(?:^|[-.])((?:UD-)?(?:IQ|Q|TQ|MXFP|NVFP|FP|BF|F)[0-9]+(?:_[A-Z0-9]+)*)"
+                r"(?:^|[-.])(" + curated_quants
+                + r"|(?:UD-)?(?:IQ|Q|TQ|MXFP|NVFP|FP|BF|F)[0-9]+(?:_[A-Z0-9]+)*)"
                 r"(?=(?:-[0-9]{5}-OF-[0-9]{5})?\.GGUF$)", name)
             if match and "mmproj" not in name.lower():
                 group = re.sub(r"-[0-9]{5}-of-[0-9]{5}(?=\.gguf$)", "", filename)
