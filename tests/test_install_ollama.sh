@@ -5,13 +5,15 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/lib/install_ollama.sh"
 
 REMOTE_PAYLOAD='{"models":[{"name":"qwen3.8:27b"}]}'
-LAST_CURL_URL=""
+CURL_URL_FILE="$(mktemp)"
+trap 'rm -f "$CURL_URL_FILE"' EXIT
 ERRORS=""
 LOCAL_CALLS=()
 
 curl() {
-    LAST_CURL_URL="${!#}"
-    [[ "$LAST_CURL_URL" == *"/api/tags" ]] || return 2
+    local url="${!#}"
+    printf '%s' "$url" > "$CURL_URL_FILE"
+    [[ "$url" == *"/api/tags" ]] || return 2
     printf '%s' "$REMOTE_PAYLOAD"
 }
 tui_error() { ERRORS+="$*\n"; }
@@ -22,7 +24,7 @@ pull_model() { LOCAL_CALLS+=("pull:$1"); }
 
 OLLAMA_HOST="https://192.168.1.20:11434"
 setup_ollama qwen3.8:27b
-[[ "$LAST_CURL_URL" == "https://192.168.1.20:11434/api/tags" ]]
+[[ "$(cat "$CURL_URL_FILE")" == "https://192.168.1.20:11434/api/tags" ]]
 [[ ${#LOCAL_CALLS[@]} -eq 0 ]]
 
 ERRORS=""
