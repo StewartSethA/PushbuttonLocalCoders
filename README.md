@@ -6,6 +6,30 @@
 > GGUF quant, place independent workers across GPUs, and launch several coding
 > frontends against the resulting local model servers.
 
+## Choose where the Ollama model runs
+
+The general `install.sh` Ollama workflow uses a model on this machine by default:
+
+```bash
+bash install.sh --quick
+```
+
+To use a model hosted by another machine, install Ollama and pull the model on the
+serving machine, then make its API reachable only on a trusted private network.
+Ollama has no built-in API authentication; do not expose port `11434` to the
+public internet. For example, start the server with `OLLAMA_HOST=0.0.0.0:11434`
+(configure the Ollama service environment if it is already managed by systemd),
+then on the client:
+
+```bash
+export OLLAMA_HOST=http://192.168.1.20:11434
+bash install.sh --quick --model qwen3.8:27b
+```
+
+The client checks that the remote service is reachable and the requested model
+is already present there; it does not install Ollama or download model weights
+on the client. Replace the address and model tag with those for your setup.
+
 ---
 
 ## Install

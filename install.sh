@@ -230,7 +230,11 @@ mode_quick() {
     tui_header "Setup Complete"
     echo ""
     echo "  Claude Code :  ANTHROPIC_BASE_URL=http://${PUSHBUTTON_CLAUDE_GATEWAY_HOST:-127.0.0.1}:${PUSHBUTTON_CLAUDE_GATEWAY_PORT:-4000} claude --model ${PUSHBUTTON_CLAUDE_GATEWAY_MODEL:-pushbutton-local}"
-    echo "  Run a query :  ollama run $SELECTED_MODEL \"Write a hello world in Python\""
+    if command -v ollama &>/dev/null; then
+        echo "  Run a query :  ollama run $SELECTED_MODEL \"Write a hello world in Python\""
+    else
+        echo "  Ollama API  :  ${OLLAMA_HOST:-http://localhost:11434} (configured model endpoint)"
+    fi
     echo "  Monitor     :  bash $ENTRY_SCRIPT --monitor"
     echo "  Agent mode  :  bash $ENTRY_SCRIPT --agent --project /your/project --task 'Improve this code'"
     echo "  Explore     :  bash $ENTRY_SCRIPT --explore"

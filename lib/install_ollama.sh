@@ -9,6 +9,61 @@ source "$SCRIPT_DIR/tui.sh"
 
 OLLAMA_MIN_VERSION="0.3.0"
 
+# ── Remote service helpers ──────────────────────────────────────────────────────
+ollama_api_base() {
+    local host="${OLLAMA_HOST:-http://localhost:11434}"
+    [[ "$host" == http://* || "$host" == https://* ]] || host="http://$host"
+    printf '%s' "${host%/}"
+}
+
+is_remote_ollama() {
+    [[ -n "${OLLAMA_HOST:-}" ]] || return 1
+    python3 - "$OLLAMA_HOST" <<'PY'
+from urllib.parse import urlsplit
+import sys
+
+value = sys.argv[1]
+parts = urlsplit(value if "://" in value else f"http://{value}")
+host = (parts.hostname or "").lower()
+sys.exit(1 if host in {"localhost", "127.0.0.1", "::1"} else 0)
+PY
+}
+
+check_remote_ollama() {
+    local endpoint payload missing
+    local model_tags=("$@")
+    endpoint="$(ollama_api_base)"
+
+    if ! payload=$(curl -fsS --max-time "${OLLAMA_CONNECT_TIMEOUT:-5}" "$endpoint/api/tags" 2>/dev/null); then
+        tui_error "Cannot reach remote Ollama at $endpoint. Check the address and server firewall."
+        return 1
+    fi
+
+    if ! missing=$(printf '%s' "$payload" | python3 -c '
+import json
+import sys
+
+try:
+    models = json.load(sys.stdin).get("models", []) or []
+except Exception:
+    raise SystemExit(1)
+
+available = {model.get("name", "") for model in models if model.get("name")}
+requested = sys.argv[1:]
+print(", ".join(model for model in requested if model not in available))
+' "${model_tags[@]}"); then
+        tui_error "Remote Ollama at $endpoint returned an invalid model list."
+        return 1
+    fi
+
+    if [[ -n "$missing" ]]; then
+        tui_error "Model(s) not found on remote Ollama: $missing. Pull them on the serving machine first."
+        return 1
+    fi
+
+    tui_success "Using remote Ollama at $endpoint ✓"
+}
+
 # ── Version helpers ────────────────────────────────────────────────────────────
 version_gte() {
     # Returns 0 (true) if $1 >= $2 in semver
@@ -147,6 +202,11 @@ pull_model() {
 # ── Entrypoint ─────────────────────────────────────────────────────────────────
 setup_ollama() {
     local model_tags=("$@")
+    if is_remote_ollama; then
+        check_remote_ollama "${model_tags[@]}"
+        return $?
+    fi
+
     ensure_ollama_installed
     start_ollama_service
     local model_tag
