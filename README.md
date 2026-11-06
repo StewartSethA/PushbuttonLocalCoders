@@ -1,3 +1,5 @@
+curl -fsSL https://raw.githubusercontent.com/StewartSethA/PushbuttonLocalCoders/main/install.sh | bash
+
 # Pushbutton Local Coders
 
 > **Pick local models. Pushbutton handles the hardware and frontend.**
@@ -29,6 +31,15 @@ bash install.sh --quick --model qwen3.8:27b
 The client checks that the remote service is reachable and the requested model
 is already present there; it does not install Ollama or download model weights
 on the client. Replace the address and model tag with those for your setup.
+
+## Experimental RTX 3090 performance paths
+
+`pushbutton-backend` supports model-specific NInfer Qwen3.6-35B-A3B artifacts,
+MTP and K8/V4 or rotated KV profiles, plus HyperQwen/vLLM Qwen3.8-27B profiles
+with long-context attention and INT8 MLP activations. Benchmark profiles
+explicitly with `pushbutton-bench --profile`; ordinary frontend defaults remain
+unchanged. GPU unlock is a separate **manual kernel/boot experiment**, never
+automatic provisioning. See [RTX 3090 setup, safety and comparison guidance](docs/RTX_3090.md).
 
 ---
 

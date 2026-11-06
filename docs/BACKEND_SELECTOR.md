@@ -108,6 +108,14 @@ p10/p90 for matching model/backend/artifact/GPU/context evidence. Reference
 results remain labeled upstream; they are not predictions for a new context,
 topology, power limit or workload.
 
+Current experimental profiles must match the recorded benchmark profile;
+legacy samples without one are not inherited by a new runtime configuration.
+NInfer now also offers Qwen3.6-35B-A3B, with a model-specific weight floor and
+MTP/compressed-KV choices. See [RTX 3090 experiments](RTX_3090.md) for explicit
+launch commands, current prompt-lookup restrictions, and manual GPU-unlock
+recovery/A-B guidance. These options do not change the selector's baseline
+frontend integration boundary.
+
 ## Flash-Next support boundary and validation
 
 The existing baseline is upstream llama.cpp with

@@ -148,7 +148,7 @@ class SelectorTests(unittest.TestCase):
     def test_16g_qwen38_blocks_ninfer_and_fits_iq3(self):
         code, out, _, launch, _ = self.run_sel(
             'qwen3.8:27b', '--gpu', '0', '--vram-limit', '16G',
-            '--no-interactive', gpus=selector.workers.synthetic_3090(1))
+            '--ram-limit', '32G', '--no-interactive', gpus=selector.workers.synthetic_3090(1))
         self.assertEqual(code, 0)
         self.assertIn('IQ3_XXS', out)
         self.assertRegex(out, r'BLOCK\s+\S+\s+ninfer-3090')
@@ -156,18 +156,29 @@ class SelectorTests(unittest.TestCase):
         self.assertIn('Recommended launch:', out)
         launch.assert_not_called()
 
-    def test_24g_table_labels_upstream_as_reference_not_local(self):
+    def test_24g_table_does_not_reuse_legacy_evidence_for_new_profiles(self):
         code, out, _, _, _ = self.run_sel(
             'qwen3.8:27b', '--gpu', '0', '--vram-limit', '24G',
             '--no-interactive', gpus=selector.workers.synthetic_3090(1))
         self.assertEqual(code, 0)
         self.assertIn('vllm-qwen38-3090', out)
-        self.assertIn('127', out)
+        self.assertNotIn('127', out)
         self.assertIn('llamampere', out)
         self.assertRegex(out, r'llamampere.*UNKNOWN')
-        self.assertRegex(out, r'127\s+UPSTREAM REFERENCE')
+        self.assertRegex(out, r'vllm-qwen38-3090.*UNKNOWN')
         self.assertNotIn('ESTIMATED', out)
         self.assertIn('25 TG/s', out)
+
+    def test_qwen36_ninfer_has_model_specific_weight_floor_and_profiles(self):
+        gpu = selector.workers.synthetic_3090(1)[0]
+        with mock.patch.object(selector.metrics, 'observations', return_value=[]):
+            rows = selector.rows_for('qwen3.6:35b', gpu, 16384, None, 4096)
+        row = next(r for r in rows if r['backend'] == 'ninfer-3090')
+        self.assertEqual(row['status'], 'BLOCK')
+        self.assertEqual(row['req'], 21735)
+        self.assertIn('mtp-k8v4', row['profiles'])
+        self.assertIn('--profile', row['validation_argv'])
+        self.assertFalse(row['frontend_integrated'])
 
     def test_noninteractive_no_model_does_not_inventory_or_read(self):
         code, out, _, launch, inventory = self.run_sel()

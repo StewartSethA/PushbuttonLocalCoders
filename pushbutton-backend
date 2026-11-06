@@ -59,6 +59,7 @@ def canonical_model(x: str) -> str:
     aliases = {
         "qwen38": "qwen3.8:27b", "qwen3.8-27b": "qwen3.8:27b", "qwen3.8:27b": "qwen3.8:27b",
         "flash-next": "qwen3.8-flash-next", "qwen3.8-flash-next": "qwen3.8-flash-next", "qwen38-flash-next": "qwen3.8-flash-next",
+        "qwen36": "qwen3.6:35b", "qwen3.6-35b-a3b": "qwen3.6:35b", "qwen3.6:35b-a3b": "qwen3.6:35b",
     }
     return aliases.get(x, x)
 
@@ -118,7 +119,9 @@ def ensure_repo(name: str, url: str, ref: str = "main") -> pathlib.Path:
         run(["git", "-C", str(dst), "fetch", "--depth=1", "origin", ref])
         run(["git", "-C", str(dst), "checkout", "-q", "--detach", "FETCH_HEAD"])
     else:
-        run(["git", "clone", "--depth=1", "--branch", ref, url, str(dst)])
+        run(["git", "clone", "--depth=1", "--no-checkout", url, str(dst)])
+        run(["git", "-C", str(dst), "fetch", "--depth=1", "origin", ref])
+        run(["git", "-C", str(dst), "checkout", "-q", "--detach", "FETCH_HEAD"])
     return dst
 
 
@@ -192,13 +195,13 @@ def prepare(backend: str, model: str, gpus: list[int]) -> None:
     if backend == "sglang-v100":
         d = docker_prefix(); run(d + ["pull", "geesegeesegeese/sglang-v100:v100-qwen38-flash-next-v4"]); return
     if backend == "vllm-qwen38-3090":
-        d = docker_prefix(); run(d + ["pull", "ghcr.io/syv-ai/qwen38-27b-rtx3090:latest"]); return
+        d = docker_prefix(); run(d + ["pull", registry()["backends"][backend]["image"]]); return
     if backend == "ninfer-3090":
-        src = ensure_repo("ninfer-3090", "https://github.com/Don-Chad/ninfer-3090.git", "master")
+        src = ensure_repo("ninfer-3090", "https://github.com/Don-Chad/ninfer-3090.git", registry()["backends"][backend]["source_ref"])
         d = docker_prefix(); run(d + ["build", "--tag", "pushbutton-ninfer-3090:sm86", "."], cwd=src)
         model_dir = CACHE / "ninfer-3090"; model_dir.mkdir(parents=True, exist_ok=True)
-        env = os.environ.copy(); env["NINFER_MODEL_DIR"] = str(model_dir)
-        run(["bash", "scripts/download-qwen38.sh"], cwd=src, env=env)
+        env = os.environ.copy(); env["NINFER_MODEL_DIR"] = str(model_dir); env["NINFER_GRAFTS"] = "off"
+        run(["bash", "scripts/download-model.sh", NINFER_MODELS[model][0]], cwd=src, env=env)
         return
     if backend == "vllm-flashnext-3090":
         src = ensure_repo("vllm-flashnext-3090", "https://github.com/loktar00/qwen38-flash-next-vllm-3090-recipe.git")
@@ -231,7 +234,49 @@ def llama_build_path(srcname: str, prefix: str = "build-sm") -> pathlib.Path:
     return builds[0]
 
 
+NINFER_MODELS = {
+    "qwen3.8:27b": ("qwen38-27b", "qwen3_8_27b.ninfer"),
+    "qwen3.6:35b": ("qwen36-35b-a3b", "qwen3_6_35b_a3b.ninfer"),
+}
+
+
+def resolve_profile(backend: str, model: str, profile: str | None, context: int | None) -> tuple[str | None, int, dict]:
+    info = registry()["backends"][backend]
+    profiles = info.get("profiles", {})
+    name = profile or info.get("default_profile") or info.get("constraints", {}).get("default_profile")
+    if profiles:
+        if name not in profiles:
+            raise SystemExit(f"unknown profile {name!r} for {backend}; supported: {', '.join(profiles)}")
+        settings = profiles[name]
+        if model not in settings.get("models", info["models"]):
+            raise SystemExit(f"profile {name} is unsupported for {model}; do not combine incompatible speculation methods")
+    else:
+        settings = {}
+        if profile and profile != info.get("constraints", {}).get("default_profile"):
+            raise SystemExit(f"backend {backend} has no selectable profile {profile!r}")
+    resolved = context if context is not None else settings.get("default_context", 65536)
+    limit = settings.get("max_context", info.get("constraints", {}).get("max_context"))
+    model_limit = info.get("model_max_context", {}).get(model)
+    if model_limit is not None:
+        limit = min(limit, model_limit) if limit is not None else model_limit
+    if resolved <= 0 or (limit is not None and resolved > limit):
+        raise SystemExit(f"invalid context {resolved} for {backend}/{name}; must be positive" + (f" and <= {limit}" if limit else ""))
+    return name, resolved, settings
+
+
+def gpu_unlock_status() -> dict:
+    cmdline = pathlib.Path("/proc/cmdline")
+    return {
+        "platform": sys.platform,
+        "module_loaded": pathlib.Path("/sys/module/gpu_unlock").exists(),
+        "boot_targets": [x for x in cmdline.read_text().split() if x.startswith("gpu_unlock.targets=")] if cmdline.exists() else [],
+        "throughput_verified": False,
+        "note": "Module/boot flags do not prove the selected card was unlocked. Review kernel logs and compare identical GEMM/prefill/decode workloads. Installation is manual; see docs/RTX_3090.md.",
+    }
+
+
 def serve(backend: str, model: str, gpus: list[int], port: int, context: int, profile: str | None) -> None:
+    profile, context, settings = resolve_profile(backend, model, profile, context)
     gpu_csv = ",".join(map(str, gpus)); env = os.environ.copy(); env["CUDA_VISIBLE_DEVICES"] = gpu_csv
     env["HF_HOME"] = str(CACHE / "huggingface"); env["LLAMA_CACHE"] = str(CACHE)
     if backend == "llama.cpp":
@@ -256,11 +301,17 @@ def serve(backend: str, model: str, gpus: list[int], port: int, context: int, pr
         exec_cmd(cmd); return
     if backend == "vllm-qwen38-3090":
         d = docker_prefix(); models = CACHE / "syv-qwen38-models"; vc = CACHE / "syv-qwen38-cache"; models.mkdir(parents=True, exist_ok=True); vc.mkdir(parents=True, exist_ok=True)
-        cmd = d + ["run", "--rm", "--gpus", f"device={gpu_csv}", "--ipc=host", "-p", f"127.0.0.1:{port}:18020", "-v", f"{models}:/app/models", "-v", f"{vc}:/cache", "-e", "SPEC=dflash2", "-e", "PREFIX_CACHE=1", "ghcr.io/syv-ai/qwen38-27b-rtx3090:latest"]
+        cmd = d + ["run", "--rm", "--gpus", f"device={gpu_csv}", "--ipc=host", "-p", f"127.0.0.1:{port}:18020", "-v", f"{models}:/app/models", "-v", f"{vc}:/cache", "-e", "PREFIX_CACHE=1", "-e", f"MAX_LEN={context}"]
+        for key, value in settings["env"].items():
+            cmd += ["-e", f"{key}={value}"]
+        cmd += [registry()["backends"][backend]["image"]]
         exec_cmd(cmd); return
     if backend == "ninfer-3090":
-        d = docker_prefix(); model_path = find_largest(CACHE / "ninfer-3090", "*.ninfer")
-        cmd = d + ["run", "--rm", "--gpus", f"device={gpu_csv}", "-p", f"127.0.0.1:{port}:8080", "-v", f"{model_path.parent}:/workspace/models:ro", "pushbutton-ninfer-3090:sm86", "ninfer-serve", f"models/{model_path.name}", "--host", "0.0.0.0", "--port", "8080", "--max-context", str(context), "--kv-capacity", str(context), "--max-concurrency", "1", "--max-pending-requests", "16", "--prefill-chunk", "1024", "--kv-dtype", "int8", "--spec", "mtp", "--draft-tokens", "3", "--lm-head-draft"]
+        d = docker_prefix(); model_path = CACHE / "ninfer-3090" / NINFER_MODELS[model][1]
+        if not DRY and not model_path.is_file():
+            raise SystemExit(f"missing model artifact: {model_path}; run prepare for {model}")
+        cmd = d + ["run", "--rm", "--gpus", f"device={gpu_csv}", "-p", f"127.0.0.1:{port}:8080", "-v", f"{model_path.parent}:/workspace/models:ro", registry()["backends"][backend]["image"], "ninfer-serve", f"models/{model_path.name}", "--host", "0.0.0.0", "--port", "8080", "--max-context", str(context), "--kv-capacity", str(context), "--max-concurrency", "1", "--max-pending-requests", "16", "--prefill-chunk", "1024", "--kv-dtype", settings["kv_dtype"]]
+        cmd += settings["args"]
         exec_cmd(cmd); return
     if backend == "vllm-flashnext-3090":
         src = STATE / "src/vllm-flashnext-3090"; hf = ensure_hf(); env = os.environ.copy()
@@ -276,25 +327,31 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("list")
+    sub.add_parser("gpu-unlock-status", help="read-only boot/module diagnostics; never installs or reboots")
     for name in ("check", "prepare", "serve", "fingerprint"):
         p = sub.add_parser(name); p.add_argument("backend"); p.add_argument("model"); p.add_argument("--gpus"); p.add_argument("--force", action="store_true")
+        p.add_argument("--context", type=int); p.add_argument("--profile")
         if name == "serve":
-            p.add_argument("--port", type=int, default=20880); p.add_argument("--context", type=int, default=65536); p.add_argument("--profile"); p.add_argument("--no-prepare", action="store_true")
+            p.add_argument("--port", type=int, default=20880); p.add_argument("--no-prepare", action="store_true")
     args = ap.parse_args(); DRY = args.dry_run
     reg = registry()["backends"]
     if args.cmd == "list":
         for k, v in reg.items(): print(f"{k:24} {v['status']:12} models={','.join(v['models'])}  {v['name']}")
         return 0
+    if args.cmd == "gpu-unlock-status":
+        print(json.dumps(gpu_unlock_status(), indent=2)); return 0
     model = canonical_model(args.model); gpus = select_gpus(args.backend, args.gpus); validate(args.backend, model, gpus, args.force)
+    profile, context, settings = resolve_profile(args.backend, model, args.profile, args.context)
     if args.cmd == "check":
-        print(json.dumps({"backend": args.backend, "model": model, "gpus": gpus, "ok": True}, indent=2)); return 0
+        print(json.dumps({"backend": args.backend, "model": model, "gpus": gpus, "profile": profile, "context": context, "ok": True}, indent=2)); return 0
     if args.cmd == "prepare": prepare(args.backend, model, gpus); return 0
     if args.cmd == "fingerprint":
-        info = reg[args.backend].copy(); info.update({"id": args.backend, "model": model, "gpus": gpus, "source_revision": source_revision(args.backend)})
+        info = reg[args.backend].copy(); info.update({"id": args.backend, "model": model, "gpus": gpus, "source_revision": source_revision(args.backend), "profile": profile, "context": context, "profile_settings": settings, "gpu_unlock": gpu_unlock_status()})
+        if model in info.get("model_artifacts", {}): info["artifact"] = info["model_artifacts"][model]
         print(json.dumps(info, indent=2)); return 0
     if args.cmd == "serve":
         if not args.no_prepare: prepare(args.backend, model, gpus)
-        serve(args.backend, model, gpus, args.port, args.context, args.profile); return 0
+        serve(args.backend, model, gpus, args.port, context, profile); return 0
     return 2
 
 

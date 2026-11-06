@@ -5,6 +5,26 @@ sys.path.insert(0,str(ROOT/'lib'))
 import pushbutton_metrics as m
 
 class MetricsTests(unittest.TestCase):
+    def test_profile_specific_observations_do_not_mix_speculation_lanes(self):
+        common = {'model': 'qwen3.6:35b', 'backend': 'ninfer-3090'}
+        rows = [{**common, 'profile': 'mtp', 'tg': 100},
+                {**common, 'profile': 'mtp-k8v4', 'tg': 200},
+                {**common, 'tg': 300}]
+        with mock.patch.object(m, 'local_rows', return_value=rows), mock.patch.object(m, '_remote_rows', return_value=[]):
+            observations = m.observations('qwen3.6:35b', 'ninfer-3090', profile='mtp-k8v4')
+        self.assertEqual([r['tg'] for r in observations], [200])
+
+    def test_local_benchmark_rows_preserve_profile_and_unlock_state(self):
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(m, 'LOCAL_RESULTS', pathlib.Path(td)):
+            report = {'model': 'qwen3.6:35b',
+                      'backend': {'id': 'ninfer-3090', 'profile': 'mtp-k8v4'},
+                      'gpu_unlock_state': 'stock',
+                      'cases': [{'name': '1k-c1', 'median_decode_tok_s': 100}]}
+            (pathlib.Path(td) / 'report.json').write_text(json.dumps(report))
+            rows = m._benchmark_rows()
+        self.assertEqual(rows[0]['profile'], 'mtp-k8v4')
+        self.assertEqual(rows[0]['gpu_unlock_state'], 'stock')
+
     def test_remote_source_local_is_still_reference_evidence(self):
         row = {'source':'local', 'model':'qwen3.8:27b', 'backend':'vllm-qwen38-3090', 'tg':42}
         with mock.patch.object(m, 'local_rows', return_value=[row]), \
