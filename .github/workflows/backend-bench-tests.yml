@@ -7,6 +7,9 @@ on:
       - "pushbutton-bench"
       - "configs/backend-registry.json"
       - "benchmarks/**"
+      - "tests/test_backend_upgrades.py"
+      - "tests/test_metrics.py"
+      - "lib/pushbutton_metrics.py"
       - "install-coder-local.sh"
       - ".github/workflows/backend-bench-tests.yml"
 
@@ -24,6 +27,10 @@ jobs:
           python3 -m json.tool configs/backend-registry.json >/dev/null
       - name: Backend registry
         run: python3 pushbutton-backend --dry-run list
+      - name: Backend profile and benchmark regression tests
+        run: |
+          python3 -m unittest discover -s tests -p test_backend_upgrades.py -q
+          python3 -m unittest discover -s tests -p test_metrics.py -q
       - name: Dry-run all backend adapters
         run: |
           python3 pushbutton-backend --dry-run prepare llama.cpp qwen3.8:27b --gpus 0

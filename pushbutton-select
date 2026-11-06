@@ -28,7 +28,8 @@ def aliases():
 UPSTREAM={
  ('qwen3.8:27b','llamampere'):{'artifact':'ATX-IQ4_XS-M (4.56 bpw)','tested_card_mib':24576,'hard_min_mib':None,'host_ram_mib':8192,'quality':'~97*','note':'3090/3090 Ti specialized path; reduced-memory behavior is recipe-dependent.'},
  ('qwen3.8:27b','vllm-qwen38-3090'):{'artifact':'patched vLLM W4A16/int8-requantized','tested_card_mib':24576,'hard_min_mib':None,'host_ram_mib':12288,'quality':'n/a','note':'single-3090 specialized stack; use measured rows for exact speed/context claims.'},
- ('qwen3.8:27b','ninfer-3090'):{'artifact':'NInfer groupwise 16.96 GiB','tested_card_mib':24576,'hard_min_mib':17368,'host_ram_mib':8192,'quality':'n/a','note':'artifact alone exceeds 16 GiB; published C1 peak is about 19.2 GiB.'},
+ ('qwen3.8:27b','ninfer-3090'):{'artifact':'NInfer v3 17.7 GiB','tested_card_mib':24576,'hard_min_mib':18104,'host_ram_mib':None,'quality':'n/a','note':'pinned current artifact; runtime/KV allocation and host RAM minimum unverified; selectable compressed KV and MTP profiles.'},
+ ('qwen3.6:35b','ninfer-3090'):{'artifact':'NInfer v3 21.2 GiB','tested_card_mib':24576,'hard_min_mib':21735,'host_ram_mib':None,'quality':'n/a','note':'single-3090 experimental MoE path; 4K speed claims do not establish 128K speed or fit; MTP/k8v4/rk8v4 profiles available; current prompt lookup is Qwen3.8-only.'},
 }
 RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; BOLD='\033[1m'; CYAN='\033[36m'; RESET='\033[0m'
 def color(s,c):return f'{c}{s}{RESET}' if sys.stdout.isatty() else s
@@ -106,8 +107,8 @@ def ask_caps():
    return ram_cap,cap
   except ValueError as exc:print(exc)
 
-def measured_summary(model,backend,gpu_name,context,artifact=None):
- rows=metrics.observations(model,backend,artifact=artifact,gpu_name=gpu_name,context=context)
+def measured_summary(model,backend,gpu_name,context,artifact=None,profile=None):
+ rows=metrics.observations(model,backend,artifact=artifact,gpu_name=gpu_name,context=context,profile=profile)
  # Do not mix published reference samples into local measurements.
  local=[r for r in rows if r.get('evidence_origin')=='local' and r.get('context')==context and gpu_name]
  rows=local or [r for r in rows if r.get('evidence_origin')!='local']
@@ -181,16 +182,16 @@ def rows_for(model,gpu,cap,ram_cap,context,gpus=None,request=None,slots=1):
   elif tested is not None and cap>=tested:status='UNVERIFIED'
   else:status='UNVERIFIED'
   if ram_cap is not None and ram_req is not None and ram_req>ram_cap:status='BLOCK'
-  eligibility,_=adapter_eligibility(registry[b],effective,context,ram_cap)
-  if eligibility=='UNAVAILABLE':status=eligibility
-  obs,sm=measured_summary(model,b,gpu_name,context)
+  eligibility,_=adapter_eligibility(registry[b],effective,context,ram_cap,model)
+  if eligibility=='UNAVAILABLE' and not (hard is not None and cap is not None and hard>cap):status=eligibility
+  obs,sm=measured_summary(model,b,gpu_name,context,d['artifact'],registry[b].get('default_profile'))
   pp=(sm.get('pp') or {}).get('median'); tg=(sm.get('tg') or {}).get('median')
   evidence=evidence_label(obs,sm)
   rows.append({'model':model,'backend':b,'artifact':d['artifact'],'req':hard,'ram_req':ram_req,'quality':d.get('quality','n/a'),'pp':pp,'tg':tg,'status':status,'note':d['note'],'evidence':evidence,'spread':sm,'local':any(r.get('evidence_origin')=='local' for r in obs)})
  for backend,d in registry.items():
   if model not in d['models'] or backend=='llama.cpp' or (model,backend) in UPSTREAM:continue
-  status,note=adapter_eligibility(d,effective,context,ram_cap)
-  obs,sm=measured_summary(model,backend,gpu_name,context)
+  status,note=adapter_eligibility(d,effective,context,ram_cap,model)
+  obs,sm=measured_summary(model,backend,gpu_name,context,profile=d.get('default_profile'))
   rows.append({'model':model,'backend':backend,'artifact':d.get('artifact','recipe-specific'),'req':None,'ram_req':None,'quality':'n/a','pp':(sm.get('pp') or {}).get('median'),'tg':(sm.get('tg') or {}).get('median'),'status':status,'note':f"experimental; {note}; {d['notes']} Source: {d['source']}",'evidence':evidence_label(obs,sm),'spread':sm})
  for r in rows:
   r.setdefault('capacity',settings)
@@ -204,9 +205,13 @@ def rows_for(model,gpu,cap,ram_cap,context,gpus=None,request=None,slots=1):
   r['support']=metadata.get('status','catalogued')
   r['frontend_integrated']=r['backend']=='llama.cpp' and model in plan.PROFILES
   r['constraints']=metadata.get('constraints',{})
+  if model in metadata.get('model_max_context',{}):
+   r['constraints']={**r['constraints'],'max_context':metadata['model_max_context'][model]}
+  r['profiles']=metadata.get('profiles',{})
   if r['backend']!='llama.cpp' and metadata:
    eligible=[g for g in gpus if 'sm'+g.compute_cap.replace('.','') in metadata['gpu_arch']]
    command=[str(ROOT/'pushbutton-bench'),model,'--backend',r['backend'],'--context',str(min(context,r['constraints'].get('max_context',context))),'--suite','standard']
+   if metadata.get('default_profile'):command+=['--profile',metadata['default_profile']]
    if eligible:command+=['--gpus',','.join(str(g.index) for g in eligible[:r['constraints'].get('gpu_count',1)])]
    r['validation_argv']=command
   s,w=policy.speed_label(r.get('tg'),measured=r['evidence']=='LOCAL MEASURED')
@@ -255,7 +260,7 @@ def print_table(rows,gpu,cap,ram_cap,model):
  for r in rows:
   if r['backend']!='llama.cpp':print(f"  {r['backend']}: {r['note']}")
 
-def adapter_eligibility(metadata,gpus,context,ram_cap):
+def adapter_eligibility(metadata,gpus,context,ram_cap,model=None):
  constraints=metadata.get('constraints',{})
  if not gpus:return 'UNKNOWN','no GPU inventory; eligibility and memory unknown'
  eligible=[g for g in gpus if 'sm'+g.compute_cap.replace('.','') in metadata['gpu_arch']]
@@ -266,7 +271,7 @@ def adapter_eligibility(metadata,gpus,context,ram_cap):
  recipe_cards=[g for g in eligible if g.total_mib>=card and name.lower() in g.name.lower()]
  if len(recipe_cards)<count:
   return 'UNAVAILABLE','published GPU model/card capacity configuration unavailable; smaller-card fit is not proven'
- if context>constraints.get('max_context',context):
+ if context>min(constraints.get('max_context',context),metadata.get('model_max_context',{}).get(model,context)):
   return 'UNAVAILABLE','context exceeds this adapter profile limit'
  return 'UNKNOWN',f'architecture eligible, but free VRAM/topology/calibration/runtime must be validated; host RAM minimum unknown; constraints={json.dumps(constraints)}'
 

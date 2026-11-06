@@ -298,6 +298,8 @@ def _benchmark_rows() -> list[dict]:
         gpu_names=[g.get("name") for g in (x.get("hardware") or {}).get("gpus",[])]; backend=(x.get("backend") or {}).get("id"); artifact=(x.get("backend") or {}).get("artifact") or (x.get("backend") or {}).get("quant")
         for c in x.get("cases",[]):rows.append({
             "source":"local-benchmark","model":x.get("model"),"backend":backend,"artifact":artifact,
+            "profile":(x.get("backend") or {}).get("profile"),
+            "gpu_unlock_state":x.get("gpu_unlock_state","unknown"),
             "gpu_models":gpu_names,"context":x.get("context"),"case":c.get("name"),
             "prompt_tokens":c.get("median_prompt_tokens"),"pp":c.get("median_prefill_tok_s"),
             "tg":c.get("median_decode_tok_s"),"ttft":c.get("median_ttft_s")})
@@ -326,7 +328,7 @@ def local_rows() -> list[dict]:
     return _benchmark_rows()+_live_rows()
 
 
-def observations(model: str, backend: str, artifact: str | None = None, gpu_name: str | None = None, context: int | None = None) -> list[dict]:
+def observations(model: str, backend: str, artifact: str | None = None, gpu_name: str | None = None, context: int | None = None, profile: str | None = None) -> list[dict]:
     if isinstance(gpu_name,(int,float)) and context is None:context=int(gpu_name); gpu_name=artifact; artifact=None
     if backend=='llama.cpp' and artifact is None:return []
     out=[]
@@ -334,6 +336,7 @@ def observations(model: str, backend: str, artifact: str | None = None, gpu_name
     rows += [dict(r, evidence_origin="reference") for r in _remote_rows()]
     for r in rows:
         if r.get("model")!=model or r.get("backend")!=backend:continue
+        if profile is not None and r.get("profile")!=profile:continue
         if artifact:
             ra=r.get("artifact")
             if not ra or (artifact.lower() not in str(ra).lower() and str(ra).lower() not in artifact.lower()):continue

@@ -44,20 +44,45 @@
       "notes": "Four-V100 optimized SGLang path with MTP and V100-specific kernels."
     },
     "vllm-qwen38-3090": {
-      "name": "Patched vLLM Qwen3.8-27B RTX 3090",
-      "source": "https://github.com/syv-ai/qwen38-27b-rtx3090",
+      "name": "HyperQwen / patched vLLM Qwen3.8-27B RTX 3090",
+      "source": "https://github.com/syv-ai/HyperQwen",
+      "image": "ghcr.io/syv-ai/hyperqwen:latest",
+      "artifact": "patched vLLM W4A16/int8-requantized",
       "status": "experimental",
       "gpu_arch": ["sm86"],
       "models": ["qwen3.8:27b"],
-      "notes": "Single-3090 DFlash2/MTP vLLM stack; prebuilt GHCR image."
+      "default_profile": "dflash2",
+      "constraints": {"gpu_count": 1, "tested_card_mib": 24576, "tested_gpu_name": "RTX 3090", "max_context": 65536},
+      "profiles": {
+        "dflash2": {"max_context": 65536, "env": {"SPEC": "dflash2", "CTX": "fast"}},
+        "standard": {"max_context": 65536, "env": {"SPEC": "off", "CTX": "fast"}},
+        "mtp": {"max_context": 65536, "env": {"SPEC": "mtp", "CTX": "fast"}},
+        "mtp-long": {"max_context": 150000, "env": {"SPEC": "mtp", "CTX": "long", "PTH_FA": "1", "INT8_ACT": "int8", "INT8_LAYERS": "mlp"}},
+        "prompt-lookup": {"max_context": 56000, "default_context": 56000, "env": {"SPEC": "dflash2", "CTX": "fast", "DFLASH_TOKENS": "15"}}
+      },
+      "notes": "Experimental W4A16-AutoRound stack with prefix caching, CUDA Graphs and specialized attention. mtp-long opts into INT8 MLP activations and the long-context attention plugin. Profile/workload-specific gains require quality validation."
     },
     "ninfer-3090": {
       "name": "NInfer RTX 3090",
       "source": "https://github.com/Don-Chad/ninfer-3090",
       "status": "experimental",
       "gpu_arch": ["sm86"],
-      "models": ["qwen3.8:27b"],
-      "notes": "Native SM86 engine with MTP, prefix reuse and concurrent cohorts."
+      "models": ["qwen3.8:27b", "qwen3.6:35b"],
+      "source_ref": "115dee6b4d2df1c2d491da498515bdeb4f7e3f01",
+      "image": "pushbutton-ninfer-3090:sm86",
+      "default_profile": "mtp",
+      "profiles": {
+        "standard": {"max_context": 262144, "kv_dtype": "int8", "args": []},
+        "mtp": {"max_context": 262144, "kv_dtype": "int8", "args": ["--spec", "mtp", "--draft-tokens", "3", "--lm-head-draft"]},
+        "mtp-k8v4": {"max_context": 131072, "default_context": 4096, "kv_dtype": "k8v4", "args": ["--spec", "mtp", "--draft-tokens", "3", "--lm-head-draft"]},
+        "mtp-rk8v4": {"max_context": 131072, "default_context": 4096, "kv_dtype": "rk8v4", "args": ["--spec", "mtp", "--draft-tokens", "3", "--lm-head-draft"]},
+        "prompt-lookup": {"models": ["qwen3.8:27b"], "max_context": 65536, "kv_dtype": "int8", "args": ["--spec", "dflash2", "--draft-tokens", "7", "--ngram-draft-tokens", "15"]}
+      },
+      "artifact": "Pinned v3 .ninfer; model-specific weights / selectable KV",
+      "model_artifacts": {"qwen3.8:27b": "NInfer v3 17.7 GiB", "qwen3.6:35b": "NInfer v3 21.2 GiB"},
+      "model_max_context": {"qwen3.6:35b": 131072},
+      "constraints": {"gpu_count": 1, "tested_card_mib": 24576, "tested_gpu_name": "RTX 3090", "max_context": 262144},
+      "notes": "Native SM86 kernels, CUDA Graphs, prefix reuse, MTP and compressed KV. Current pinned prompt lookup requires Qwen3.8/DFlash2, not Qwen3.6/MTP. 128K is a capacity experiment, not a speed or fit guarantee; current Qwen3.6 artifact is 21.2 GiB."
     },
     "vllm-flashnext-3090": {
       "name": "Patched vLLM Flash-Next 4x3090",
